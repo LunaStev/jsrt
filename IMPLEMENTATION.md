@@ -53,7 +53,10 @@ tests/https_peer.go는 독립 TLS 검사 상대다. Wave 도구가 private 캐�
 실제 HTTPS에서 바이트·Blob·Request 원본/clone·FormData의 중복/한글/파일·Web Stream 업로드,
 느린 읽기 상대의 전송, 활성 응답 취소·정확한 원인, downgrade 거부와 인증서/hostname 거부를 통과했다.
 20회의 과대 헤더 fetch 실패와 Node HTTPS error 뒤 새 요청 성공으로 슬롯 반환도 확인했다.
-진행 중인 업로드 자체의 중간 취소와 더 넓은 전이/동시성 조합은 후속 검사 범위다.
+2026-11-02에 진행 중인 업로드의 중간 취소를 추가했다: 느린/빠른 스트림, 24회 반복(슬롯 한도 16 초과),
+완료 업로드와 취소 업로드의 동시 실행, Blob. 검사 상대가 본문 읽기 중단 횟수를 세므로 Promise 거부뿐 아니라
+실제 연결 중단을 확인한다. 유한 본문은 소켓 버퍼에 다 들어가면 정상 EOF가 되므로 횟수 단언은 끝없는 스트림에만 쓴다.
+redirect 중 취소와 서버 응답과의 경합 등 더 넓은 전이 조합은 후속 검사 범위다.
 
 JSC matrix의 runner 라벨·JSRT_WAVEC·명시 Worker 종료 probe를 정리했다.
 세 workflow는 actionlint v1.7.12 exit 0이다. 실제 원격 실행을 뜻하지 않는다.
@@ -163,3 +166,24 @@ TextDecoder의 다른 인코딩, byte/BYOB/transfer·codec stream, 네트워크 
 File·multipart 파싱, 추가 Node API는 남아 있다. [ROADMAP.md](ROADMAP.md)를 따른다.
 사용자가 종료한 이전 약 54분 10초 부하는 1시간 완료가 아니며 24시간·실제 VM/정전 검증도 미완료다.
 이번에는 장시간 soak를 재시작하지 않았다.
+
+## 2026-11-02 코어 API 확장과 새 release
+
+- 추가: Node식 util.inspect/format(console 공유), Timeout 객체와 unref·setImmediate, process.exit·hrtime·
+  uptime·memoryUsage·pid, global, performance.now, atob/btoa, util.callbackify와 콜백 fs 10종.
+  세부 계약과 알려진 차이는 docs/compatibility.md의 "코어 전역·유틸리티"를 따른다.
+- 영구 회귀: tests/core_globals.js(inspect·format·base64·process·타이머·콜백)와 tests/tls_request.js의
+  업로드 취소 시나리오. 기존 기대값 3건은 Node와 같은 출력(BigInt `n` 접미사, 사용자 toString 비호출)으로 고쳤다.
+- build·독립 test·release 내부 test 각각 **1058개·실패 0·네트워크 생략 0**, 공개 npm HTTPS **38/0**.
+- 첫 release 시도는 TLS 업로드 취소 시나리오가 하네스의 10초 제한을 넘겨 실패했다
+  (반복 취소 루프 약 8초). 검사 상대에 빠른 읽기 경로를 추가해 약 1.5초로 줄인 뒤 다시 실행해 통과했다.
+- 최신 runtime SHA-256: **5891c05f064b037b864270aab833d01fb1fbb6400ee617bbffd32c53abfdaac3**.
+  새 로컬 archive: `target/dist/jsrt-linux-x86_64-307e47267d91917b2020fc92acee28f6998b9d6cdbe1da989d268e77faf1b70d.tar.gz`,
+  SHA-256 **24dd2de31e1b34d6c67292330f447820f568215865802c11adfd2339b5a99a2c**.
+- release의 필수 60초 혼합 부하: 61표본·421 batches·1685 lanes·55214080바이트·3028 Worker·757 abort, PASS.
+  RSS warm/peak/end KiB 55892/56180/51228, 관측 최대 지연 **5514 ms**(직전 release는 2668 ms).
+  1시간/24시간 통과나 지연 SLO 충족으로 해석하지 않으며, 지연 증가의 원인은 조사하지 않았다.
+- 이 archive가 최신 runtime을 포함하는 배포물이다. 이전 archive b6560fea…44eff8은 헤더 수정 전,
+  이후 코어 API 확장 전의 산출물이다.
+- 미실행: 원격 CI/VM, 운영 서명·신뢰 공개키 검증, 공개 업로드, actionlint(이번 release.yml 수정은
+  YAML 구문만 확인), 깨끗한 환경에서의 엔진 전체 재컴파일.
