@@ -1,5 +1,33 @@
 # 다음 대화 시작점
 
+## 최신 코어 API 확장·git 초기화·새 release — 2026-11-02 (Asia/Seoul)
+
+사용자가 전체 검토를 요청했고, 이어서 검토에서 나온 1~5번(git, 기본 API, 빌드 안내/CI, HTTPS 업로드 취소,
+새 release)을 모두 진행하라고 했다. 아래가 결과다. 우선 범위(범용 Node 앱/API 서버/CLI) 질문과
+저장소·runner·운영 키 정보는 여전히 미답변이다.
+
+- git을 초기화했다(`.git`이 빈 폴더였음). 개인 설정(.vscode 등)·키·target은 .gitignore로 제외한다.
+  커밋은 bb4a1f1(기준선) 이후 4개이며 최신은 50051b1이다.
+- 추가한 API: util.inspect/format과 console 공유 포매터(runtime/inspect.wave, format.wave), Timeout 객체
+  (ref/unref/hasRef/refresh/close)와 unref된 타이머는 루프를 유지하지 않는 규칙, setImmediate,
+  process.exit/hrtime/uptime/memoryUsage/pid/ppid, global, performance.now, atob/btoa(process_extras.wave),
+  util.callbackify와 콜백 fs 10종(callbacks.wave). 계약과 차이는 docs/compatibility.md.
+- 알려진 제한: Proxy 트랩이 inspect에서 관찰될 수 있음, Promise 상태·WeakMap 내용 미표시, %o의 showHidden 없음,
+  memoryUsage의 힙 항목은 0, process.exit 코드는 0..255만 허용, Worker 안의 exit는 거부.
+- HTTPS 업로드 중간 취소 검사를 추가했다(tests/tls_request.js, 검사 상대에 /hold-upload·/hold-upload-slow·/stats).
+- docs/building.md를 추가하고 README가 가리키게 했다. release.yml은 이번 실행의 archive 하나만
+  서명·업로드·검사한다(YAML 구문만 확인, actionlint 미실행).
+- 결과: build·독립 test·release 내부 test 각각 **1058/0/0**, 공개 npm **38/0**, release exit 0.
+  runtime SHA-256 **5891c05f…aac3**, archive SHA-256 **24dd2de3…99a2c**(파일명 해시 307e4726…).
+  60초 부하 PASS, 최대 지연 5514 ms(직전 2668 ms, 원인 미조사). 1시간/24시간 통과가 아니다.
+- 첫 release 시도는 새 TLS 시나리오가 하네스 10초 제한을 넘겨 실패했고, 상대의 읽기 속도를 올려 고쳤다.
+  하네스의 expect()는 명령당 10초만 기다린다는 점을 기억한다.
+- 미실행: 원격 CI/VM, 운영 서명·신뢰 공개키 검증, 공개 업로드, 깨끗한 환경의 엔진 전체 재컴파일,
+  actionlint. target/에 엔진 후보 10개·archive 7개(1.8 GB)가 남아 있으며 정리는 사용자 허락 후에만 한다.
+- 남은 API 후보: timers/promises, querystring.stringify, util.deprecate·promisify.custom,
+  assert.deepStrictEqual, process.chdir, url.fileURLToPath(file: URL 표현이 먼저 필요).
+- 다음 대화는 우선 범위 답을 받은 뒤 그 종류의 실제 npm 앱으로 빠진 API를 찾는 것을 권한다.
+
 ## 사용자 종료·다음 대화 재개 지점 — 2026-10-28 (Asia/Seoul)
 
 사용자가 여기까지의 작업을 저장하고 다음에 이어가라고 요청했다. 이번 작업 배치는 종료한다.
