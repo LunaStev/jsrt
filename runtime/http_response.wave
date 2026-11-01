@@ -1,0 +1,569 @@
+// ServerResponse validation and streaming frames. Transport lifecycle stays separate.
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::mem::ops")::{mem_copy};
+import("std::mem::cstr")::{mem_eq_cstr};
+import("./http_state")::{HttpServer, HttpConnection, ResponseHeader, connection_for};
+import("./http_protocol")::{request_method, request_keep_alive};
+import("./http_values")::{http_get, http_define};
+import("./http_response_bytes")::{HttpOutput, encode_head_connection, encode_frame};
+import("./streams")::{stream_invoke};
+import("./stream_state")::{stream_state};
+import("./collections")::{flag};
+import("./collections")::{length, at};
+import("./buffer")::{copy_buffer_input};
+import("./values")::{define, fail};
+import("./http_state")::{endpoint_for};
+import("./system")::{encode_host_text, system_fail, system_type_fail};
+import("./buffer_core")::{copy_byte_view, byte_view_length};
+import("./config")::{HTTP_BODY_LIMIT, HTTP_HEADER_LIMIT, HTTP_HEADER_COUNT};
+
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun value_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_is_array") fun is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_to_number") fun number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "jsrt_uv_write") fun write_response(request: ptr<u8>, handle: ptr<u8>, bytes: ptr<u8>, length: i64) -> i32;
+extern(c, "jsrt_uv_write_size") fun write_size() -> i64;
+extern(c, "uv_req_set_data") fun set_request_data(request: ptr<u8>, data: ptr<u8>);
+extern(c, "jsrt_uv_close") fun close_handle(handle: ptr<u8>);
+extern(c, "uv_read_stop") fun read_stop(handle: ptr<u8>) -> i32;
+
+fun mutable_response(ctx: ptr<u8>, receiver: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<HttpConnection> {
+    var client: ptr<HttpConnection> = connection_for(receiver);
+    if (client == null || deref client.ending || deref client.busy) {
+        system_fail(ctx, ex, false, "HTTP response is closed, ended or busy");
+        return null;
+    }
+    return client;
+}
+
+pub fun header_token(octet: u8) -> bool {
+    return(octet >= 48 && octet <= 57) || (octet >= 65 && octet <= 90) || (octet >= 97 && octet <= 122) || octet == 33 || octet == 35 || octet == 36 || octet == 37 || octet == 38 || octet == 39 || octet == 42 || octet == 43 || octet == 45 || octet == 46 || octet == 94 || octet == 95 || octet == 96 || octet == 124 || octet == 126;
+}
+
+pub fun response_header_size(header: ptr<ResponseHeader>) -> i64 {
+    if (deref header.value_count == 0) {
+        return 0;
+    }
+    return deref header.value_length + 1 + deref header.value_count * (deref header.name_length + 3);
+}
+
+// Values are copied while the response is reserved. No user getter can mutate
+// or close this connection between validation and native publication.
+fun copy_header_values(ctx: ptr<u8>, source: ptr<u8>, bytes: ptr<u8>, values: ptr<i64>,
+    ex: ptr<ptr<u8>>) -> i64 {
+    var many: bool = is_array(ctx, source);
+    deref values = 1;
+    if (many) {
+        deref values = length(ctx, source, ex);
+    }
+    if (deref ex != null) {
+        return -1;
+    }
+    if (deref values < 0 || deref values > HTTP_HEADER_COUNT) {
+        system_type_fail(ctx, ex, "HTTP header array exceeds the value limit");
+        return -1;
+    }
+    var used: i64 = 0;
+    for (var i: i64 = 0; i < deref values; i++) {
+        var item: ptr<u8> = source;
+        if (many) {
+            item = at(ctx, source, i, ex);
+        }
+        if (deref ex != null) {
+            return -1;
+        }
+        var n: i64 = encode_host_text(ctx, item, bytes + used, HTTP_HEADER_LIMIT + 1 - used, ex);
+        if (n < 0 || deref ex != null) {
+            return -1;
+        }
+        for (var j: i64 = 0; j < n; j++) {
+            if (bytes[used + j] != 9 && (bytes[used + j] < 32 || bytes[used + j] > 126)) {
+                system_type_fail(ctx, ex, "invalid HTTP header value");
+                return -1;
+            }
+        }
+        used += n + 1;
+        if (used > HTTP_HEADER_LIMIT) {
+            system_type_fail(ctx, ex, "HTTP header array exceeds the byte limit");
+            return -1;
+        }
+    }
+    if (used == 0) {
+        bytes[0] = 0;
+        return 0;
+    }
+    return used - 1;
+}
+
+export(c) fun jsrt_http_set_header(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return set_response_header(ctx, receiver, count, args, ex);
+}
+
+pub fun set_response_header(ctx: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var client: ptr<HttpConnection> = mutable_response(ctx, receiver, ex);
+    if (client == null) {
+        return undefined(ctx);
+    }
+    if (deref client.prepared) {
+        system_fail(ctx, ex, false, "HTTP headers already sent");
+        return undefined(ctx);
+    }
+    if (count != 2) {
+        system_type_fail(ctx, ex, "setHeader requires a string name and value");
+        return undefined(ctx);
+    }
+    var name: ptr<u8> = mem_alloc(HTTP_HEADER_LIMIT + 1);
+    var value: ptr<u8> = mem_alloc(HTTP_HEADER_LIMIT + 1);
+    if (name == null || value == null) {
+        if (name != null) {
+            mem_free(name, HTTP_HEADER_LIMIT + 1);
+        }
+        if (value != null) {
+            mem_free(value, HTTP_HEADER_LIMIT + 1);
+        }
+        system_fail(ctx, ex, true, "cannot allocate HTTP header");
+        return undefined(ctx);
+    }
+    deref client.busy = true;
+    var n: i64 = encode_host_text(ctx, args[0], name, HTTP_HEADER_LIMIT + 1, ex);
+    var v: i64 = -1;
+    var value_count: i64 = 0;
+    var array_value: bool = false;
+    if (n >= 0 && deref ex == null) {
+        array_value = is_array(ctx, args[1]);
+        v = copy_header_values(ctx, args[1], value, &value_count, ex);
+    }
+    var valid: bool = n > 0 && v >= 0 && deref ex == null;
+    for (var i: i64 = 0; i < n && valid; i++) {
+        if (!header_token(name[i])) {
+            valid = false;
+        }
+        if (name[i] >= 65 && name[i] <= 90) {
+            name[i] += 32;
+        }
+    }
+    if (valid && (mem_eq_cstr(name as str, "content-length") || mem_eq_cstr(name as str, "transfer-encoding") || mem_eq_cstr(name as str,
+        "connection") || mem_eq_cstr(name as str, "trailer") || mem_eq_cstr(name as str, "upgrade"))) {
+        valid = false;
+    }
+    if (!valid && deref ex == null) {
+        system_type_fail(ctx, ex, "invalid or runtime-managed HTTP header");
+    }
+    var index: i64 = -1;
+    if (valid) {
+        for (var i: i64 = 0; i < deref client.header_count; i++) {
+            var h: ptr<ResponseHeader> = deref client.headers + i;
+            if (mem_eq_cstr(deref h.name as str, name as str)) {
+                index = i;
+                break;
+            }
+        }
+        var size: i64 = deref client.header_bytes + v + 1 + value_count * (n + 3);
+        if (value_count == 0) {
+            size = deref client.header_bytes;
+        }
+        var lines: i64 = value_count;
+        for (var i: i64 = 0; i < deref client.header_count; i++) {
+            var header: ptr<ResponseHeader> = deref client.headers + i;
+            lines += deref header.value_count;
+        }
+        if (index >= 0) {
+            var h: ptr<ResponseHeader> = deref client.headers + index;
+            size -= response_header_size(h);
+            lines -= deref h.value_count;
+        }
+        if (size > HTTP_HEADER_LIMIT || lines > HTTP_HEADER_COUNT || (index < 0 && deref client.header_count >= HTTP_HEADER_COUNT)) {
+            system_fail(ctx, ex, true, "HTTP response header limit exceeded");
+            valid = false;
+        }
+        if (valid && deref client.headers == null) {
+            deref client.headers = mem_alloc_zeroed(HTTP_HEADER_COUNT * (size_of<ResponseHeader>() as i64)) as ptr<ResponseHeader>;
+            if (deref client.headers == null) {
+                system_fail(ctx, ex, true, "cannot allocate response headers");
+                valid = false;
+            }
+        }
+        if (valid) {
+            var name_copy: ptr<u8> = mem_alloc(n + 1);
+            var value_copy: ptr<u8> = mem_alloc(v + 1);
+            if (name_copy == null || value_copy == null) {
+                if (name_copy != null) {
+                    mem_free(name_copy, n + 1);
+                }
+                if (value_copy != null) {
+                    mem_free(value_copy, v + 1);
+                }
+                system_fail(ctx, ex, true, "cannot allocate response header");
+                valid = false;
+            } else {
+                mem_copy(name_copy, name, n + 1);
+                mem_copy(value_copy, value, v + 1);
+                if (index < 0) {
+                    index = deref client.header_count;
+                    deref client.header_count += 1;
+                }
+                var h: ptr<ResponseHeader> = deref client.headers + index;
+                if (deref h.name != null) {
+                    mem_free(deref h.name, deref h.name_length + 1);
+                    mem_free(deref h.value, deref h.value_length + 1);
+                }
+                deref h.name = name_copy;
+                deref h.value = value_copy;
+                deref h.name_length = n;
+                deref h.value_length = v;
+                deref h.value_count = value_count;
+                deref h.array_value = array_value;
+                deref client.header_bytes = size;
+            }
+        }
+    }
+    mem_free(name, HTTP_HEADER_LIMIT + 1);
+    mem_free(value, HTTP_HEADER_LIMIT + 1);
+    deref client.busy = false;
+    return receiver;
+}
+
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "uv_err_name") fun error_name(code: i32) -> str;
+import("./values")::{text};
+
+pub fun send_bytes(client: ptr<HttpConnection>, result: HttpOutput) -> bool {
+    if (result.bytes == null) {
+        return false;
+    }
+    deref client.output = result.bytes;
+    deref client.output_length = result.length;
+    deref client.output_capacity = result.capacity;
+    deref client.write_request = mem_alloc_zeroed(write_size());
+    if (deref client.write_request == null) {
+        return false;
+    }
+    set_request_data(deref client.write_request, client as ptr<u8>);
+    deref client.ending = true;
+    return write_response(deref client.write_request, deref client.handle, result.bytes, result.length) == 0;
+}
+
+pub fun prepare_head(ctx: ptr<u8>, client: ptr<HttpConnection>, ending: bool, size: i64, ex: ptr<ptr<u8>>) {
+    if (deref client.prepared) {
+        return;
+    }
+    deref client.busy = true;
+    var status: ptr<u8> = http_get(ctx, deref client.response, "statusCode", ex);
+    var code: f64 = 0.0;
+    if (value_type(ctx, status) != 3) {
+        system_type_fail(ctx, ex, "statusCode must be a number");
+    } else {
+        code = number(ctx, status, ex);
+        if (code != code || code < 200.0 || code > 599.0 || (code as i32) as f64 != code) {
+            system_fail(ctx, ex, true, "statusCode must be an integer from 200 to 599");
+        }
+    }
+    if (deref ex == null) {
+        var headers: ptr<u8> = mem_alloc(HTTP_HEADER_LIMIT + 1);
+        if (headers == null) {
+            system_fail(ctx, ex, true, "cannot allocate response headers");
+        } else {
+            var used: i64 = 0;
+            for (var i: i64 = 0; i < deref client.header_count; i++) {
+                var h: ptr<ResponseHeader> = deref client.headers + i;
+                var offset: i64 = 0;
+                for (var j: i64 = 0; j < deref h.value_count; j++) {
+                    mem_copy(headers + used, deref h.name, deref h.name_length);
+                    used += deref h.name_length;
+                    headers[used] = 58;
+                    headers[used + 1] = 32;
+                    used += 2;
+                    var value: ptr<u8> = deref h.value + offset;
+                    var width: i64 = 0;
+                    while (value[width] != 0) {
+                        width += 1;
+                    }
+                    mem_copy(headers + used, value, width);
+                    used += width;
+                    offset += width + 1;
+                    headers[used] = 13;
+                    headers[used + 1] = 10;
+                    used += 2;
+                }
+            }
+            var head: bool = mem_eq_cstr(request_method(deref client.request), "HEAD");
+            deref client.suppress = head || code == 204.0 || code == 304.0 || code == 205.0;
+            deref client.chunked = !ending && !deref client.suppress;
+            var content: i64 = size;
+            if (!ending) {
+                content = -1;
+            }
+            var server: ptr<HttpServer> = deref client.server;
+            deref client.keep_alive = server != null && deref server.listening && deref server.keep_alive && request_keep_alive(deref client.request);
+            var result: HttpOutput = encode_head_connection(code as i32, headers, used, content, deref client.chunked,
+                deref client.keep_alive);
+            if (result.bytes == null) {
+                system_fail(ctx, ex, true, "cannot allocate response head");
+            } else {
+                deref client.head = result.bytes;
+                deref client.head_length = result.length;
+                deref client.head_capacity = result.capacity;
+                deref client.prepared = true;
+                http_define(ctx, deref client.response, "headersSent", boolean(ctx, true), ex);
+            }
+            mem_free(headers, HTTP_HEADER_LIMIT + 1);
+        }
+    }
+    deref client.busy = false;
+}
+
+fun submit_response(ctx: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ending: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var client: ptr<HttpConnection> = mutable_response(ctx, receiver, ex);
+    if (client == null) {
+        return undefined(ctx);
+    }
+    var state: ptr<u8> = stream_state(ctx, receiver, 2, ex);
+    if (state == null || flag(ctx, state, "ending", ex) || flag(ctx, state, "destroyed", ex)) {
+        system_fail(ctx, ex, false, "HTTP response has ended");
+        return undefined(ctx);
+    }
+    if ((!ending && count == 0) || count > 3) {
+        system_type_fail(ctx, ex, "response write/end arguments are invalid");
+        return undefined(ctx);
+    }
+    var completion: ptr<u8> = undefined(ctx);
+    var enc: ptr<u8> = undefined(ctx);
+    var source: ptr<u8> = undefined(ctx);
+    if (count > 0) {
+        source = args[0];
+    }
+    if (ending && value_type(ctx, source) == 5 && callable(ctx, source)) {
+        completion = source;
+        source = undefined(ctx);
+    }
+    if (count > 1) {
+        if (value_type(ctx, args[1]) == 5 && callable(ctx, args[1])) {
+            completion = args[1];
+        } else {
+            enc = args[1];
+        }
+    }
+    if (count > 2) {
+        completion = args[2];
+    }
+    if (value_type(ctx, completion) != 0 && (value_type(ctx, completion) != 5 || !callable(ctx, completion))) {
+        system_type_fail(ctx, ex, "response completion must be a function");
+        return undefined(ctx);
+    }
+    var chunk: ptr<u8> = undefined(ctx);
+    var size: i64 = 0;
+    if (value_type(ctx, source) != 0 && !(ending && value_type(ctx, source) == 1)) {
+        chunk = copy_buffer_input(ctx, source, enc, ex);
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        protect(ctx, chunk);
+        size = byte_view_length(ctx, chunk, ex);
+    } else {
+        protect(ctx, chunk);
+    }
+    prepare_head(ctx, client, ending, size, ex);
+    var call_args: array<ptr<u8>, 2> = [chunk, completion];
+    var result: ptr<u8> = undefined(ctx);
+    if (deref ex == null) {
+        var code: i64 = 4;
+        if (ending) {
+            code = 5;
+            deref client.end_requested = true;
+        }
+        result = stream_invoke(ctx, receiver, code, 2, &call_args[0], ex);
+        if (ending && deref ex != null) {
+            deref client.end_requested = false;
+        }
+    }
+    unprotect(ctx, chunk);
+    return result;
+}
+
+export(c) fun jsrt_http_end(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return submit_response(ctx, receiver, count, args, true, ex);
+}
+
+export(c) fun jsrt_http_write(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return submit_response(ctx, receiver, count, args, false, ex);
+}
+
+pub fun write_frame(ctx: ptr<u8>, client: ptr<HttpConnection>, body: ptr<u8>, length: i64, done: ptr<u8>,
+    last: bool, ex: ptr<ptr<u8>>) {
+    if (deref client.write_request != null || deref client.write_done != null) {
+        system_fail(ctx, ex, false, "HTTP write already in progress");
+        return;
+    }
+    var result: HttpOutput = encode_frame(deref client.head, deref client.head_length, body, length,
+        deref client.chunked, last);
+    if (deref client.head != null) {
+        mem_free(deref client.head, deref client.head_capacity);
+        deref client.head = null;
+        deref client.head_length = 0;
+    }
+    if (result.bytes == null) {
+        system_fail(ctx, ex, true, "cannot allocate response frame");
+        return;
+    }
+    if (result.length == 0) {
+        mem_free(result.bytes, result.capacity);
+        call(ctx, done, deref client.response, 0, null, ex);
+        if (last) {
+            deref client.response_finished = true;
+        }
+        if (last && !deref client.keep_alive && !deref client.closing) {
+            deref client.closing = true;
+            read_stop(deref client.handle);
+            close_handle(deref client.handle);
+        }
+        return;
+    }
+    deref client.output = result.bytes;
+    deref client.output_length = result.length;
+    deref client.output_capacity = result.capacity;
+    deref client.write_done = done;
+    protect(ctx, done);
+    deref client.ending = last;
+    deref client.write_request = mem_alloc_zeroed(write_size());
+    if (deref client.write_request == null) {
+        system_fail(ctx, ex, true, "cannot allocate HTTP write");
+        return;
+    }
+    set_request_data(deref client.write_request, client as ptr<u8>);
+    var status: i32 = write_response(deref client.write_request, deref client.handle, result.bytes, result.length);
+    if (status < 0) {
+        mem_free(deref client.write_request, write_size());
+        deref client.write_request = null;
+        deref client.write_complete = true;
+        deref client.write_status = status;
+    }
+}
+
+export(c) fun jsrt_http_stream_write(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count < 3 || value_type(ctx, args[2]) != 5 || !callable(ctx, args[2])) {
+        system_type_fail(ctx, ex, "HTTP write hook requires a completion callback");
+        return undefined(ctx);
+    }
+    var client: ptr<HttpConnection> = connection_for(receiver);
+    if (client == null) {
+        system_fail(ctx, ex, false, "HTTP socket is closed");
+        return undefined(ctx);
+    }
+    if (!deref client.prepared) {
+        prepare_head(ctx, client, false, 0, ex);
+    }
+    var bytes: ptr<u8> = mem_alloc(HTTP_BODY_LIMIT + 1);
+    if (bytes == null) {
+        system_fail(ctx, ex, true, "cannot allocate response bytes");
+        return undefined(ctx);
+    }
+    var size: i64 = copy_byte_view(ctx, args[0], bytes, HTTP_BODY_LIMIT, ex);
+    if (deref client.suppress) {
+        size = 0;
+    }
+    if (deref ex == null) {
+        write_frame(ctx, client, bytes, size, args[2], false, ex);
+    }
+    mem_free(bytes, HTTP_BODY_LIMIT + 1);
+    return undefined(ctx);
+}
+
+export(c) fun jsrt_http_stream_final(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0 || value_type(ctx, args[0]) != 5 || !callable(ctx, args[0])) {
+        system_type_fail(ctx, ex, "HTTP final hook requires a callback");
+        return undefined(ctx);
+    }
+    var client: ptr<HttpConnection> = connection_for(receiver);
+    if (client == null) {
+        system_fail(ctx, ex, false, "HTTP socket is closed");
+        return undefined(ctx);
+    }
+    if (!deref client.prepared) {
+        prepare_head(ctx, client, true, 0, ex);
+    }
+    if (deref ex == null) {
+        write_frame(ctx, client, null, 0, args[0], true, ex);
+    }
+    return undefined(ctx);
+}
+
+export(c) fun jsrt_http_stream_destroy(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count < 2 || value_type(ctx, args[1]) != 5 || !callable(ctx, args[1])) {
+        system_type_fail(ctx, ex, "HTTP destroy hook requires a callback");
+        return undefined(ctx);
+    }
+    var client: ptr<HttpConnection> = endpoint_for(receiver);
+    if (client == null) {
+        call(ctx, args[1], receiver, 0, null, ex);
+        return undefined(ctx);
+    }
+    if (deref client.response == receiver) {
+        if (deref client.response_destroy_done != null) {
+            system_fail(ctx, ex, false, "HTTP destroy already pending");
+            return undefined(ctx);
+        }
+        deref client.response_destroy_done = args[1];
+    } else {
+        if (deref client.incoming_destroy_done != null) {
+            system_fail(ctx, ex, false, "HTTP destroy already pending");
+            return undefined(ctx);
+        }
+        deref client.incoming_destroy_done = args[1];
+    }
+    protect(ctx, args[1]);
+    if (!deref client.closing) {
+        deref client.closing = true;
+        read_stop(deref client.handle);
+        close_handle(deref client.handle);
+    }
+    return undefined(ctx);
+}
+
+pub fun dispatch_response_write(ctx: ptr<u8>, client: ptr<HttpConnection>, ex: ptr<ptr<u8>>) -> bool {
+    if (!deref client.write_complete || deref client.write_done == null) {
+        return false;
+    }
+    var done: ptr<u8> = deref client.write_done;
+    deref client.write_done = null;
+    var last: bool = deref client.ending;
+    var status: i32 = deref client.write_status;
+    deref client.write_complete = false;
+    if (deref client.output != null) {
+        mem_free(deref client.output, deref client.output_capacity);
+        deref client.output = null;
+    }
+    if (status < 0) {
+        var problem: ptr<u8> = null;
+        fail(ctx, &problem, 0, "HTTP socket write failed");
+        protect(ctx, problem);
+        define(ctx, problem, "code", text(ctx, error_name(status)), ex, true);
+        var call_args: array<ptr<u8>, 1> = [problem];
+        call(ctx, done, deref client.response, 1, &call_args[0], ex);
+        unprotect(ctx, problem);
+    } else {
+        call(ctx, done, deref client.response, 0, null, ex);
+    }
+    unprotect(ctx, done);
+    if (last && status >= 0) {
+        deref client.response_finished = true;
+    }
+    if ((status < 0 || (last && !deref client.keep_alive)) && !deref client.closing) {
+        deref client.closing = true;
+        read_stop(deref client.handle);
+        close_handle(deref client.handle);
+    }
+    return true;
+}

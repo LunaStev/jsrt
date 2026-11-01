@@ -1,0 +1,185 @@
+import("./context_state")::{VALUES_SLOT, context_slot, allocate_context_slot, release_context_slot};
+fun intrinsic(ctx: ptr<u8>, index: i64) -> ptr<ptr<u8>> {
+    return(context_slot(ctx, VALUES_SLOT) as ptr<ptr<u8>>) + index;
+}
+
+// Shared host value operations. Capture intrinsics before user code runs.
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_string_value") fun string(ctx: ptr<u8>, value: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_get") fun property(ctx: ptr<u8>, object: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set") fun assign(ctx: ptr<u8>, object: ptr<u8>, key: ptr<u8>, value: ptr<u8>, flags: u32,
+    ex: ptr<ptr<u8>>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, object: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_construct") fun construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_to_boolean") fun to_boolean(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_to_number") fun engine_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+
+pub fun text(ctx: ptr<u8>, value: str) -> ptr<u8> {
+    var key: ptr<u8> = utf8(value);
+    var result: ptr<u8> = string(ctx, key);
+    release(key);
+    return result;
+}
+
+pub fun get(ctx: ptr<u8>, object: ptr<u8>, name: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var key: ptr<u8> = utf8(name);
+    var result: ptr<u8> = property(ctx, object, key, ex);
+    release(key);
+    // Failed JSC property reads may return a null native pointer, not JS null.
+    if (result == null || deref ex != null) {
+        return undefined(ctx);
+    }
+    return result;
+}
+
+pub fun put(ctx: ptr<u8>, object: ptr<u8>, name: str, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (deref ex != null) {
+        return;
+    }
+    protect(ctx, value);
+    var key: ptr<u8> = utf8(name);
+    assign(ctx, object, key, value, 0, ex);
+    release(key);
+    unprotect(ctx, value);
+}
+
+pub fun plain(ctx: ptr<u8>) -> ptr<u8> {
+    var result: ptr<u8> = object(ctx, null, null);
+    prototype(ctx, result, js_null(ctx));
+    return result;
+}
+
+pub fun fail(ctx: ptr<u8>, ex: ptr<ptr<u8>>, kind: i32, message: str) {
+    if (deref ex != null) {
+        return;
+    }
+    var args: array<ptr<u8>, 1> = [text(ctx, message)];
+    protect(ctx, args[0]);
+    var nested: ptr<u8> = null;
+    deref ex = construct(ctx, deref intrinsic(ctx, kind), 1, &args[0], &nested);
+    if (nested != null) {
+        deref ex = nested;
+    }
+    unprotect(ctx, args[0]);
+}
+
+pub fun define_key(ctx: ptr<u8>, object: ptr<u8>, key: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>, enumerable: bool) {
+    if (deref ex != null) {
+        return;
+    }
+    protect(ctx, value);
+    protect(ctx, key);
+    var descriptor: ptr<u8> = plain(ctx);
+    protect(ctx, descriptor);
+    put(ctx, descriptor, "value", value, ex);
+    put(ctx, descriptor, "writable", boolean(ctx, true), ex);
+    put(ctx, descriptor, "configurable", boolean(ctx, true), ex);
+    put(ctx, descriptor, "enumerable", boolean(ctx, enumerable), ex);
+    var args: array<ptr<u8>, 3> = [object, key, descriptor];
+    var result: ptr<u8> = call(ctx, deref intrinsic(ctx, 3), null, 3, &args[0], ex);
+    if (deref ex == null && !to_boolean(ctx, result)) {
+        fail(ctx, ex, 1, "cannot define host property");
+    }
+    unprotect(ctx, descriptor);
+    unprotect(ctx, key);
+    unprotect(ctx, value);
+}
+
+pub fun define(ctx: ptr<u8>, object: ptr<u8>, name: str, value: ptr<u8>, ex: ptr<ptr<u8>>, enumerable: bool) {
+    protect(ctx, value);
+    define_key(ctx, object, text(ctx, name), value, ex, enumerable);
+    unprotect(ctx, value);
+}
+
+pub fun capture(ctx: ptr<u8>, object: ptr<u8>, name: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var result: ptr<u8> = get(ctx, object, name, ex);
+    if (result != null && deref ex == null) {
+        protect(ctx, result);
+        return result;
+    }
+    return null;
+}
+
+pub fun getter(ctx: ptr<u8>, object: ptr<u8>, name: str, fn: ptr<u8>, ex: ptr<ptr<u8>>) {
+    protect(ctx, fn);
+    var key: ptr<u8> = text(ctx, name);
+    protect(ctx, key);
+    var descriptor: ptr<u8> = plain(ctx);
+    protect(ctx, descriptor);
+    put(ctx, descriptor, "get", fn, ex);
+    put(ctx, descriptor, "configurable", boolean(ctx, true), ex);
+    var args: array<ptr<u8>, 3> = [object, key, descriptor];
+    var result: ptr<u8> = call(ctx, deref intrinsic(ctx, 3), null, 3, &args[0], ex);
+    if (deref ex == null && !to_boolean(ctx, result)) {
+        fail(ctx, ex, 1, "cannot define host getter");
+    }
+    unprotect(ctx, descriptor);
+    unprotect(ctx, key);
+    unprotect(ctx, fn);
+}
+
+pub fun install_values(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (!allocate_context_slot(ctx, VALUES_SLOT, 40)) {
+        return false;
+    }
+    var root: ptr<u8> = global(ctx);
+    var names: array<str, 3> = ["Error", "TypeError", "RangeError"];
+    for (var i: i64 = 0; i < 3; i++) {
+        deref intrinsic(ctx, i) = capture(ctx, root, names[i], ex);
+    }
+    deref intrinsic(ctx, 3) = capture(ctx, get(ctx, root, "Reflect", ex), "defineProperty", ex);
+    deref intrinsic(ctx, 4) = capture(ctx, get(ctx, root, "Math", ex), "min", ex);
+    return deref ex == null && deref intrinsic(ctx, 3) != null;
+}
+
+// A one-argument Math.min applies ECMAScript ToNumber once and preserves signed
+// zero, NaN and infinities. JSValueToNumber also accepts BigInt on this JSC build.
+// Use the captured intrinsic where an API requires implicit numeric conversion.
+pub fun coerce_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64 {
+    if (deref ex != null) {
+        return 0.0;
+    }
+    protect(ctx, value);
+    var args: array<ptr<u8>, 1> = [value];
+    var result: ptr<u8> = call(ctx, deref intrinsic(ctx, 4), null, 1, &args[0], ex);
+    unprotect(ctx, value);
+    if (deref ex != null) {
+        return 0.0;
+    }
+    return engine_number(ctx, result, ex);
+}
+
+pub fun shutdown_values(ctx: ptr<u8>) {
+    if (context_slot(ctx, VALUES_SLOT) == null) {
+        return;
+    }
+    for (var i: i64 = 0; i < 3; i++) {
+        if (deref intrinsic(ctx, i) != null) {
+            unprotect(ctx, deref intrinsic(ctx, i));
+            deref intrinsic(ctx, i) = null;
+        }
+    }
+    if (deref intrinsic(ctx, 3) != null) {
+        unprotect(ctx, deref intrinsic(ctx, 3));
+        deref intrinsic(ctx, 3) = null;
+    }
+    if (deref intrinsic(ctx, 4) != null) {
+        unprotect(ctx, deref intrinsic(ctx, 4));
+        deref intrinsic(ctx, 4) = null;
+    }
+    release_context_slot(ctx, VALUES_SLOT, 40);
+}

@@ -1,0 +1,7 @@
+// Thin build entry point. Runtime and tooling share one baseline configuration.
+import("./tools/build_app")::{run};
+import("./runtime/config")::{ENGINE_MAJOR, ENGINE_MINOR, ENGINE_MICRO};
+
+fun main() -> i32 {
+    return run(ENGINE_MAJOR, ENGINE_MINOR, ENGINE_MICRO);
+}

@@ -1,0 +1,247 @@
+// Managed-tree replacement uses exchange renames and durable inode proofs.
+// The transaction module owns the journal and only cleans backups after recovery.
+import("std::sys::fs")::{fstat, fsync, Stat};
+import("std::io::fd")::{io_close};
+import("wjson")::{Json, JsonWriter, json_get, json_bool_or, json_i64_or, json_is_bool,
+    json_field_bool, json_field_i64};
+extern(c, "openat") fun open_at(fd: i32, path: str, flags: i32, mode: i32) -> i32;
+extern(c, "linkat") fun link_at(a: i32, from: str, b: i32, target: str, flags: i32) -> i32;
+extern(c, "renameat2") fun exchange_at(a: i32, from: str, b: i32, target: str, flags: u32) -> i32;
+extern(c, "getuid") fun current_uid() -> i32;
+const DIRECTORY_FLAGS: i32 = 720896;
+const READ_FLAGS: i32 = 657408;
+const EXCHANGE: u32 = 2;
+static tree_fd: i32 = -1;
+static marker_fd: i32 = -1;
+static lock_fd: i32 = -1;
+static replace_tree: bool = false;
+static replace_lock: bool = false;
+static old_tree: Stat;
+static old_marker: Stat;
+static old_lock: Stat;
+static failure: str = "package replacement failed; recovery journal retained";
+
+pub fun replacement_error() -> str {
+    return failure;
+}
+
+fun fail(message: str) -> bool {
+    failure = message;
+    return false;
+}
+
+pub fun replacement_active() -> bool {
+    return replace_tree || replace_lock;
+}
+
+pub fun replacing_tree() -> bool {
+    return replace_tree;
+}
+
+pub fun replacing_lock() -> bool {
+    return replace_lock;
+}
+
+pub fun reset_replacement() {
+    if (marker_fd >= 0) {
+        io_close(marker_fd as i64);
+    }
+    if (tree_fd >= 0) {
+        io_close(tree_fd as i64);
+    }
+    if (lock_fd >= 0) {
+        io_close(lock_fd as i64);
+    }
+    tree_fd = -1;
+    marker_fd = -1;
+    lock_fd = -1;
+    replace_tree = false;
+    replace_lock = false;
+}
+
+fun same(a: Stat, b: Stat) -> bool {
+    return a.dev == b.dev && a.ino == b.ino;
+}
+
+fun matches(parent: i32, path: str, stamp: Stat, directory: bool) -> bool {
+    var flags: i32 = READ_FLAGS;
+    var expected: i32 = 32768;
+    if (directory) {
+        flags = DIRECTORY_FLAGS;
+        expected = 16384;
+    }
+    var fd: i32 = open_at(parent, path, flags, 0);
+    if (fd < 0) {
+        return false;
+    }
+    var info: Stat;
+    var ok: bool = fstat(fd as i64, &info) == 0 && (info.mode & 61440) == expected && same(info, stamp);
+    io_close(fd as i64);
+    return ok;
+}
+
+fun managed_tree(parent: i32, directory: Stat, marker: Stat) -> bool {
+    if (!matches(parent, "node_modules", directory, true)) {
+        return false;
+    }
+    var fd: i32 = open_at(parent, "node_modules", DIRECTORY_FLAGS, 0);
+    if (fd < 0) {
+        return false;
+    }
+    var ok: bool = matches(fd, ".jsrt-install-proof", marker, false);
+    io_close(fd as i64);
+    return ok;
+}
+
+pub fun configure_replacement(project: i32, tree: bool, lock: bool) -> bool {
+    reset_replacement();
+    replace_tree = tree;
+    replace_lock = lock;
+    if (tree) {
+        tree_fd = open_at(project, "node_modules", DIRECTORY_FLAGS, 0);
+        if (tree_fd < 0 || fstat(tree_fd as i64, &old_tree) != 0 || old_tree.uid != current_uid()) {
+            return fail("replacement requires an owned directory without symlinks");
+        }
+        marker_fd = open_at(tree_fd, ".jsrt-install-proof", READ_FLAGS, 0);
+        if (marker_fd < 0 || fstat(marker_fd as i64, &old_marker) != 0 ||
+            (old_marker.mode & 61440) != 32768 || old_marker.uid != current_uid()) {
+            return fail("replacement requires a jsrt-managed dependency tree");
+        }
+    }
+    if (tree || lock) {
+        lock_fd = open_at(project, "jsrt.lock.wjson", READ_FLAGS, 0);
+        if (lock_fd < 0 || fstat(lock_fd as i64, &old_lock) != 0 ||
+            (old_lock.mode & 61440) != 32768 || old_lock.uid != current_uid()) {
+            return fail("replacement requires an owned regular lockfile without symlinks");
+        }
+    }
+    return true;
+}
+
+pub fun replacement_fields(writer: ptr<JsonWriter>) -> bool {
+    if (!replacement_active()) {
+        return true;
+    }
+    return json_field_bool(writer, "replaceTree", replace_tree) && json_field_bool(writer, "replaceLock", replace_lock) &&
+        json_field_i64(writer, "oldTreeDev", old_tree.dev) && json_field_i64(writer, "oldTreeIno", old_tree.ino) &&
+        json_field_i64(writer, "oldMarkerDev", old_marker.dev) && json_field_i64(writer, "oldMarkerIno", old_marker.ino) &&
+        json_field_i64(writer, "oldLockDev", old_lock.dev) && json_field_i64(writer, "oldLockIno", old_lock.ino);
+}
+
+pub fun prepare_replacement(project: i32, stage: i32) -> bool {
+    if (!replacement_active()) {
+        return true;
+    }
+    if (replace_tree && (!managed_tree(project, old_tree, old_marker) ||
+        link_at(tree_fd, ".jsrt-install-proof", stage, "old-tree.proof", 0) != 0 ||
+        !matches(stage, "old-tree.proof", old_marker, false))) {
+        return fail("dependency tree changed before replacement; existing files preserved");
+    }
+    if (!matches(project, "jsrt.lock.wjson", old_lock, false) ||
+        link_at(project, "jsrt.lock.wjson", stage, "old-lock.proof", 0) != 0 ||
+        !matches(stage, "old-lock.proof", old_lock, false)) {
+        return fail("lockfile changed before replacement; existing files preserved");
+    }
+    return true;
+}
+
+pub fun exchange_lock(project: i32, stage: i32) -> bool {
+    if (!matches(project, "jsrt.lock.wjson", old_lock, false) ||
+        exchange_at(stage, "jsrt.lock.wjson", project, "jsrt.lock.wjson", EXCHANGE) != 0 ||
+        !matches(stage, "jsrt.lock.wjson", old_lock, false) || fsync(stage as i64) != 0 || fsync(project as i64) != 0) {
+        return fail("cannot exchange owned lockfile; recovery journal retained");
+    }
+    return true;
+}
+
+pub fun verify_replacement_lock(project: i32, stage: i32) -> bool {
+    if (!replacement_active()) {
+        return true;
+    }
+    var expected: Stat = old_lock;
+    if (replace_lock) {
+        var fd: i32 = open_at(stage, "lock.proof", READ_FLAGS, 0);
+        if (fd < 0) {
+            return fail("new lockfile ownership proof is missing");
+        }
+        var ok: bool = fstat(fd as i64, &expected) == 0;
+        io_close(fd as i64);
+        if (!ok) {
+            return fail("cannot inspect new lockfile ownership proof");
+        }
+    }
+    return matches(project, "jsrt.lock.wjson", expected, false) ||
+        fail("lockfile changed during replacement; recovery journal retained");
+}
+
+pub fun exchange_tree(project: i32, stage: i32) -> bool {
+    if (!managed_tree(project, old_tree, old_marker) ||
+        exchange_at(stage, "node_modules", project, "node_modules", EXCHANGE) != 0 ||
+        !managed_tree(stage, old_tree, old_marker) || fsync(stage as i64) != 0 || fsync(project as i64) != 0) {
+        return fail("cannot exchange owned dependency tree; recovery journal retained");
+    }
+    return true;
+}
+
+fun stamp(value: Json, device: str, inode: str) -> Stat {
+    var result: Stat;
+    result.dev = json_i64_or(json_get(value, device), -1);
+    result.ino = json_i64_or(json_get(value, inode), -1);
+    return result;
+}
+
+pub fun valid_replacement(value: Json) -> bool {
+    var tree: bool = json_bool_or(json_get(value, "replaceTree"), false);
+    var lock: bool = json_bool_or(json_get(value, "replaceLock"), false);
+    var directory: Stat = stamp(value, "oldTreeDev", "oldTreeIno");
+    var marker: Stat = stamp(value, "oldMarkerDev", "oldMarkerIno");
+    var previous_lock: Stat = stamp(value, "oldLockDev", "oldLockIno");
+    return json_is_bool(json_get(value, "replaceTree")) && json_is_bool(json_get(value, "replaceLock")) &&
+        (tree || lock) && (!tree || (directory.dev >= 0 && directory.ino > 0 && marker.dev >= 0 && marker.ino > 0)) &&
+        previous_lock.dev >= 0 && previous_lock.ino > 0 && (!lock || json_bool_or(json_get(value, "newLock"), false) ||
+            !json_bool_or(json_get(value, "prepared"), false));
+}
+
+// Return true only when every backup can be safely removed by stage cleanup.
+pub fun recover_replacement(project: i32, stage: i32, value: Json, committed: bool) -> bool {
+    var tree: bool = json_bool_or(json_get(value, "replaceTree"), false);
+    var lock: bool = json_bool_or(json_get(value, "replaceLock"), false);
+    var directory: Stat = stamp(value, "oldTreeDev", "oldTreeIno");
+    var marker: Stat = stamp(value, "oldMarkerDev", "oldMarkerIno");
+    var previous_lock: Stat = stamp(value, "oldLockDev", "oldLockIno");
+    var next_lock: Stat = stamp(value, "lockDev", "lockIno");
+    if (!matches(stage, "old-lock.proof", previous_lock, false) ||
+        (tree && !matches(stage, "old-tree.proof", marker, false))) {
+        return fail("replacement ownership proofs are missing; existing files preserved");
+    }
+    if (tree) {
+        var next_marker: Stat = stamp(value, "treeDev", "treeIno");
+        var staged: i32 = open_at(stage, "node_modules", DIRECTORY_FLAGS, 0);
+        var pending: bool = staged >= 0 && matches(staged, ".jsrt-install-proof", next_marker, false);
+        if (staged >= 0) {
+            io_close(staged as i64);
+        }
+        if ((committed && !managed_tree(stage, directory, marker)) ||
+            (!committed && (!pending || !managed_tree(project, directory, marker)))) {
+            return fail("replacement tree ownership conflict; backups and journal retained");
+        }
+    }
+    if (!lock) {
+        return matches(project, "jsrt.lock.wjson", previous_lock, false) ||
+            fail("replacement lockfile conflict; backups and journal retained");
+    }
+    var published: bool = matches(project, "jsrt.lock.wjson", next_lock, false);
+    var backup: bool = matches(stage, "jsrt.lock.wjson", previous_lock, false);
+    if (committed) {
+        return (published && backup) || fail("committed replacement lockfile conflict; journal retained");
+    }
+    if (published && backup) {
+        if (exchange_at(stage, "jsrt.lock.wjson", project, "jsrt.lock.wjson", EXCHANGE) != 0 ||
+            fsync(stage as i64) != 0 || fsync(project as i64) != 0) {
+            return fail("cannot restore previous package lockfile; journal retained");
+        }
+    }
+    return (matches(project, "jsrt.lock.wjson", previous_lock, false) &&
+        matches(stage, "jsrt.lock.wjson", next_lock, false)) ||
+        fail("replacement lockfile ownership conflict; backups and journal retained");
+}

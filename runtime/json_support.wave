@@ -1,0 +1,140 @@
+// Context-local JSON intrinsics, host calls, properties and error boundaries.
+import("./context_state")::{JSON_SLOT, context_slot};
+extern(c, "wr_type") fun wr_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_undefined") fun wr_undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun wr_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_boolean") fun wr_boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_string_value") fun wr_string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_to_boolean") fun wr_to_boolean(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_to_number") fun wr_to_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_protect") fun wr_protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_object") fun wr_object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_array") fun wr_array(ctx: ptr<u8>, length: i64, values: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun wr_set_prototype(ctx: ptr<u8>, object: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_get") fun wr_get(ctx: ptr<u8>, obj: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set") fun wr_set(ctx: ptr<u8>, obj: ptr<u8>, key: ptr<u8>, value: ptr<u8>, flags: u32,
+    ex: ptr<ptr<u8>>);
+extern(c, "wr_callable") fun wr_callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_call") fun wr_call(ctx: ptr<u8>, fn: ptr<u8>, this_value: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_construct") fun wr_construct(ctx: ptr<u8>, fn: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+
+pub fun intrinsic(ctx: ptr<u8>, index: i64) -> ptr<ptr<u8>> {
+    return (context_slot(ctx, JSON_SLOT) as ptr<ptr<u8>>) + index;
+}
+
+pub const DEPTH_LIMIT: i64 = 128;
+
+pub const ITEM_LIMIT: i64 = 131072;
+
+pub fun get(ctx: ptr<u8>, obj: ptr<u8>, key: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var name: ptr<u8> = wr_string_utf8(key);
+    var value: ptr<u8> = wr_get(ctx, obj, name, ex);
+    wr_string_release(name);
+    return value;
+}
+
+pub fun set(ctx: ptr<u8>, obj: ptr<u8>, key: str, value: ptr<u8>, flags: u32, ex: ptr<ptr<u8>>) {
+    wr_protect(ctx, value);
+    var name: ptr<u8> = wr_string_utf8(key);
+    wr_set(ctx, obj, name, value, flags, ex);
+    wr_string_release(name);
+    wr_unprotect(ctx, value);
+}
+
+pub fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    return value != null && wr_type(ctx, value) == 5 && wr_callable(ctx, value);
+}
+
+pub fun error(ctx: ptr<u8>, ex: ptr<ptr<u8>>, kind: i32, message: str) {
+    if (deref ex != null) {
+        return;
+    }
+    var constructor: ptr<u8> = deref intrinsic(ctx, 5);
+    if (kind == 1) {
+        constructor = deref intrinsic(ctx, 6);
+    }
+    if (kind == 2) {
+        constructor = deref intrinsic(ctx, 7);
+    }
+    var text: ptr<u8> = wr_string_utf8(message);
+    var args: array<ptr<u8>, 1> = [wr_string_value(ctx, text)];
+    var nested: ptr<u8> = null;
+    var value: ptr<u8> = wr_construct(ctx, constructor, 1, &args[0], &nested);
+    if (nested != null) {
+        value = nested;
+    }
+    deref ex = value;
+    wr_string_release(text);
+}
+
+// Reflect.apply preserves primitive `this` for strict BigInt.toJSON methods.
+pub fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, args: ptr<ptr<u8>>, count: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    wr_protect(ctx, fn);
+    wr_protect(ctx, receiver);
+    for (var i: i64 = 0; i < count; i++) {
+        wr_protect(ctx, args[i]);
+    }
+    var list: ptr<u8> = wr_array(ctx, count, args, ex);
+    var result: ptr<u8> = null;
+    if (list != null && deref ex == null) {
+        wr_protect(ctx, list);
+        var invoke: array<ptr<u8>, 3> = [fn, receiver, list];
+        result = wr_call(ctx, deref intrinsic(ctx, 0), null, 3, &invoke[0], ex);
+        wr_unprotect(ctx, list);
+    }
+    for (var i: i64 = 0; i < count; i++) {
+        wr_unprotect(ctx, args[i]);
+    }
+    wr_unprotect(ctx, receiver);
+    wr_unprotect(ctx, fn);
+    return result;
+}
+
+pub fun is_array(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var args: array<ptr<u8>, 1> = [value];
+    var result: ptr<u8> = call(ctx, deref intrinsic(ctx, 2), wr_undefined(ctx), &args[0], 1, ex);
+    return deref ex == null && wr_to_boolean(ctx, result);
+}
+
+pub fun length_of(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64 {
+    var n: ptr<u8> = get(ctx, value, "length", ex);
+    if (deref ex != null) {
+        return 0;
+    }
+    var length: f64 = wr_to_number(ctx, n, ex);
+    if (deref ex != null || length != length || length <= 0.0) {
+        return 0;
+    }
+    if (length > ITEM_LIMIT as f64) {
+        error(ctx, ex, 2, "wjson collection limit exceeded (131072)");
+        return 0;
+    }
+    return length as i64;
+}
+
+pub fun own_keys(ctx: ptr<u8>, object: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var args: array<ptr<u8>, 1> = [object];
+    return call(ctx, deref intrinsic(ctx, 1), wr_undefined(ctx), &args[0], 1, ex);
+}
+
+pub fun data_property(ctx: ptr<u8>, object: ptr<u8>, key: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    wr_protect(ctx, value);
+    var descriptor: ptr<u8> = wr_object(ctx, null, null);
+    wr_protect(ctx, descriptor);
+    wr_set_prototype(ctx, descriptor, wr_null(ctx));
+    set(ctx, descriptor, "value", value, 0, ex);
+    set(ctx, descriptor, "writable", wr_boolean(ctx, true), 0, ex);
+    set(ctx, descriptor, "enumerable", wr_boolean(ctx, true), 0, ex);
+    set(ctx, descriptor, "configurable", wr_boolean(ctx, true), 0, ex);
+    var args: array<ptr<u8>, 3> = [object, wr_string_value(ctx, key), descriptor];
+    if (deref ex == null) {
+        call(ctx, deref intrinsic(ctx, 3), wr_undefined(ctx), &args[0], 3, ex);
+    }
+    wr_unprotect(ctx, descriptor);
+    wr_unprotect(ctx, value);
+}

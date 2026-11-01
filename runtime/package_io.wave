@@ -1,0 +1,624 @@
+// Package bytes, SRI and descriptor-relative extraction. No package code executes.
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::mem::ops")::{mem_copy};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("std::sys::fs")::{open, Stat, fstat};
+import("std::io::fd")::{io_close, io_read, io_write_all};
+import("./config")::{PACKAGE_ARCHIVE_LIMIT, PACKAGE_EXTRACT_LIMIT, PACKAGE_ENTRY_LIMIT, PACKAGE_PATH_CAP,
+    CLIENT_CONNECT_TIMEOUT_MS, PACKAGE_DOWNLOAD_TIMEOUT_MS, PACKAGE_REDIRECT_LIMIT};
+import("./package_transaction")::{STAGE_NAME, open_transaction, start_transaction_stage, stage_fd, transaction_error,
+    commit_transaction, close_transaction};
+extern(c, "openat") fun open_at(fd: i32, path: str, flags: i32, mode: i32) -> i32;
+extern(c, "mkdirat") fun mkdir_at(fd: i32, path: str, mode: i32) -> i32;
+extern(c, "unlinkat") fun unlink_at(fd: i32, path: str, flags: i32) -> i32;
+extern(c, "curl_global_init") fun curl_init(flags: i64) -> i32;
+extern(c, "curl_global_cleanup") fun curl_cleanup();
+extern(c, "curl_easy_init") fun curl_new() -> ptr<u8>;
+extern(c, "curl_easy_cleanup") fun curl_free(easy: ptr<u8>);
+extern(c, "curl_easy_perform") fun curl_perform(easy: ptr<u8>) -> i32;
+extern(c, "jsrt_curl_set_long") fun set_long(easy: ptr<u8>, key: i32, value: i64) -> i32;
+extern(c, "jsrt_curl_set_ptr") fun set_ptr(easy: ptr<u8>, key: i32, value: ptr<u8>) -> i32;
+extern(c, "jsrt_curl_get_long") fun get_long(easy: ptr<u8>, key: i32) -> i64;
+extern(c, "jsrt_package_download_callback") fun download_callback() -> ptr<u8>;
+extern(c, "EVP_sha512") fun sha512() -> ptr<u8>;
+extern(c, "EVP_Digest") fun digest(bytes: ptr<u8>, n: u64, result: ptr<u8>, size: ptr<u32>, algorithm: ptr<u8>,
+    engine: ptr<u8>) -> i32;
+extern(c, "CRYPTO_memcmp") fun secure_compare(a: ptr<u8>, b: ptr<u8>, n: u64) -> i32;
+extern(c, "archive_read_new") fun archive_new() -> ptr<u8>;
+extern(c, "archive_read_support_filter_gzip") fun archive_gzip(reader: ptr<u8>) -> i32;
+extern(c, "archive_read_support_format_tar") fun archive_tar(reader: ptr<u8>) -> i32;
+extern(c, "archive_read_open_memory") fun archive_open(reader: ptr<u8>, bytes: ptr<u8>, n: u64) -> i32;
+extern(c, "archive_read_next_header") fun archive_next(reader: ptr<u8>, entry: ptr<ptr<u8>>) -> i32;
+extern(c, "archive_read_data") fun archive_data(reader: ptr<u8>, bytes: ptr<u8>, n: u64) -> i64;
+extern(c, "archive_read_free") fun archive_free(reader: ptr<u8>) -> i32;
+extern(c, "archive_entry_pathname") fun entry_path(entry: ptr<u8>) -> ptr<u8>;
+extern(c, "archive_entry_filetype") fun entry_type(entry: ptr<u8>) -> u32;
+extern(c, "archive_entry_symlink") fun entry_symlink(entry: ptr<u8>) -> ptr<u8>;
+extern(c, "archive_entry_hardlink") fun entry_hardlink(entry: ptr<u8>) -> ptr<u8>;
+extern(c, "archive_entry_size") fun entry_size(entry: ptr<u8>) -> i64;
+pub struct Blob {
+    bytes: ptr<u8>;
+    length: i64;
+    capacity: i64;
+}
+
+struct Created {
+    path: ptr<u8>;
+    directory: bool;
+}
+
+static paths: ptr<Created> = null;
+static path_count: i64 = 0;
+static extracted: i64 = 0;
+pub fun account_workspace_bytes(size: i64) -> bool {
+    if (size < 0 || size > PACKAGE_EXTRACT_LIMIT - extracted) {
+        return package_fail("combined package and workspace extraction budget exceeded");
+    }
+    extracted += size;
+    return true;
+}
+static stage: i32 = -1;
+static stage_name: array<u8, 64>;
+static project_root: str = ".";
+static reason: str = "package installation failed";
+const DIRECTORY_FLAGS: i32 = 720896;
+pub fun install_error() -> str {
+    return reason;
+}
+
+pub fun package_fail(message: str) -> bool {
+    reason = message;
+    return false;
+}
+
+pub fun package_path(dest: ptr<u8>, a: str, b: str) -> bool {
+    var na: i64 = mem_len_cstr(a);
+    var nb: i64 = mem_len_cstr(b);
+    var slash: i64 = 0;
+    if (na > 0 && nb > 0) {
+        slash = 1;
+    }
+    // Keep ledger paths within Linux unlinkat's PATH_MAX so rollback stays usable.
+    if (na + slash + nb >= PACKAGE_PATH_CAP) {
+        return package_fail("package path limit exceeded");
+    }
+    mem_copy(dest, a as ptr<u8>, na);
+    if (slash != 0) {
+        dest[na] = 47;
+    }
+    mem_copy(dest + na + slash, b as ptr<u8>, nb + 1);
+    return true;
+}
+
+pub fun free_blob(value: ptr<Blob>) {
+    if (deref value.bytes != null) {
+        mem_free(deref value.bytes, deref value.capacity);
+        deref value.bytes = null;
+    }
+}
+
+pub fun read_blob(path: str, limit: i64) -> Blob {
+    var result: Blob = Blob {
+        bytes: null, length: 0, capacity: limit + 1
+    };
+    var fd: i64 = open(path, 657408, 0);
+    var info: Stat;
+    if (fd < 0 || fstat(fd, &info) < 0 || (info.mode & 61440) != 32768 || info.size > limit || info.size < 0) {
+        if (fd >= 0) {
+            io_close(fd);
+        }
+        package_fail("cannot read regular package input within size limit");
+        return result;
+    }
+    result.bytes = mem_alloc(result.capacity);
+    if (result.bytes == null) {
+        io_close(fd);
+        package_fail("cannot allocate package input");
+        return result;
+    }
+    while (result.length <= limit) {
+        var n: i64 = io_read(fd, result.bytes + result.length, result.capacity - result.length);
+        if (n == -4) {
+            continue;
+        }
+        if (n < 0) {
+            free_blob(&result);
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        result.length += n;
+    }
+    io_close(fd);
+    if (result.bytes != null && result.length > limit) {
+        free_blob(&result);
+        package_fail("package input size limit exceeded");
+    }
+    if (result.bytes != null) {
+        result.bytes[result.length] = 0;
+    }
+    return result;
+}
+
+export(c) fun jsrt_package_download(bytes: ptr<u8>, size: i64, count: i64, data: ptr<u8>) -> i64 {
+    var blob: ptr<Blob> = data as ptr<Blob>;
+    if (size < 0 || count < 0 || (size > 0 && count > 9223372036854775807 / size)) {
+        return 0;
+    }
+    var n: i64 = size * count;
+    if (n > deref blob.capacity - 1 - deref blob.length) {
+        return 0;
+    }
+    mem_copy(deref blob.bytes + deref blob.length, bytes, n);
+    deref blob.length += n;
+    return n;
+}
+
+pub fun require_https(url: str) -> bool {
+    if (mem_len_cstr(url) < 8 || url[0] != 104 || url[1] != 116 || url[2] != 116 || url[3] != 112 || url[4] != 115 || url[5] != 58 || url[6] != 47 || url[7] != 47) {
+        return package_fail("package downloads require HTTPS");
+    }
+    return true;
+}
+
+pub fun download_blob(url: str, limit: i64) -> Blob {
+    var result: Blob = Blob {
+        bytes: null, length: 0, capacity: limit + 1
+    };
+    if (!require_https(url)) {
+        return result;
+    }
+    if (curl_init(3) != 0) {
+        package_fail("cannot initialize package HTTPS");
+        return result;
+    }
+    var easy: ptr<u8> = curl_new();
+    if (easy == null) {
+        curl_cleanup();
+        return result;
+    }
+    result.bytes = mem_alloc(result.capacity);
+    var ok: bool = result.bytes != null;
+    if (ok) {
+        ok = set_ptr(easy, 10002, url as ptr<u8>) == 0 && set_ptr(easy, 10318, "https" as ptr<u8>) == 0 && set_ptr(easy,
+            10319, "https" as ptr<u8>) == 0 && set_long(easy, 64, 1) == 0 && set_long(easy, 81, 2) == 0 && set_long(easy,
+            52, 1) == 0 && set_long(easy, 68, PACKAGE_REDIRECT_LIMIT) == 0 && set_long(easy, 156, CLIENT_CONNECT_TIMEOUT_MS) == 0 && set_long(easy,
+            155, PACKAGE_DOWNLOAD_TIMEOUT_MS) == 0 && set_long(easy, 99, 1) == 0 && set_ptr(easy, 20011,
+            download_callback()) == 0 && set_ptr(easy, 10001, &result as ptr<u8>) == 0;
+    }
+    if (ok) {
+        ok = curl_perform(easy) == 0 && get_long(easy, 2097154) == 200;
+    }
+    curl_free(easy);
+    curl_cleanup();
+    if (!ok) {
+        free_blob(&result);
+        package_fail("package HTTPS download failed or exceeded size limit");
+    } else {
+        result.bytes[result.length] = 0;
+    }
+    return result;
+}
+
+pub fun integrity(bytes: ptr<u8>, n: i64, output: ptr<u8>) -> bool {
+    var hashed: array<u8, 64>;
+    var size: u32 = 0;
+    if (digest(bytes, n as u64, &hashed[0], &size, sha512(), null) != 1 || size != 64) {
+        return package_fail("SHA512 computation failed");
+    }
+    mem_copy(output, "sha512-" as ptr<u8>, 7);
+    var alphabet: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    var used: i64 = 7;
+    for (var i: i64 = 0; i < 64; i += 3) {
+        var bits: u32 = (hashed[i] as u32) << 16;
+        if (i + 1 < 64) {
+            bits = bits | ((hashed[i + 1] as u32) << 8);
+        }
+        if (i + 2 < 64) {
+            bits = bits | (hashed[i + 2] as u32);
+        }
+        output[used] = alphabet[((bits >> 18) & 63) as i64];
+        output[used + 1] = alphabet[((bits >> 12) & 63) as i64];
+        output[used + 2] = 61;
+        output[used + 3] = 61;
+        if (i + 1 < 64) {
+            output[used + 2] = alphabet[((bits >> 6) & 63) as i64];
+        }
+        if (i + 2 < 64) {
+            output[used + 3] = alphabet[(bits & 63) as i64];
+        }
+        used += 4;
+    }
+    output[used] = 0;
+    return true;
+}
+
+pub fun verify_integrity(blob: Blob, expected: str) -> bool {
+    var actual: array<u8, 96>;
+    if (mem_len_cstr(expected) != 95) {
+        return package_fail("package requires canonical sha512-base64 integrity");
+    }
+    return integrity(blob.bytes, blob.length, &actual[0]) && (secure_compare(&actual[0], expected as ptr<u8>,
+        95) == 0 || package_fail("package SHA512 integrity mismatch"));
+}
+
+pub fun prepare_install(root: str) -> bool {
+    if (!open_transaction(root)) {
+        reason = transaction_error();
+        close_transaction();
+        return false;
+    }
+    return true;
+}
+
+pub fun begin_install(root: str) -> bool {
+    project_root = root;
+    path_count = 0;
+    extracted = 0;
+    paths = mem_alloc_zeroed(PACKAGE_ENTRY_LIMIT * (size_of<Created>() as i64)) as ptr<Created>;
+    if (paths == null) {
+        return package_fail("cannot allocate package transaction");
+    }
+    if (!start_transaction_stage()) {
+        return package_fail(transaction_error());
+    }
+    stage = stage_fd();
+    mem_copy(&stage_name[0], STAGE_NAME as ptr<u8>, mem_len_cstr(STAGE_NAME)+1);
+    return true;
+}
+
+fun reserve_path(path: str) -> ptr<u8> {
+    if (path_count >= PACKAGE_ENTRY_LIMIT) {
+        package_fail("package entry count limit exceeded");
+        return null;
+    }
+    var n: i64 = mem_len_cstr(path);
+    var copy: ptr<u8> = mem_alloc(n + 1);
+    if (copy == null) {
+        package_fail("cannot record package transaction path");
+        return null;
+    }
+    mem_copy(copy, path as ptr<u8>, n+1);
+    return copy;
+}
+
+fun record_path(path: ptr<u8>, directory: bool) {
+    var item: ptr<Created> = paths + path_count;
+    deref item.path = path;
+    deref item.directory = directory;
+    path_count += 1;
+}
+
+// Every parent component is opened with O_NOFOLLOW|O_DIRECTORY, anchored at stage.
+pub fun ensure_directory(path: str) -> bool {
+    var fd: i32 = open_at(stage, ".", DIRECTORY_FLAGS, 0);
+    if (fd < 0) {
+        return package_fail("cannot open package parent");
+    }
+    var prefix: array<u8, 8192>;
+    var used: i64 = 0;
+    var cursor: i64 = 0;
+    var ok: bool = true;
+    while (path[cursor] != 0 && ok) {
+        var component: array<u8, 8192>;
+        var n: i64 = 0;
+        while (path[cursor] != 0 && path[cursor] != 47) {
+            if (n >= 8191 || used >= 8191) {
+                ok = false;
+                break;
+            }
+            component[n] = path[cursor];
+            prefix[used] = path[cursor];
+            n += 1;
+            used += 1;
+            cursor += 1;
+        }
+        component[n] = 0;
+        prefix[used] = 0;
+        if (!ok || n == 0 || mem_eq_cstr(&component[0] as str, ".") || mem_eq_cstr(&component[0] as str,
+            "..")) {
+            ok = false;
+            break;
+        }
+        var copy: ptr<u8> = reserve_path(&prefix[0] as str);
+        if (copy == null) {
+            ok = false;
+            break;
+        }
+        if (mkdir_at(fd, &component[0] as str, 493) == 0) {
+            record_path(copy, true);
+        } else {
+            mem_free(copy, used+1);
+        }
+        var next: i32 = open_at(fd, &component[0] as str, DIRECTORY_FLAGS, 0);
+        io_close(fd as i64);
+        fd = next;
+        if (fd < 0) {
+            ok = false;
+            break;
+        }
+        if (path[cursor] == 47) {
+            prefix[used] = 47;
+            used += 1;
+            cursor += 1;
+        }
+    }
+    if (fd >= 0) {
+        io_close(fd as i64);
+    }
+    if (!ok) {
+        package_fail("unsafe package directory component");
+    }
+    return ok;
+}
+
+pub fun install_checkpoint() -> i64 {
+    return path_count;
+}
+
+// Optional subtrees can only remove paths created after their reservation.
+// Open each parent through the same nofollow descriptor traversal as extraction.
+pub fun rollback_install(checkpoint: i64) -> bool {
+    if (checkpoint < 0 || checkpoint > path_count) {
+        return package_fail("invalid optional installation checkpoint");
+    }
+    while (path_count > checkpoint) {
+        var item: ptr<Created> = paths + path_count - 1;
+        var path: str = deref item.path as str;
+        var n: i64 = mem_len_cstr(path);
+        var split: i64 = n;
+        while (split > 0 && path[split - 1] != 47) {
+            split -= 1;
+        }
+        var parent: array<u8, 8192>;
+        parent[0] = 0;
+        if (split > 0) {
+            mem_copy(&parent[0], path as ptr<u8>, split - 1);
+            parent[split - 1] = 0;
+        }
+        var fd: i32 = open_directory(&parent[0] as str);
+        var flags: i32 = 0;
+        if (deref item.directory) {
+            flags = 512;
+        }
+        if (fd < 0) {
+            return package_fail("cannot open optional rollback parent");
+        }
+        var result: i32 = unlink_at(fd, (path as ptr<u8> + split) as str, flags);
+        io_close(fd as i64);
+        if (result != 0) {
+            return package_fail("cannot remove optional subtree; installation aborted");
+        }
+        mem_free(deref item.path, n + 1);
+        path_count -= 1;
+    }
+    return true;
+}
+
+fun open_directory(path: str) -> i32 {
+    var fd: i32 = open_at(stage, ".", DIRECTORY_FLAGS, 0);
+    var cursor: i64 = 0;
+    while (fd >= 0 && path[cursor] != 0) {
+        var component: array<u8, 8192>;
+        var n: i64 = 0;
+        while (path[cursor] != 0 && path[cursor] != 47 && n < 8191) {
+            component[n] = path[cursor];
+            n += 1;
+            cursor += 1;
+        }
+        component[n] = 0;
+        if (n == 0 || mem_eq_cstr(&component[0] as str, ".") || mem_eq_cstr(&component[0] as str, "..")) {
+            io_close(fd as i64);
+            return -1;
+        }
+        var next: i32 = open_at(fd, &component[0] as str, DIRECTORY_FLAGS, 0);
+        io_close(fd as i64);
+        fd = next;
+        if (path[cursor] == 47) {
+            cursor += 1;
+        }
+    }
+    return fd;
+}
+
+pub fun create_file(path: str) -> i32 {
+    var n: i64 = mem_len_cstr(path);
+    var split: i64 = n;
+    while (split > 0 && path[split - 1] != 47) {
+        split -= 1;
+    }
+    var parent: array<u8, 8192>;
+    var fd: i32 = -1;
+    if (split == 0) {
+        fd = open_directory("");
+    } else {
+        mem_copy(&parent[0], path as ptr<u8>, split-1);
+        parent[split-1] = 0;
+        if (!ensure_directory(&parent[0] as str)) {
+            return -1;
+        }
+        fd = open_directory(&parent[0] as str);
+    }
+    if (fd < 0) {
+        return -1;
+    }
+    var copy: ptr<u8> = reserve_path(path);
+    if (copy == null) {
+        io_close(fd as i64);
+        return -1;
+    }
+    var result: i32 = open_at(fd, (path as ptr<u8> + split) as str, 655553, 420);
+    io_close(fd as i64);
+    if (result < 0) {
+        mem_free(copy, n+1);
+        package_fail("duplicate or unsafe package file");
+    } else {
+        record_path(copy, false);
+    }
+    return result;
+}
+
+pub fun staged_path(result: ptr<u8>, path: str) -> bool {
+    var relative: array<u8, 8192>;
+    return package_path(&relative[0], &stage_name[0] as str, path) && package_path(result, project_root,
+        &relative[0] as str);
+}
+
+pub fun extract_package(blob: Blob, destination: str) -> bool {
+    if (!ensure_directory(destination)) {
+        return false;
+    }
+    var reader: ptr<u8> = archive_new();
+    if (reader == null) {
+        return package_fail("cannot allocate archive reader");
+    }
+    var ok: bool = archive_gzip(reader) == 0 && archive_tar(reader) == 0 && archive_open(reader, blob.bytes,
+        blob.length as u64) == 0;
+    var entry: ptr<u8> = null;
+    var count: i64 = 0;
+    while (ok) {
+        var status: i32 = archive_next(reader, &entry);
+        if (status == 1) {
+            break;
+        }
+        if (status != 0) {
+            ok = false;
+            break;
+        }
+        count += 1;
+        if (count > PACKAGE_ENTRY_LIMIT) {
+            ok = false;
+            break;
+        }
+        var name: ptr<u8> = entry_path(entry);
+        if (name == null) {
+            ok = false;
+            break;
+        }
+        var n: i64 = mem_len_cstr(name as str);
+        if (n >= 8192 || entry_symlink(entry) != null || entry_hardlink(entry) != null) {
+            ok = false;
+            break;
+        }
+        var directory: bool = entry_type(entry) == 16384;
+        if (directory && entry_size(entry) != 0) {
+            ok = false;
+            break;
+        }
+        if (mem_eq_cstr(name as str, "package/") || mem_eq_cstr(name as str, "package")) {
+            if (!directory) {
+                ok = false;
+            }
+            continue;
+        }
+        if (n <= 8 || name[0] != 112 || name[1] != 97 || name[2] != 99 || name[3] != 107 || name[4] != 97 || name[5] != 103 || name[6] != 101 || name[7] != 47) {
+            ok = false;
+            break;
+        }
+        var relative: array<u8, 8192>;
+        mem_copy(&relative[0], name+8, n-7);
+        var end: i64 = n-8;
+        if (directory && end > 0 && relative[end-1] == 47) {
+            end -= 1;
+            relative[end] = 0;
+        }
+        var start: i64 = 0;
+        for (var i: i64 = 0; i <= end; i++) {
+            if (relative[i] == 92) {
+                ok = false;
+                break;
+            }
+            if (relative[i] == 47 || relative[i] == 0) {
+                var size: i64 = i-start;
+                if (size == 0 || (size == 1 && relative[start] == 46) || (size == 2 && relative[start] == 46 && relative[start+1] == 46)) {
+                    ok = false;
+                    break;
+                }
+                start = i+1;
+            }
+        }
+        var path: array<u8, 8192>;
+        if (!ok || !package_path(&path[0], destination, &relative[0] as str)) {
+            ok = false;
+            break;
+        }
+        if (directory) {
+            ok = ensure_directory(&path[0] as str);
+            continue;
+        }
+        if (entry_type(entry) != 32768) {
+            ok = false;
+            break;
+        }
+        var size: i64 = entry_size(entry);
+        if (size < 0 || size > PACKAGE_ARCHIVE_LIMIT || size > PACKAGE_EXTRACT_LIMIT - extracted) {
+            ok = false;
+            break;
+        }
+        var fd: i32 = create_file(&path[0] as str);
+        if (fd < 0) {
+            ok = false;
+            break;
+        }
+        var written: i64 = 0;
+        var scratch: array<u8, 65536>;
+        while (ok) {
+            var amount: i64 = archive_data(reader, &scratch[0], 65536);
+            if (amount == 0) {
+                break;
+            }
+            if (amount < 0 || amount > size - written || io_write_all(fd as i64, &scratch[0], amount) != amount) {
+                ok = false;
+                break;
+            }
+            written += amount;
+        }
+        io_close(fd as i64);
+        extracted += written;
+        if (written != size) {
+            ok = false;
+        }
+    }
+    archive_free(reader);
+    if (!ok) {
+        package_fail("unsafe corrupt or oversized package archive");
+    }
+    return ok;
+}
+
+pub fun publish_install(lock: ptr<u8>, lock_size: i64, new_lock: bool) -> bool {
+    if (new_lock) {
+        var fd: i32 = create_file("jsrt.lock.wjson");
+        if (fd < 0) {
+            return false;
+        }
+        var ok: bool = io_write_all(fd as i64, lock, lock_size) == lock_size;
+        io_close(fd as i64);
+        if (!ok) {
+            return package_fail("cannot write staged lockfile");
+        }
+    }
+    if (!commit_transaction(new_lock)) {
+        return package_fail(transaction_error());
+    }
+    return true;
+}
+
+pub fun end_install() -> bool {
+    if (paths != null) {
+        for (var i: i64 = path_count; i > 0; i--) {
+            var item: ptr<Created> = paths + i - 1;
+            mem_free(deref item.path, mem_len_cstr(deref item.path as str)+1);
+        }
+        mem_free(paths as ptr<u8>, PACKAGE_ENTRY_LIMIT * (size_of<Created>() as i64));
+        paths = null;
+    }
+    stage = -1;
+    path_count = 0;
+    if (!close_transaction()) {
+        return package_fail(transaction_error());
+    }
+    return true;
+}

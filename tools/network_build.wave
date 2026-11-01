@@ -1,0 +1,36 @@
+// Build pinned upstream C libraries; host behavior remains in Wave.
+import("./support")::{run, join, concat, absolute};
+
+pub fun build_network(cc: str, directory: str) -> i32 {
+    var compiler: ptr<u8> = concat("-DCMAKE_C_COMPILER=", absolute(cc) as str);
+    if (compiler == null) {
+        return 1;
+    }
+    var configure: array<str, 12> = ["cmake", "-S", "vendor/libuv", "-B", "target/deps/libuv", "-DBUILD_TESTING=OFF",
+        "-DLIBUV_BUILD_SHARED=OFF", "-DLIBUV_BUILD_TESTS=OFF", "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+        "-DCMAKE_BUILD_TYPE=Release", compiler as str, "-DCMAKE_C_FLAGS=-fstack-protector-strong"];
+    var result: i32 = run(&configure[0], 12);
+    if (result != 0) {
+        return result;
+    }
+    var build: array<str, 7> = ["cmake", "--build", "target/deps/libuv", "--target", "uv_a", "--parallel",
+        "2"];
+    result = run(&build[0], 7);
+    if (result != 0) {
+        return result;
+    }
+    var sources: array<str, 4> = ["vendor/llhttp/src/api.c", "vendor/llhttp/src/http.c", "vendor/llhttp/src/llhttp.c",
+        "native/c/http_parser_abi.c"];
+    var objects: array<str, 4> = ["http-api.o", "http-core.o", "http-parser.o", "http-abi.o"];
+    for (var i: i64 = 0; i < 4; i++) {
+        var command: array<str, 12> = [cc, "-std=c11", "-O2", "-fPIE", "-fstack-protector-strong", "-Ivendor/llhttp/include",
+            "-c", sources[i], "-o", join(directory, objects[i]) as str, "-Wall", "-Wno-unused-parameter"];
+        result = run(&command[0], 12);
+        if (result != 0) {
+            return result;
+        }
+    }
+    var bridge: array<str, 12> = [cc, "-std=c11", "-D_GNU_SOURCE", "-O2", "-fPIE", "-Ivendor/libuv/include",
+        "-c", "native/c/network_abi.c", "-o", join(directory, "network-abi.o") as str, "-Wall", "-Werror"];
+    return run(&bridge[0], 12);
+}

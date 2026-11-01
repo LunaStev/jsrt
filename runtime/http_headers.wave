@@ -1,0 +1,297 @@
+// Header inspection uses native response records; JS getters never run under uv_run.
+import("./http_state")::{HttpConnection, ResponseHeader, connection_for};
+import("./http_values")::{http_define, http_native, http_text, http_object, http_keys};
+import("./http_response")::{header_token, set_response_header, prepare_head, response_header_size};
+import("./values")::{get, put, fail};
+import("./collections")::{length, at, append};
+import("./system")::{encode_host_text};
+import("./config")::{HTTP_HEADER_LIMIT, HTTP_HEADER_COUNT};
+import("std::mem::cstr")::{mem_eq_cstr};
+import("std::mem::alloc")::{mem_free};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_is_array") fun is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_to_number") fun numeric(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+
+fun header_value(ctx: ptr<u8>, header: ptr<ResponseHeader>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (!deref header.array_value) {
+        return http_text(ctx, deref header.value as str);
+    }
+    var result: ptr<u8> = array(ctx, 0, null, ex);
+    protect(ctx, result);
+    var offset: i64 = 0;
+    for (var i: i64 = 0; i < deref header.value_count && deref ex == null; i++) {
+        var value: ptr<u8> = deref header.value + offset;
+        append(ctx, result, http_text(ctx, value as str), ex);
+        while (value[0] != 0) {
+            value = value + 1;
+            offset += 1;
+        }
+        offset += 1;
+    }
+    unprotect(ctx, result);
+    return result;
+}
+
+const GET_HEADER: i32 = 12;
+const HAS_HEADER: i32 = 13;
+const GET_HEADERS: i32 = 14;
+const REMOVE_HEADER: i32 = 15;
+const WRITE_HEAD: i32 = 16;
+
+pub fun install_response_headers(ctx: ptr<u8>, owner: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var names: array<str, 5> = ["getHeader", "hasHeader", "getHeaders", "removeHeader", "writeHead"];
+    for (var i: i64 = 0; i < 5; i++) {
+        http_define(ctx, owner, names[i], http_native(ctx, names[i], GET_HEADER + i as i32), ex);
+    }
+}
+
+fun response(ctx: ptr<u8>, owner: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<HttpConnection> {
+    var client: ptr<HttpConnection> = connection_for(owner);
+    if (client == null || deref client.busy) {
+        fail(ctx, ex, 0, "invalid or busy HTTP response");
+        return null;
+    }
+    return client;
+}
+
+fun named_header(ctx: ptr<u8>, client: ptr<HttpConnection>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> i64 {
+    if (count != 1 || kind(ctx, args[0]) != 4) {
+        fail(ctx, ex, 1, "header name must be a string");
+        return -1;
+    }
+    var bytes: array<u8, 16385>;
+    var n: i64 = encode_host_text(ctx, args[0], &bytes[0], HTTP_HEADER_LIMIT + 1, ex);
+    if (deref ex != null) {
+        return -1;
+    }
+    if (n == 0) {
+        fail(ctx, ex, 1, "empty header name");
+        return -1;
+    }
+    for (var i: i64 = 0; i < n; i++) {
+        if (!header_token(bytes[i])) {
+            fail(ctx, ex, 1, "invalid header name");
+            return -1;
+        }
+        if (bytes[i] >= 65 && bytes[i] <= 90) {
+            bytes[i] += 32;
+        }
+    }
+    for (var i: i64 = 0; i < deref client.header_count; i++) {
+        var h: ptr<ResponseHeader> = deref client.headers + i;
+        if (mem_eq_cstr(deref h.name as str, &bytes[0] as str)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+export(c) fun jsrt_http_get_header(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var client: ptr<HttpConnection> = response(ctx, owner, ex);
+    if (client == null) {
+        return undefined(ctx);
+    }
+    var index: i64 = named_header(ctx, client, count, args, ex);
+    if (index < 0 || deref ex != null) {
+        return undefined(ctx);
+    }
+    var h: ptr<ResponseHeader> = deref client.headers + index;
+    return header_value(ctx, h, ex);
+}
+
+export(c) fun jsrt_http_has_header(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var client: ptr<HttpConnection> = response(ctx, owner, ex);
+    if (client == null) {
+        return undefined(ctx);
+    }
+    return boolean(ctx, named_header(ctx, client, count, args, ex) >= 0);
+}
+
+export(c) fun jsrt_http_get_headers(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var client: ptr<HttpConnection> = response(ctx, owner, ex);
+    var result: ptr<u8> = http_object(ctx);
+    protect(ctx, result);
+    if (client != null) {
+        for (var i: i64 = 0; i < deref client.header_count; i++) {
+            var h: ptr<ResponseHeader> = deref client.headers + i;
+            http_define(ctx, result, deref h.name as str, header_value(ctx, h, ex), ex);
+        }
+    }
+    unprotect(ctx, result);
+    return result;
+}
+
+export(c) fun jsrt_http_remove_header(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var client: ptr<HttpConnection> = response(ctx, owner, ex);
+    if (client == null) {
+        return undefined(ctx);
+    }
+    if (deref client.prepared || deref client.ending) {
+        fail(ctx, ex, 0, "HTTP headers already sent");
+        return undefined(ctx);
+    }
+    var index: i64 = named_header(ctx, client, count, args, ex);
+    if (index >= 0 && deref ex == null) {
+        var h: ptr<ResponseHeader> = deref client.headers + index;
+        deref client.header_bytes -= response_header_size(h);
+        mem_free(deref h.name, deref h.name_length + 1);
+        mem_free(deref h.value, deref h.value_length + 1);
+        for (var i: i64 = index; i + 1 < deref client.header_count; i++) {
+            var target: ptr<ResponseHeader> = deref client.headers + i;
+            var source: ptr<ResponseHeader> = deref client.headers + i + 1;
+            deref target = deref source;
+        }
+        deref client.header_count -= 1;
+        var vacant: ptr<ResponseHeader> = deref client.headers + deref client.header_count;
+        deref vacant.name = null;
+        deref vacant.value = null;
+        deref vacant.name_length = 0;
+        deref vacant.value_length = 0;
+    }
+    return undefined(ctx);
+}
+
+fun stage_raw_headers(ctx: ptr<u8>, source: ptr<u8>, staged: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var n: i64 = length(ctx, source, ex);
+    if (deref ex != null) {
+        return;
+    }
+    if (n < 0 || n % 2 != 0 || n > HTTP_HEADER_COUNT * 2) {
+        fail(ctx, ex, 1, "raw headers require bounded name/value pairs");
+        return;
+    }
+    for (var i: i64 = 0; i < n && deref ex == null; i += 2) {
+        var key: ptr<u8> = at(ctx, source, i, ex);
+        if (deref ex != null) {
+            break;
+        }
+        var name: array<u8, 16385>;
+        var width: i64 = encode_host_text(ctx, key, &name[0], HTTP_HEADER_LIMIT + 1, ex);
+        if (width < 0 || deref ex != null) {
+            break;
+        }
+        if (width == 0) {
+            fail(ctx, ex, 1, "empty raw header name");
+            break;
+        }
+        for (var j: i64 = 0; j < width; j++) {
+            if (!header_token(name[j])) {
+                fail(ctx, ex, 1, "invalid raw header name");
+                break;
+            }
+            if (name[j] >= 65 && name[j] <= 90) {
+                name[j] += 32;
+            }
+        }
+        if (deref ex != null) {
+            break;
+        }
+        var value: ptr<u8> = at(ctx, source, i + 1, ex);
+        if (deref ex != null) {
+            break;
+        }
+        if (kind(ctx, value) != 4) {
+            fail(ctx, ex, 1, "raw header values must be strings");
+            break;
+        }
+        protect(ctx, value);
+        var values: ptr<u8> = get(ctx, staged, &name[0] as str, ex);
+        if (kind(ctx, values) == 0 && deref ex == null) {
+            values = array(ctx, 0, null, ex);
+            http_define(ctx, staged, &name[0] as str, values, ex);
+        }
+        if (deref ex == null) {
+            append(ctx, values, value, ex);
+        }
+        unprotect(ctx, value);
+    }
+}
+
+export(c) fun jsrt_http_write_head(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var client: ptr<HttpConnection> = response(ctx, owner, ex);
+    if (client == null) {
+        return undefined(ctx);
+    }
+    if (deref client.prepared || deref client.ending || count < 1 || count > 2 || kind(ctx, args[0]) != 3) {
+        fail(ctx, ex, 1, "writeHead requires a status and optional headers object before sending");
+        return undefined(ctx);
+    }
+    var code: f64 = numeric(ctx, args[0], ex);
+    if (code != code || code < 200.0 || code > 599.0 || (code as i32) as f64 != code) {
+        fail(ctx, ex, 2, "status must be an integer from 200 to 599");
+        return undefined(ctx);
+    }
+    if (count == 2) {
+        if (kind(ctx, args[1]) != 5) {
+            fail(ctx, ex, 1, "headers must be an object");
+            return undefined(ctx);
+        }
+        // Reserve before ownKeys/getters. Stage user reads before native mutation.
+        deref client.busy = true;
+        var staged: ptr<u8> = http_object(ctx);
+        protect(ctx, staged);
+        var raw: bool = is_array(ctx, args[1]);
+        if (raw) {
+            stage_raw_headers(ctx, args[1], staged, ex);
+        }
+        if (deref ex != null) {
+            deref client.busy = false;
+            unprotect(ctx, staged);
+            return undefined(ctx);
+        }
+        var source: ptr<u8> = args[1];
+        if (raw) {
+            source = staged;
+        }
+        var keys: ptr<u8> = http_keys(ctx, source, ex);
+        protect(ctx, keys);
+        if (deref ex != null) {
+            deref client.busy = false;
+            unprotect(ctx, keys);
+            unprotect(ctx, staged);
+            return undefined(ctx);
+        }
+        var n: i64 = length(ctx, keys, ex);
+        if (n > HTTP_HEADER_COUNT) {
+            fail(ctx, ex, 2, "too many headers");
+        }
+        for (var i: i64 = 0; i < n && !raw && deref ex == null; i++) {
+            var key: ptr<u8> = at(ctx, keys, i, ex);
+            var name: array<u8, 16385>;
+            if (encode_host_text(ctx, key, &name[0], HTTP_HEADER_LIMIT + 1, ex) >= 0) {
+                put(ctx, staged, &name[0] as str, get(ctx, args[1], &name[0] as str, ex), ex);
+            }
+        }
+        deref client.busy = false;
+        for (var i: i64 = 0; i < n && deref ex == null; i++) {
+            var key: ptr<u8> = at(ctx, keys, i, ex);
+            var name: array<u8, 16385>;
+            if (encode_host_text(ctx, key, &name[0], HTTP_HEADER_LIMIT + 1, ex) >= 0) {
+                var pair: array<ptr<u8>, 2> = [key, get(ctx, staged, &name[0] as str, ex)];
+                set_response_header(ctx, owner, 2, &pair[0], ex);
+            }
+        }
+        unprotect(ctx, staged);
+        unprotect(ctx, keys);
+    }
+    if (deref ex == null) {
+        deref client.busy = true;
+        put(ctx, owner, "statusCode", args[0], ex);
+        deref client.busy = false;
+    }
+    if (deref ex == null) {
+        prepare_head(ctx, client, false, 0, ex);
+    }
+    return owner;
+}

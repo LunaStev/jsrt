@@ -1,0 +1,100 @@
+// CLI parsing only borrows argv strings; the session owns script storage.
+import("std::mem::cstr")::{mem_eq_cstr};
+import("./output")::{write_text};
+import("./engine")::{write_version, write_info};
+import("./package_install")::{run_install};
+import("./package_cache_cli")::{run_cache_cli};
+
+extern(c, "jsrt_argc") fun jsrt_argc() -> i32;
+extern(c, "jsrt_argv") fun jsrt_argv(index: i32) -> str;
+
+pub struct LaunchOptions {
+    memory_bytes: i64;
+    source_index: i32;
+    path: str;
+    eval_mode: bool;
+    check_only: bool;
+}
+
+fun help() {
+    write_text(1, "JavaScript runtime — Wave host\n\nUsage:\n  jsrt run <file.js> [--] [args...]\n  jsrt <file.js> [--] [args...]\n  jsrt -e <script> [--] [args...]\n  jsrt --check <file.js>\n  jsrt --version\n  jsrt --info\n  jsrt install [--project <directory>] [--frozen-lockfile] [--offline]\n");
+    write_text(1, "\nOptional script prefix: --memory-limit-mb <1..1048576 MiB>\nApplies a process address-space limit; JavaScriptCore virtual reservations count too.\n");
+    write_text(1, "\n  jsrt test [--] <file.js>...\nRun explicit test files sequentially in isolated processes.\nInstall development dependencies with install --include-dev.\nReplace a managed tree with install --replace; re-resolve its lock with --update.\n");
+    write_text(1, "\n  jsrt cache prune [--project <directory>] [--max-mb <0..256>] [--max-entries <0..1024>]\n");
+}
+
+// A nonnegative result is a completed CLI command; -1 requests a session.
+pub fun handle_cli() -> i32 {
+    var count: i32 = jsrt_argc();
+    if (count == 1) {
+        help();
+        return 0;
+    }
+    var command: str = jsrt_argv(1);
+    if (mem_eq_cstr(command, "--help")) {
+        help();
+        return 0;
+    }
+    if (mem_eq_cstr(command, "install")) {
+        return run_install();
+    }
+    if (mem_eq_cstr(command, "cache")) {
+        return run_cache_cli();
+    }
+    if (mem_eq_cstr(command, "test")) {
+        return -2;
+    }
+    if (mem_eq_cstr(command, "--info")) {
+        if (count != 2) {
+            write_text(2, "--info takes no arguments\n");
+            return 2;
+        }
+        return write_info();
+    }
+    if (mem_eq_cstr(command, "--version")) {
+        write_version();
+        return 0;
+    }
+    return -1;
+}
+
+pub fun parse_launch(options: ptr<LaunchOptions>) -> bool {
+    var base: i32 = 1;
+    deref options.memory_bytes = 0;
+    if (mem_eq_cstr(jsrt_argv(base), "--memory-limit-mb")) {
+        if (jsrt_argc() < 4) {
+            write_text(2, "expected --memory-limit-mb <positive MiB> <script>\n");
+            return false;
+        }
+        var value: str = jsrt_argv(2);
+        var number: i64 = 0;
+        var i: i64 = 0;
+        while (value[i] != 0) {
+            if (value[i] < 48 || value[i] > 57 || number > 1048576) {
+                write_text(2, "invalid memory limit; expected 1..1048576 MiB\n");
+                return false;
+            }
+            number = number * 10 + (value[i] as i64) - 48;
+            i += 1;
+        }
+        if (i == 0 || number < 1 || number > 1048576) {
+            write_text(2, "invalid memory limit; expected 1..1048576 MiB\n");
+            return false;
+        }
+        deref options.memory_bytes = number * 1048576;
+        base = 3;
+    }
+    var command: str = jsrt_argv(base);
+    deref options.eval_mode = mem_eq_cstr(command, "-e");
+    deref options.check_only = mem_eq_cstr(command, "--check");
+    deref options.source_index = base;
+    if (deref options.eval_mode || deref options.check_only || mem_eq_cstr(command, "run")) {
+        deref options.source_index = base + 1;
+    }
+    if (jsrt_argc() <= deref options.source_index || (deref options.check_only && jsrt_argc() != deref options.source_index + 1)) {
+        write_text(2, "expected one script; use --help\n");
+        return false;
+    }
+    deref options.path = jsrt_argv(deref options.source_index);
+    return true;
+}

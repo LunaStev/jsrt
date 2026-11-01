@@ -1,0 +1,39 @@
+// Engine identity, metadata and baseline policy; JSC owns JS execution.
+import("std::mem::cstr")::{mem_eq_cstr};
+import("./config")::{engine_supported};
+import("./info")::{write_runtime_info};
+import("./output")::{write_text};
+
+extern(c, "wr_engine_name") fun wr_engine_name() -> str;
+extern(c, "wr_engine_version") fun wr_engine_version() -> str;
+extern(c, "wr_engine_major") fun wr_engine_major() -> u32;
+extern(c, "wr_engine_minor") fun wr_engine_minor() -> u32;
+extern(c, "wr_engine_micro") fun wr_engine_micro() -> u32;
+extern(c, "wr_engine_patch") fun wr_engine_patch() -> u32;
+extern(c, "jsrt_older_engine_allowed") fun jsrt_older_engine_allowed() -> i32;
+extern(c, "fflush") fun fflush(stream: ptr<u8>) -> i32;
+
+pub fun write_version() {
+    println("JavaScript runtime 0.1.0-dev / {} {}", wr_engine_name(), wr_engine_version());
+    fflush(null);
+    if (jsrt_older_engine_allowed() == 1) {
+        write_text(1, "Explicit older-engine compatibility build\n");
+    }
+}
+
+pub fun write_info() -> i32 {
+    return write_runtime_info(wr_engine_major(), wr_engine_minor(), wr_engine_micro(), wr_engine_patch(),
+        jsrt_older_engine_allowed() == 1);
+}
+
+pub fun require_supported_engine() -> bool {
+    if (jsrt_older_engine_allowed() == 1) {
+        return true;
+    }
+    if (!mem_eq_cstr(wr_engine_name(), "JavaScriptCoreGTK") || !engine_supported(wr_engine_major(), wr_engine_minor(),
+        wr_engine_micro(), wr_engine_patch())) {
+        write_text(2, "JavaScriptCoreGTK 2.54.1 or newer is required\n");
+        return false;
+    }
+    return true;
+}

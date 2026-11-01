@@ -1,0 +1,351 @@
+// Writable queues, serialized writes, completion and finalization.
+import("./stream_operations")::{schedule, release_pass_write, push_chunk, destroy_stream, auto_destroy};
+import("./stream_transform")::{transform_write, transform_flush};
+import("./stream_state")::{finish_stream_signal};
+import("./values")::{get, put, text, plain, fail};
+import("./collections")::{list, length, at, append, remove_at, integer, flag, set_integer, set_flag, enqueue,
+    bind_one};
+import("./events")::{add_listener, emit_named};
+import("./stream_state")::{stream_state, stream_chunk, stream_state_storage, StreamHostState, stream_chunk_size};
+import("./buffer_core")::{byte_view_length};
+import("./config")::{STREAM_BYTE_LIMIT, STREAM_CHUNK_LIMIT};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, left: ptr<u8>, right: ptr<u8>) -> bool;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+
+pub fun stream_write(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<u8> = stream_state(ctx, receiver, 2, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    if (count == 0) {
+        fail(ctx, ex, 1, "write requires a chunk");
+        return undefined(ctx);
+    }
+    if (flag(ctx, state, "destroyed", ex) || flag(ctx, state, "ending", ex)) {
+        fail(ctx, ex, 0, "write after end or destroy");
+        return undefined(ctx);
+    }
+    var enc: ptr<u8> = undefined(ctx);
+    var completion: ptr<u8> = undefined(ctx);
+    if (count > 1) {
+        if (kind(ctx, args[1]) == 5 && callable(ctx, args[1])) {
+            completion = args[1];
+        } else {
+            enc = args[1];
+        }
+    }
+    if (count > 2) {
+        completion = args[2];
+    }
+    if (kind(ctx, completion) != 0 && (kind(ctx, completion) != 5 || !callable(ctx, completion))) {
+        fail(ctx, ex, 1, "write callback must be a function");
+        return undefined(ctx);
+    }
+    if (kind(ctx, args[0]) == 1) {
+        fail(ctx, ex, 1, "null is not a writable chunk");
+        return undefined(ctx);
+    }
+    var chunk: ptr<u8> = args[0];
+    if (!flag(ctx, state, "writableObjectMode", ex)) {
+        chunk = stream_chunk(ctx, args[0], enc, ex);
+    }
+    if (chunk == null || deref ex != null) {
+        return undefined(ctx);
+    }
+    protect(ctx, chunk);
+    var size: i64 = stream_chunk_size(ctx, state, chunk, false, ex);
+    var bytes: i64 = integer(ctx, state, "wbytes", ex);
+    var writes: ptr<u8> = get(ctx, state, "writes", ex);
+    if (size > STREAM_BYTE_LIMIT - bytes || length(ctx, writes, ex) >= STREAM_CHUNK_LIMIT) {
+        fail(ctx, ex, 2, "writable queue limit exceeded");
+    }
+    if (deref ex == null) {
+        var record: ptr<u8> = plain(ctx);
+        protect(ctx, record);
+        put(ctx, record, "chunk", chunk, ex);
+        put(ctx, record, "callback", completion, ex);
+        set_integer(ctx, record, "size", size, ex);
+        append(ctx, writes, record, ex);
+        unprotect(ctx, record);
+        set_integer(ctx, state, "wbytes", bytes + size, ex);
+    }
+    var ready: bool = bytes + size < integer(ctx, state, "writeHigh", ex);
+    if (!ready) {
+        set_flag(ctx, state, "needDrain", true, ex);
+    }
+    schedule(ctx, receiver, state, true, ex);
+    unprotect(ctx, chunk);
+    return boolean(ctx, ready);
+}
+
+pub fun stream_end(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var state: ptr<u8> = stream_state(ctx, receiver, 2, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    if (flag(ctx, state, "destroyed", ex) || flag(ctx, state, "ending", ex)) {
+        fail(ctx, ex, 0, "end after end or destroy");
+        return undefined(ctx);
+    }
+    var completion: ptr<u8> = undefined(ctx);
+    var amount: i64 = count;
+    if (amount > 0 && kind(ctx, args[amount - 1]) == 5 && callable(ctx, args[amount - 1])) {
+        completion = args[amount - 1];
+        amount -= 1;
+    }
+    if (amount > 2) {
+        fail(ctx, ex, 1, "end accepts a chunk, encoding and callback");
+        return undefined(ctx);
+    }
+    if (amount > 0 && kind(ctx, args[0]) != 0) {
+        stream_write(ctx, (deref stream_state_roots.stream_methods)[4], receiver, amount, args, ex);
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (kind(ctx, completion) == 5) {
+        add_listener(ctx, receiver, text(ctx, "finish"), completion, true, false, ex);
+    }
+    set_flag(ctx, state, "ending", true, ex);
+    set_integer(ctx, state, "corked", 0, ex);
+    schedule(ctx, receiver, state, true, ex);
+    return receiver;
+}
+
+pub fun stream_pump_write(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var state: ptr<u8> = stream_state(ctx, receiver, 2, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    set_flag(ctx, state, "writeScheduled", false, ex);
+    if (flag(ctx, state, "destroyed", ex) || flag(ctx, state, "writing", ex) ||
+        integer(ctx, state, "corked", ex) > 0) {
+        return undefined(ctx);
+    }
+    var writes: ptr<u8> = get(ctx, state, "writes", ex);
+    if (length(ctx, writes, ex) == 0) {
+        if (flag(ctx, state, "ending", ex) && !flag(ctx, state, "finished", ex)) {
+            if (flag(ctx, state, "transform", ex) && !transform_flush(ctx, receiver, state, ex)) {
+                return undefined(ctx);
+            }
+            if (!flag(ctx, state, "finalDone", ex)) {
+                if (flag(ctx, state, "finalStarted", ex)) {
+                    return undefined(ctx);
+                }
+                set_flag(ctx, state, "finalStarted", true, ex);
+                var hook: ptr<u8> = get(ctx, receiver, "_final", ex);
+                protect(ctx, hook);
+                if (flag(ctx, state, "destroyed", ex)) {
+                    unprotect(ctx, hook);
+                    return undefined(ctx);
+                }
+                if (kind(ctx, hook) == 5 && callable(ctx, hook) && deref ex == null) {
+                    var done: ptr<u8> = bind_one(ctx, (deref stream_state_roots.stream_methods)[23],
+                        receiver, undefined(ctx), ex);
+                    protect(ctx, done);
+                    var call_args: array<ptr<u8>, 1> = [done];
+                    call(ctx, hook, receiver, 1, &call_args[0], ex);
+                    unprotect(ctx, done);
+                    unprotect(ctx, hook);
+                    if (deref ex != null) {
+                        var reason: ptr<u8> = deref ex;
+                        protect(ctx, reason);
+                        deref ex = null;
+                        destroy_stream(ctx, receiver, state, reason, ex);
+                        unprotect(ctx, reason);
+                    }
+                    return undefined(ctx);
+                }
+                unprotect(ctx, hook);
+                set_flag(ctx, state, "finalDone", true, ex);
+            }
+            set_flag(ctx, state, "finished", true, ex);
+            if (flag(ctx, state, "passThrough", ex) || flag(ctx, state, "transform", ex)) {
+                set_flag(ctx, state, "ended", true, ex);
+                schedule(ctx, receiver, state, false, ex);
+            }
+            finish_stream_signal(ctx, state, ex);
+            emit_named(ctx, receiver, "finish", 0, null, ex);
+            auto_destroy(ctx, receiver, state, ex);
+        }
+        return undefined(ctx);
+    }
+    var record: ptr<u8> = at(ctx, writes, 0, ex);
+    var vector: ptr<u8> = undefined(ctx);
+    var writer: ptr<u8> = undefined(ctx);
+    if (!flag(ctx, state, "passThrough", ex) && !flag(ctx, state, "transform", ex) && length(ctx, writes, ex) > 1) {
+        writer = get(ctx, receiver, "_writev", ex);
+    }
+    if (flag(ctx, state, "destroyed", ex)) {
+        return undefined(ctx);
+    }
+    protect(ctx, writer);
+    if (deref ex == null && kind(ctx, writer) == 5 && callable(ctx, writer)) {
+        record = plain(ctx);
+        protect(ctx, record);
+        vector = array(ctx, 0, null, ex);
+        protect(ctx, vector);
+        var batch: ptr<u8> = list(ctx, ex);
+        protect(ctx, batch);
+        var size: i64 = 0;
+        for (var i: i64 = 0; i < length(ctx, writes, ex) && deref ex == null; i++) {
+            var item: ptr<u8> = at(ctx, writes, i, ex);
+            append(ctx, batch, item, ex);
+            var entry: ptr<u8> = plain(ctx);
+            protect(ctx, entry);
+            put(ctx, entry, "chunk", get(ctx, item, "chunk", ex), ex);
+            put(ctx, entry, "encoding", text(ctx, "buffer"), ex);
+            append(ctx, vector, entry, ex);
+            unprotect(ctx, entry);
+            size += integer(ctx, item, "size", ex);
+        }
+        put(ctx, record, "batch", batch, ex);
+        set_integer(ctx, record, "size", size, ex);
+        put(ctx, state, "inflight", record, ex);
+        unprotect(ctx, batch);
+        unprotect(ctx, record);
+    } else {
+        put(ctx, state, "inflight", record, ex);
+    }
+    set_flag(ctx, state, "writing", true, ex);
+    var chunk: ptr<u8> = get(ctx, record, "chunk", ex);
+    if (deref ex == null && kind(ctx, vector) == 5) {
+        var done: ptr<u8> = bind_one(ctx, (deref stream_state_roots.stream_methods)[11], receiver, record, ex);
+        protect(ctx, done);
+        var call_args: array<ptr<u8>, 2> = [vector, done];
+        if (deref ex == null) {
+            call(ctx, writer, receiver, 2, &call_args[0], ex);
+        }
+        unprotect(ctx, done);
+    } else if (flag(ctx, state, "passThrough", ex) || flag(ctx, state, "transform", ex)) {
+        if (flag(ctx, state, "transform", ex)) {
+            transform_write(ctx, receiver, state, record, chunk, ex);
+        } else {
+            push_chunk(ctx, receiver, state, chunk, ex);
+            release_pass_write(ctx, receiver, state, ex);
+        }
+    } else {
+        var writer: ptr<u8> = get(ctx, receiver, "_write", ex);
+        protect(ctx, writer);
+        if (kind(ctx, writer) != 5 || !callable(ctx, writer)) {
+            fail(ctx, ex, 0, "Writable requires a write hook");
+        } else {
+            var done: ptr<u8> = bind_one(ctx, (deref stream_state_roots.stream_methods)[11], receiver,
+                record, ex);
+            protect(ctx, done);
+            var encoding: ptr<u8> = text(ctx, "buffer");
+            protect(ctx, encoding);
+            var call_args: array<ptr<u8>, 3> = [chunk, encoding, done];
+            if (deref ex == null && !flag(ctx, state, "destroyed", ex)) {
+                call(ctx, writer, receiver, 3, &call_args[0], ex);
+            }
+            unprotect(ctx, encoding);
+            unprotect(ctx, done);
+        }
+        unprotect(ctx, writer);
+    }
+    unprotect(ctx, writer);
+    if (kind(ctx, vector) == 5) {
+        unprotect(ctx, vector);
+    }
+    if (deref ex != null) {
+        var reason: ptr<u8> = deref ex;
+        protect(ctx, reason);
+        deref ex = null;
+        destroy_stream(ctx, receiver, state, reason, ex);
+        unprotect(ctx, reason);
+    }
+    return undefined(ctx);
+}
+
+pub fun stream_done(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var state: ptr<u8> = stream_state(ctx, receiver, 2, ex);
+    if (state == null || count == 0) {
+        return undefined(ctx);
+    }
+    var record: ptr<u8> = args[0];
+    if (flag(ctx, state, "destroyed", ex)) {
+        return undefined(ctx);
+    }
+    if (flag(ctx, record, "done", ex)) {
+        fail(ctx, ex, 0, "write callback called more than once");
+        return undefined(ctx);
+    }
+    set_flag(ctx, record, "done", true, ex);
+    if (count > 1 && kind(ctx, args[1]) != 0 && kind(ctx, args[1]) != 1) {
+        put(ctx, record, "error", args[1], ex);
+    }
+    enqueue(ctx, (deref stream_state_roots.stream_methods)[12], receiver, record, ex);
+    return undefined(ctx);
+}
+
+pub fun stream_complete(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<u8> = stream_state(ctx, receiver, 2, ex);
+    if (state == null || count == 0 || flag(ctx, state, "destroyed", ex)) {
+        return undefined(ctx);
+    }
+    var record: ptr<u8> = args[0];
+    if (!equal(ctx, record, get(ctx, state, "inflight", ex))) {
+        return undefined(ctx);
+    }
+    var error: ptr<u8> = get(ctx, record, "error", ex);
+    if (kind(ctx, error) != 0) {
+        destroy_stream(ctx, receiver, state, error, ex);
+        return undefined(ctx);
+    }
+    var writes: ptr<u8> = get(ctx, state, "writes", ex);
+    var batch: ptr<u8> = get(ctx, record, "batch", ex);
+    protect(ctx, batch);
+    var amount: i64 = 1;
+    if (kind(ctx, batch) == 5) {
+        amount = length(ctx, batch, ex);
+    }
+    for (var i: i64 = 0; i < amount; i++) {
+        remove_at(ctx, writes, 0, ex);
+    }
+    set_integer(ctx, state, "wbytes", integer(ctx, state, "wbytes", ex) - integer(ctx, record, "size",
+        ex), ex);
+    put(ctx, state, "inflight", undefined(ctx), ex);
+    set_flag(ctx, state, "writing", false, ex);
+    var first: ptr<u8> = null;
+    for (var i: i64 = 0; i < amount; i++) {
+        var item: ptr<u8> = record;
+        if (kind(ctx, batch) == 5) {
+            item = at(ctx, batch, i, ex);
+        }
+        var completion: ptr<u8> = get(ctx, item, "callback", ex);
+        if (kind(ctx, completion) == 5 && deref ex == null) {
+            var nested: ptr<u8> = null;
+            call(ctx, completion, receiver, 0, null, &nested);
+            if (nested != null && first == null) {
+                first = nested;
+                protect(ctx, first);
+            }
+        }
+    }
+    unprotect(ctx, batch);
+    if (first != null) {
+        deref ex = first;
+        unprotect(ctx, first);
+    }
+    if (deref ex == null && flag(ctx, state, "needDrain", ex) && integer(ctx, state, "wbytes", ex) == 0 && !flag(ctx,
+        state, "ending", ex) && !flag(ctx, state, "destroyed", ex)) {
+        set_flag(ctx, state, "needDrain", false, ex);
+        emit_named(ctx, receiver, "drain", 0, null, ex);
+    }
+    schedule(ctx, receiver, state, true, ex);
+    return undefined(ctx);
+}

@@ -1,0 +1,374 @@
+// HTTP client, cancellation, upload and transport policy regressions.
+import("jsrt::tools::support")::{join, concat, spawn, wait, absolute};
+import("jsrt::runtime::http_response_bytes")::{HttpOutput, encode_head, encode_frame};
+import("jsrt::runtime::client_transfer")::{Client, receive_body, receive_header, supply_upload};
+import("jsrt::runtime::network_deadlines")::{connection_deadline};
+import("std::mem::layout")::{size_of};
+import("std::fs::file")::{create, remove};
+import("std::io::fd")::{io_close};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::ops")::{mem_eq, mem_zero};
+import("std::mem::cstr")::{mem_len_cstr};
+import("std::net::socket_base")::{net_socket_tcp_v4, net_connect_socket_v4, net_close, net_bind_socket_v4,
+    net_local_addr_v4};
+import("std::net::socketopt")::{net_set_nonblock};
+import("std::net::address")::{socket_addr_v4_loopback, SocketAddrV4};
+import("std::net::poll")::{net_wait_connected};
+import("std::time::clock")::{time_now_monotonic_ns};
+import("std::time::sleep")::{time_sleep_ms};
+import("std::process::core")::{proc_kill};
+import("./harness")::{async_case, check, contains, expect, test, TestState, test_state};
+import("./network_server")::{body_case, http_dispatch_tests};
+import("jsrt::tools::compiler")::{compile_tls_peer};
+
+pub fun client_tests() {
+    var suite: ptr<TestState> = test_state();
+    http_dispatch_tests();
+    test("path join accepts a single path at the documented byte boundary", "const p=require('path');for(const n of [8189,8190,8191])console.log(p.join('a'.repeat(n)).length);try{p.join('a'.repeat(8191),'b')}catch(e){console.log(e instanceof RangeError)}",
+        "8189\n8190\n8191\ntrue\n", 0, "");
+    test("finished option getter exceptions preserve identity without listener registration", "const s=require('stream'),r=new s.Readable(),reason=Error('options');for(const name of ['readable','writable','signal']){const o={get [name](){throw reason}};try{s.finished(r,o,()=>{})}catch(e){console.log(e===reason,r.listenerCount('end'),r.listenerCount('error'))}}",
+        "true 0 0\ntrue 0 0\ntrue 0 0\n", 0, "");
+    test("finished invalid signals reject before constructing a partial watcher", "const s=require('stream'),r=new s.Readable();for(const signal of [3,{},false]){try{s.finished(r,{signal},()=>{})}catch(e){console.log(e instanceof TypeError,r.listenerCount('end'),r.listenerCount('error'))}}",
+        "true 0 0\ntrue 0 0\ntrue 0 0\n", 0, "");
+    test("stream constructors propagate throwing option getters as JS exceptions", "const s=require('stream'),reason=Error('getter');for(const C of [s.Readable,s.Writable,s.PassThrough]){for(const key of ['objectMode','readableObjectMode','writableObjectMode','highWaterMark','read','write','final','destroy']){try{new C({get [key](){throw reason}});throw Error('missing')}catch(e){if(e!==reason)throw e}}}console.log('24 preserved');",
+        "24 preserved\n", 0, "");
+    test("fetch option getters reject promises with original exceptions", "const reason=Error('getter');Promise.all(['method','rejectUnauthorized','signal','connectTimeout','timeout','redirect','headers','caFile','body'].map(key=>fetch('http://localhost/',{get [key](){throw reason}}).then(()=>false,e=>e===reason))).then(a=>console.log(a.length,a.every(Boolean)));",
+        "9 true\n", 0, "");
+    async_case("file stream option getter reentrancy cannot reuse a reserved resource", "const f=require('fs'),p=process.argv[2];f.writeFileSync(p,'outer');let inner;const r=f.createReadStream(p,{get highWaterMark(){inner=f.createReadStream('README.md');inner.on('error',()=>{});inner.destroy();return 2}}),a=[];r.on('data',b=>a.push(b));r.on('end',()=>console.log(Buffer.concat(a).toString()));",
+        "outer\n", 0, "");
+    async_case("failed outer file stream validation leaves reentrant inner stream intact", "const f=require('fs'),p=process.argv[2];f.writeFileSync(p,'inner');const reason=Error('options');try{f.createReadStream('README.md',{get highWaterMark(){const r=f.createReadStream(p),a=[];r.on('data',b=>a.push(b));r.on('end',()=>console.log(Buffer.concat(a).toString()));throw reason}})}catch(e){console.log(e===reason)}",
+        "true\ninner\n", 0, "");
+    test("invalid request header names stop before native C string comparison", "Promise.all(['x'.repeat(8192),'한'.repeat(3000)].map(k=>fetch('http://localhost/',{headers:{[k]:'v'}}).then(()=>false,e=>e instanceof RangeError))).then(a=>console.log(a.every(Boolean)));",
+        "true\n", 0, "");
+    test("request header getter exceptions preserve identity without native rooting", "const reason=Error('header'),headers={get x(){throw reason}};fetch('http://localhost/',{headers}).catch(e=>console.log(e===reason));",
+        "true\n", 0, "");
+    test("streaming request owns Expect negotiation rather than injecting continue", "fetch('http://localhost/',{headers:{Expect:'100-continue'}}).catch(e=>console.log(e instanceof TypeError));",
+        "true\n", 0, "");
+    test("finished signal cancellation stops monitoring without destroying the stream", "const s=require('stream'),c=new AbortController(),r=new s.Readable({read(){}});s.promises.finished(r,{signal:c.signal}).catch(e=>console.log(e.name,e.cause,r.destroyed,r.listenerCount('end'),r.listenerCount('error')));c.abort(42);",
+        "AbortError 42 false 0 0\n", 0, "");
+    test("finished pre-aborted callback is asynchronous and cleanup cancels monitoring", "const s=require('stream'),r=new s.Readable({read(){}});s.finished(r,{signal:AbortSignal.abort()},e=>console.log(e.name));const c=new AbortController(),cleanup=s.finished(r,{signal:c.signal},()=>{throw Error('wrong')});cleanup();c.abort();console.log('sync');",
+        "sync\nAbortError\n", 0, "");
+    test("HTTP signal cancellation wraps arbitrary reasons as AbortError causes", "const c=new AbortController(),reason=17,r=require('http').request('http://localhost/',{signal:c.signal});r.on('error',e=>console.log(e.name,e.cause));c.abort(reason);",
+        "AbortError 17\n", 0, "");
+    test("POSIX path aliases normalization and joins preserve relative parents", "const p=require('path');console.log(p===require('node:path'),p===p.posix,p===require('path/posix'));console.log(p.normalize('/a//b/../c/'),p.normalize('a/../../b'),p.normalize(''),p.join('a','','/b','..','c'));",
+        "true true true\n/a/c/ ../b . a/c\n", 0, "");
+    test("POSIX path parsing handles roots dotfiles trailing separators and Unicode", "const p=require('path');for(const s of ['/a///file.txt/','.gitignore','..','/'])console.log(p.dirname(s),p.basename(s),p.extname(s));console.log(JSON.stringify(p.parse('/한글/a.tar.gz')),p.basename('abc.js','.js'),p.isAbsolute('/a'),p.isAbsolute('a'));",
+        "/a// file.txt .txt\n. .gitignore \n. .. \n/  \n{\"root\":\"/\",\"dir\":\"/한글\",\"base\":\"a.tar.gz\",\"ext\":\".gz\",\"name\":\"a.tar\"} abc true false\n",
+        0, "");
+    test("POSIX path resolve and relative use complete component boundaries", "const p=require('path');console.log(p.resolve('/a','b','/c','..','d'),p.resolve()===process.cwd());for(const a of [['/a/b','/a/c'],['/a','/a/b'],['/a/b','/a'],['/abc','/abcd'],['/','/a'],['/a','/'],['/a','/a']])console.log(JSON.stringify(p.relative(...a)));",
+        "/d true\n\"../c\"\n\"b\"\n\"..\"\n\"../abcd\"\n\"a\"\n\"..\"\n\"\"\n", 0, "");
+    test("POSIX path rejects coercion malformed text and oversized combined paths", "const p=require('path');for(const f of [()=>p.normalize(3),()=>p.join('a',{}),()=>p.relative('/a'),()=>p.basename('a',3),()=>p.normalize('a\\0b'),()=>p.normalize('\\ud800'),()=>p.join('a'.repeat(5000),'b'.repeat(5000))]){try{f()}catch(e){console.log(e instanceof Error)}}",
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n", 0, "");
+    test("OS module reports actual platform identity and resource information", "const o=require('os');console.log(o===require('node:os'),o.platform(),o.type(),o.EOL==='\\n',o.devNull);console.log(o.hostname().length>0,o.release().length>0,o.version().length>0,o.homedir().startsWith('/'),o.tmpdir().length>0);console.log(o.uptime()>0,o.totalmem()>0,o.freemem()>=0,o.availableParallelism()>=1,['LE','BE'].includes(o.endianness()));",
+        "true linux Linux true /dev/null\ntrue true true true true\ntrue true true true true\n", 0, "");
+    test("util promisify preserves receiver asynchronous completion and single settlement", "const u=require('util'),o={n:40,f(a,cb){setTimeout(()=>{cb(null,this.n+a);cb(Error('late'))},1)}};o.p=u.promisify(o.f);o.p(2).then(v=>console.log(v,u===require('node:util')));",
+        "42 true\n", 0, "");
+    test("POSIX path format preserves precedence extensions and parse round trips", "const p=require('path');for(const s of ['/a/b.txt','/','file','.hidden','..','a/../b.js'])console.log(p.format(p.parse(s)));console.log(p.format({dir:'/a',root:'/',base:'b',name:'ignored',ext:'.x'}),p.format({root:'/',name:'a',ext:'txt'}),p.format({dir:'/a',ext:'txt'}),p.format({dir:'/a'}));",
+        "/a/b.txt\n/\nfile\n.hidden\n..\na/../b.js\n/a/b /a.txt /a/.txt /a/\n", 0, "");
+    test("POSIX path format stops at throwing getters and rejects invalid fields", "const p=require('path');let touched=0;try{p.format({get dir(){throw Error('directory')},get root(){touched++;return '/'}})}catch(e){console.log(e.message,touched)}for(const v of [null,42,'x',{dir:42},{name:{}}])try{p.format(v);throw Error('accepted')}catch(e){console.log(e instanceof TypeError)}console.log(p.format({base:'safe',get name(){throw Error('unused')}}));",
+        "directory 0\ntrue\ntrue\ntrue\ntrue\ntrue\nsafe\n", 0, "");
+    test("Headers supports normalized records pairs copying and mutation", "const h=new Headers([['X-A',' first '],['x-a','second'],['z',42]]),copy=new Headers(h);console.log(h instanceof Headers,h.get('X-A'),h.has('missing'),h.get('missing'));h.set('x-a','third');h.delete('z');console.log(copy.get('x-a'),copy.get('z'),h.get('x-a'),h.has('z'));h.set('__proto__','safe');console.log(h.get('__proto__'));",
+        "true first, second false null\nfirst, second 42 third false\nsafe\n", 0, "");
+    test("Headers validates names bytes receiver and conversion ordering", "for(const f of [()=>new Headers([['bad name','x']]),()=>new Headers([['x','a\\r\\nb']]),()=>new Headers([['x','한글']]),()=>new Headers([['x']]),()=>Headers.prototype.get.call({},'x')])try{f();throw Error('accepted')}catch(e){console.log(e instanceof TypeError)}const h=new Headers;let touched=0;try{h.set({toString(){throw Error('name')}},{toString(){touched++;return 'value'}})}catch(e){console.log(e.message,touched,h.has('x'))}",
+        "true\ntrue\ntrue\ntrue\ntrue\nname 0 false\n", 0, "");
+    test("Headers forEach uses sorted live fields and captured intrinsics", "const h=new Headers({z:'3',a:'1'}),r={};let out=[];Object.keys=null;Array.prototype.sort=null;h.forEach(function(v,k,self){if(this!==r||self!==h)throw Error('receiver');out.push(k+v);if(k==='a')h.set('b','2')},r);console.log(out.join('|'));",
+        "a1|b2|z3\n", 0, "");
+    test("Headers exposes sorted pair key and value iterators", "const h=new Headers([['Z','3'],['a','1'],['a','2']]);console.log(h.entries===h[Symbol.iterator],JSON.stringify([...h]),[...h.keys()].join(','),[...h.values()].join('|'));const i=h.entries();console.log(i[Symbol.iterator]()===i,Object.prototype.toString.call(i),Array.isArray(i.next().value));",
+        "true [[\"a\",\"1, 2\"],[\"z\",\"3\"]] a,z 1, 2|3\ntrue [object Headers Iterator] true\n", 0, "");
+    test("Headers iterators observe sorted list changes between next calls", "const h=new Headers({a:'1',c:'3'}),i=h.entries();console.log(i.next().value.join(':'));h.set('b','2');h.set('c','changed');console.log(i.next().value.join(':'));h.delete('c');console.log(i.next().done);h.set('d','4');console.log(i.next().value.join(':'),i.next().done);",
+        "a:1\nb:2\ntrue\nd:4 true\n", 0, "");
+    test("Headers iterator cursors are independent and ignore forged public fields", "const h=new Headers({a:'1',b:'2'}),a=h.keys(),b=h.values();a.index=999;a.values={};a.mode=7;console.log(a.next().value,b.next().value,a.next().value,b.next().value,a.next().done,b.next().done);",
+        "a 1 b 2 true true\n", 0, "");
+    test("Headers iterator next validates private brands without proxy traps", "const h=new Headers({a:'1'}),i=h.entries(),next=i.next;let errors=0,traps=0;for(const target of [{},h,new Proxy(i,{get(){traps++;throw Error('trap')}})])try{next.call(target)}catch(e){if(e instanceof TypeError)errors++}try{Headers.prototype.entries.call(i)}catch(e){if(e instanceof TypeError)errors++}console.log(errors,traps,next.call(i).value.join(':'));",
+        "4 0 a:1\n", 0, "");
+    test("Headers iterators retain captured intrinsics and engine well-known symbols", "const h=new Headers({z:'3',a:'1'}),i=h.entries(),key=Symbol.iterator;Object.keys=null;Array.prototype.sort=null;WeakMap.prototype.get=WeakMap.prototype.set=null;globalThis.Symbol=null;globalThis.Array=null;let out='';for(const pair of h)out+=pair[0]+pair[1];console.log(out,i[key]()===i,i.next().value[0]);",
+        "a1z3 true a\n", 0, "");
+    test("Headers iterator results define own data properties past inherited setters", "const h=new Headers({a:'1'}),i=h.entries();Object.defineProperty(Object.prototype,'value',{__proto__:null,set(){throw Error('value setter')},configurable:true});Object.defineProperty(Object.prototype,'done',{__proto__:null,set(){throw Error('done setter')},configurable:true});const r=i.next(),d=i.next();console.log(r.value[0],r.done,d.value,d.done,Object.hasOwn(r,'value'),Object.hasOwn(d,'done'));",
+        "a false undefined true true true\n", 0, "");
+    test("Headers failed size mutations preserve prior values", "const h=new Headers({x:'safe'});try{h.set('x','a'.repeat(16384))}catch(e){console.log(e instanceof RangeError)}console.log(h.get('x'));let count=0;try{for(let i=0;i<65;i++){h.set('h'+i,'v');count++}}catch(e){console.log(e instanceof RangeError,count,h.has('h63'))}",
+        "true\nsafe\ntrue 63 false\n", 0, "");
+    test("Headers pair getters preserve the first exception", "let touched=0;const p=new Array(2);Object.defineProperty(p,'0',{get(){throw Error('first')}});Object.defineProperty(p,'1',{get(){touched++;return 'value'}});try{new Headers([p])}catch(e){console.log(e.message,touched)}",
+        "first 0\n", 0, "");
+    test("util promisify handles no arguments synchronous throws and intrinsic mutation", "const u=require('util'),reason=Error('exact'),a=u.promisify(cb=>cb(null,7)),b=u.promisify(()=>{throw reason});WeakMap.prototype.get=WeakMap.prototype.set=null;Promise=null;Function.prototype.bind=null;a().then(v=>console.log(v));b().catch(e=>console.log(e===reason));console.log(u.types.isUint8Array(Buffer.alloc(1)),u.types.isUint8Array(new Uint8Array),u.types.isUint8Array({}));",
+        "true true false\n7\ntrue\n", 0, "");
+    test("strict assertion module preserves SameValue and structured failures", "const a=require('assert');a(true);a.strictEqual(NaN,NaN);a.notStrictEqual(0,-0);a.throws(()=>{throw 7});a.doesNotThrow(()=>{});a.ifError(null);console.log(a===a.strict,a===require('assert/strict'),a===require('node:assert'));try{a.strictEqual(1,'1','mismatch')}catch(e){console.log(e.name,e.code,e.actual,e.expected,e.operator,e.message)}",
+        "true true true\nAssertionError ERR_ASSERTION 1 1 strictEqual mismatch\n", 0, "");
+    test("HTTP servers expose EventEmitter request registration without sockets", "const h=require('http'),E=require('events'),f=()=>{},s=h.createServer({},f);console.log(s instanceof E,s.listenerCount('request'),s.listeners('request')[0]===f,typeof s.closeAllConnections);s.removeAllListeners('request');console.log(s.listenerCount('request'));s.closeAllConnections();",
+        "true 1 true function\n0\n", 0, "");
+    async_case("pre-aborted file stream does not truncate or open the file", "const f=require('fs'),p=process.argv[2];f.writeFileSync(p,'keep');const w=f.createWriteStream(p,{signal:AbortSignal.abort('cancel')});w.on('error',e=>console.log(e.name,e.cause));w.on('close',()=>console.log(f.readFileSync(p,'utf8')));",
+        "AbortError cancel\nkeep\n", 0, "");
+    check("server header deadline is absolute despite trickled activity", connection_deadline(1000000,
+        9000000, false, false, 10, 100, 30) == 11000000);
+    check("server request and idle deadlines change with protocol completion", connection_deadline(1000000,
+        9000000, true, false, 10, 20, 30) == 21000000 && connection_deadline(1000000, 9000000, true,
+        true, 10, 20, 30) == 39000000);
+    check("server deadlines may be disabled explicitly", connection_deadline(1000000, 9000000, false,
+        false, 0, 0, 0) == -1);
+    test("server deadline options are validated before allocating resources", "const h=require('http');for(const o of [{timeout:-1},{headersTimeout:NaN},{requestTimeout:1.5}]){try{h.createServer(o)}catch(e){console.log(e instanceof RangeError)}}console.log(h.createServer({timeout:0}).listening);",
+        "true\ntrue\ntrue\nfalse\n", 0, "");
+    test("pipeline cancellation destroys every member and reports one AbortError", "const s=require('stream'),c=new AbortController(),r=new s.Readable({read(){}}),w=new s.Writable({write(b,e,d){d()}});let n=0;s.pipeline(r,w,{signal:c.signal},e=>console.log(++n,e.name,r.destroyed,w.destroyed));c.abort('stop');",
+        "1 AbortError true true\n", 0, "");
+    test("pre-aborted promise pipeline rejects without reading input", "const s=require('stream'),r=new s.Readable({read(){throw Error('read')}}),w=new s.Writable({write(b,e,d){d()}});s.promises.pipeline([r,w],{signal:AbortSignal.abort()}).catch(e=>console.log(e.name,r.destroyed,w.destroyed));",
+        "AbortError true true\n", 0, "");
+    test("addAbortSignal releases its subscription after stream completion", "const s=require('stream'),c=new AbortController(),w=new s.Writable({autoDestroy:false,write(b,e,d){d()}});s.addAbortSignal(c.signal,w);w.end();setTimeout(()=>{c.abort();console.log(w.writableFinished,w.destroyed,w.listenerCount('finish'))},1);",
+        "true false 0\n", 0, "");
+    test("fetch readable input failures reject and drain internal upload pipeline", "const {Readable}=require('stream'),reason=Error('source');fetch('http://localhost/',{method:'POST',body:new Readable({read(){throw reason}})}).catch(e=>console.log(e===reason));",
+        "true\n", 0, "");
+    test("AbortController owns a stable branded signal and preserves the first reason", "const c=new AbortController(),s=c.signal;console.log(s===c.signal,s instanceof AbortSignal,s.aborted,s.reason);const e={why:42};c.abort(e);c.abort('later');try{s.throwIfAborted()}catch(x){console.log(s.aborted,s.reason===e,x===e)}",
+        "true true false undefined\ntrue true true\n", 0, "");
+    test("AbortSignal listeners deduplicate remove and preserve once and reentrancy", "const c=new AbortController(),s=c.signal,a=[];function b(){a.push('bad')}function f(e){a.push(e.type);s.removeEventListener('abort',b);c.abort()}s.addEventListener('abort',f,{once:true});s.addEventListener('abort',f);s.addEventListener('abort',b);s.onabort=function(e){a.push(this===s&&e.target===s)};c.abort();c.abort();console.log(a.join(','),s.reason.name);",
+        "abort,true AbortError\n", 0, "");
+    test("AbortSignal validates brand construction and timeout ranges", "for(const f of [()=>new AbortSignal(),()=>AbortController.prototype.abort.call({}),()=>AbortSignal.prototype.throwIfAborted.call({}),()=>AbortSignal.timeout(-1),()=>AbortSignal.timeout(NaN),()=>AbortSignal.timeout(1.5)]){try{f()}catch(e){console.log(e instanceof Error)}}console.log(AbortSignal.abort(7).reason);",
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\n7\n", 0, "");
+    test("AbortSignal timeout uses the host event loop and captured timer", "const s=AbortSignal.timeout(1);setTimeout=null;s.addEventListener('abort',()=>console.log(s.aborted,s.reason.name));",
+        "true TimeoutError\n", 0, "");
+    test("AbortSignal any preserves first reason and synchronous propagation", "const a=new AbortController(),b=new AbortController(),s=AbortSignal.any([a.signal,b.signal]),reason={};let n=0;s.addEventListener('abort',()=>n++);b.abort(reason);a.abort('later');console.log(s instanceof AbortSignal,s.aborted,s.reason===reason,n);try{s.throwIfAborted()}catch(e){console.log(e===reason)}",
+        "true true true 1\ntrue\n", 0, "");
+    test("AbortSignal any validates all entries including after an aborted input", "const a=AbortSignal.abort('first'),b=AbortSignal.abort('second');console.log(AbortSignal.any([a,b]).reason,AbortSignal.any([]).aborted);let n=0;for(const v of [undefined,{},new Set(),[a,{}],[a,,],[null]])try{AbortSignal.any(v)}catch(e){if(e instanceof TypeError)n++}try{AbortSignal.any(Array(1025).fill(a))}catch(e){if(e instanceof RangeError)n++}console.log(n);",
+        "first false\n7\n", 0, "");
+    test("AbortSignal any snapshots getter inputs before selecting reason", "const a=new AbortController(),b=new AbortController(),reason={};const inputs=[a.signal,b.signal];Object.defineProperty(inputs,1,{get(){a.abort(reason);return b.signal}});const s=AbortSignal.any(inputs);console.log(s.aborted,s.reason===reason);const error={};try{AbortSignal.any([a.signal,new Proxy({},{get(){throw error}})])}catch(e){console.log(e instanceof TypeError)}const x=[];Object.defineProperty(x,0,{get(){throw error}});try{AbortSignal.any(x)}catch(e){console.log(e===error)}",
+        "true true\ntrue\ntrue\n", 0, "");
+    test("AbortSignal any uses private algorithms before throwing user listeners", "const a=new AbortController(),b=new AbortController(),reason={},s=AbortSignal.any([a.signal,b.signal]);a.signal.addEventListener('abort',()=>{throw reason});a.signal.addEventListener('abort',()=>console.log('after',s.aborted));try{a.abort('cancel')}catch(e){console.log(e===reason,s.reason)}",
+        "after true\ntrue cancel\n", 0, "");
+    test("AbortSignal any deduplicates and detaches every source subscription", "const a=new AbortController();for(let i=0;i<1100;i++){const b=new AbortController(),s=AbortSignal.any([a.signal,a.signal,b.signal]);b.abort(i);if(s.reason!==i)throw Error('reason')}console.log(a.signal.aborted,AbortSignal.any([a.signal]).aborted);",
+        "false false\n", 0, "");
+    test("AbortSignal any failed subscription rolls back earlier sources", "const a=new AbortController(),b=new AbortController(),held=[];for(let i=0;i<1024;i++)held.push(AbortSignal.any([b.signal]));let n=0;for(let i=0;i<1100;i++)try{AbortSignal.any([a.signal,b.signal])}catch(e){if(e instanceof RangeError)n++}const c=new AbortController(),s=AbortSignal.any([a.signal,c.signal]);c.abort('released');console.log(n,s.reason);",
+        "1100 released\n", 0, "");
+    test("AbortSignal any nested graphs and poisoned listener intrinsics", "const a=new AbortController(),b=new AbortController(),c=new AbortController(),s=AbortSignal.any([AbortSignal.any([a.signal,b.signal]),c.signal]);const reason={};a.signal.addEventListener=a.signal.removeEventListener=()=>{throw Error('poison')};WeakMap.prototype.get=WeakMap.prototype.set=null;Function.prototype.bind=null;a.abort(reason);console.log(s.aborted,s.reason===reason,AbortSignal.any([s]).reason===reason);",
+        "true true true\n", 0, "");
+    test("AbortSignal any rejects hostile lengths and preserves length getter errors", "const reason={};for(const n of [NaN,Infinity,-1,1.5,1025])try{AbortSignal.any(new Proxy([],{get(t,k){return k==='length'?n:Reflect.get(t,k)}}))}catch(e){console.log(e instanceof RangeError)}try{AbortSignal.any(new Proxy([],{get(){throw reason}}))}catch(e){console.log(e===reason)}",
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\n", 0, "");
+    test("AbortSignal any completes other dependents after a listener throws", "const a=new AbortController(),s=AbortSignal.any([a.signal]),t=AbortSignal.any([a.signal]),reason={};s.onabort=()=>{throw reason};try{a.abort()}catch(e){console.log(e===reason,t.aborted,s.reason===a.signal.reason,t.reason===a.signal.reason,t.reason.name)}",
+        "true true true true AbortError\n", 0, "");
+    test("AbortSignal any captures array checks and rejects revoked proxy errors", "const a=new AbortController();Array.isArray=()=>false;const s=AbortSignal.any(new Proxy([a.signal],{}));a.abort('proxy');console.log(s.reason);const r=Proxy.revocable([],{});r.revoke();try{AbortSignal.any(r.proxy)}catch(e){console.log(e instanceof TypeError)}try{AbortSignal.any(new Proxy([],{get(){return 1n}}))}catch(e){console.log(e instanceof TypeError)}",
+        "proxy\ntrue\ntrue\n", 0, "");
+    test("fetch pre-aborted and synchronous abort preserve exact rejection reasons", "const a=new AbortController(),b=new AbortController(),reason={stop:true};a.abort(reason);const p=fetch('http://127.0.0.1:1/',{signal:a.signal}).catch(e=>console.log(e===reason));const q=fetch('http://127.0.0.1:1/',{signal:b.signal}).catch(e=>console.log(e===reason));b.abort(reason);",
+        "true\ntrue\n", 0, "");
+    test("abort listener exceptions do not prevent transfer cancellation", "const c=new AbortController(),reason=Error('stop');c.signal.addEventListener('abort',()=>{throw Error('listener')});fetch('http://127.0.0.1:1/',{signal:c.signal}).catch(e=>console.log(e===reason));try{c.abort(reason)}catch(e){console.log(e.message)}",
+        "listener\ntrue\n", 0, "");
+    test("client validates timeout and signal options before transport", "Promise.all([{signal:{}},{timeout:-1},{timeout:NaN},{timeout:1.5},{connectTimeout:0},{connectTimeout:'10'}].map(o=>fetch('http://localhost/',o).then(()=>false,e=>e instanceof Error))).then(a=>console.log(a.length,a.every(Boolean)));",
+        "6 true\n", 0, "");
+    test("request abort drains pending write callbacks and closes", "const c=new AbortController(),r=require('http').request('http://localhost/',{method:'POST',signal:c.signal});r.on('error',e=>console.log(e.name));r.on('close',()=>console.log('closed'));r.write('body',e=>console.log(e.name));c.abort();",
+        "AbortError\nAbortError\nclosed\n", 0, "");
+    test("HTTP native request hooks validate missing callback arguments", "const r=require('http').request('http://localhost/');for(const run of [()=>r._write(),()=>r._final(42),()=>r._destroy()]){try{run()}catch(e){console.log(e instanceof TypeError)}}r.destroy();",
+        "true\ntrue\ntrue\n", 0, "");
+    test("request header proxy exception preserves original identity", "const err=Error('keys'),headers=new Proxy({},{ownKeys(){throw err}});fetch('http://localhost/',{headers}).catch(e=>console.log(e===err));",
+        "true\n", 0, "");
+    var syntax: array<str, 3> = [(deref suite.binary) as str, "--check", "tests/io_network.js"];
+    expect("HTTP client integration fixture syntax", &syntax[0], 3, "" as ptr<u8>, 0, 0, "");
+    syntax[2] = "tests/tls_request.js";
+    expect("TLS integration fixture syntax", &syntax[0], 3, "" as ptr<u8>, 0, 0, "");
+    test("HTTP and HTTPS client module identity", "console.log(typeof fetch,typeof require('http').request,typeof require('http').get,require('https')===require('node:https'),typeof require('https').get);",
+        "function function function true function\n", 0, "");
+    test("fetch rejects invalid URLs and unsupported protocols as promises", "Promise.all([undefined,42,'not a URL','file:///etc/passwd','ftp://localhost/','http://user:pass@localhost/','http://localhost/\\0x'].map(v=>fetch(v).then(()=>false,e=>e instanceof TypeError))).then(a=>console.log(a.length,a.every(Boolean)));",
+        "7 true\n", 0, "");
+    test("fetch validates TLS policy and request headers before I/O", "Promise.all([{rejectUnauthorized:false},{headers:{'x\\r\\ny':'bad'}},{headers:{x:'bad\\r\\ny'}},{headers:{'Content-Length':'99'}},{method:'GET',body:'bad'},{redirect:'other'}].map(o=>fetch('http://localhost/',o).then(()=>false,e=>e instanceof TypeError))).then(a=>console.log(a.length,a.every(Boolean)));",
+        "6 true\n", 0, "");
+    test("fetch transport errors reject with structured curl diagnostics", "fetch('http://127.0.0.1:1/').catch(e=>console.log(e instanceof Error,e.code,typeof e.curlCode));",
+        "true ERR_HTTP_CLIENT number\n", 0, "");
+    test("HTTP request errors reach EventEmitter and close", "const r=require('http').get('http://127.0.0.1:1/');r.on('error',e=>console.log(e.code,typeof e.curlCode));r.on('close',()=>console.log('closed'));",
+        "ERR_HTTP_CLIENT number\nclosed\n", 0, "");
+    test("HTTP request cancellation before end releases native ownership", "const r=require('http').request('http://localhost/');r.on('close',()=>console.log(r.destroyed));r.destroy();",
+        "true\n", 0, "");
+    test("HTTPS module rejects plaintext URLs without starting transport", "try{require('https').get('http://localhost/')}catch(e){console.log(e instanceof TypeError)}",
+        "true\n", 0, "");
+    test("client capacity is bounded and unfinished requests can be destroyed", "const a=[],http=require('http');for(let i=0;i<16;i++)a.push(http.request('http://localhost/'));try{http.request('http://localhost/')}catch(e){console.log(e instanceof RangeError)}a.forEach(r=>r.destroy());",
+        "true\n", 0, "");
+    var binary_payload: array<u8, 5> = [0, 255, 128, 195, 40];
+    var stable_payload: str = "hello";
+    body_case("Response collector snapshots data before later user listeners mutate it", stable_payload as ptr<u8>,
+        5, "bodyResponse.text().then(s=>{globalThis.result=s});bodyResponse.body.on('data',b=>b.fill(88));",
+        "hello");
+    body_case("Response listener capacity errors reject promises without leaking handlers", stable_payload as ptr<u8>,
+        5, "const r=bodyResponse.body;for(let i=0;i<1024;i++)r.on('unused',()=>{});try{bodyResponse.text().then(()=>{globalThis.result='wrong'},e=>{globalThis.result='promise:'+String(e instanceof RangeError)+':'+r.listenerCount('unused')})}catch(e){globalThis.result='sync'}",
+        "promise:true:1024");
+    body_case("Response arrayBuffer preserves binary octets", &binary_payload[0], 5, "bodyResponse.arrayBuffer().then(b=>{globalThis.result=Buffer.from(b).toString('hex')});",
+        "00ff80c328");
+    var bom_payload: array<u8, 7> = [239, 187, 191, 65, 0, 240, 159];
+    body_case("Response text strips BOM and replaces truncated UTF-8", &bom_payload[0], 7, "bodyResponse.text().then(s=>{globalThis.result=Buffer.from(s).toString('hex')});",
+        "4100efbfbd");
+    var json: str = "{\"wave\":42}";
+    body_case("Response json uses captured wjson parser", json as ptr<u8>, mem_len_cstr(json), "JSON.parse=null;bodyResponse.json().then(v=>{globalThis.result=String(v.wave)+':'+bodyResponse.bodyUsed});",
+        "42:true");
+    body_case("Response consumption is one-shot", json as ptr<u8>, mem_len_cstr(json), "const a=bodyResponse.text();bodyResponse.text().catch(e=>{globalThis.result=String(e instanceof TypeError)});",
+        "true");
+    var invalid: str = "invalid";
+    body_case("Response invalid JSON rejects with SyntaxError", invalid as ptr<u8>, mem_len_cstr(invalid),
+        "bodyResponse.json().catch(e=>{globalThis.result=String(e instanceof SyntaxError)});", "true");
+    body_case("Response invalid method receiver rejects safely", invalid as ptr<u8>, mem_len_cstr(invalid),
+        "bodyResponse.text.call({}).catch(e=>{globalThis.result=String(e instanceof TypeError)});", "true");
+    body_case("Response detects consumption through its readable body", invalid as ptr<u8>, mem_len_cstr(invalid),
+        "bodyResponse.body.on('data',()=>{});bodyResponse.body.on('end',()=>bodyResponse.text().catch(e=>{globalThis.result=String(e instanceof TypeError)+':'+bodyResponse.bodyUsed}));",
+        "true:true");
+    body_case("Response consumption after cancellation rejects instead of hanging", invalid as ptr<u8>,
+        mem_len_cstr(invalid), "const err=Error('cancel');bodyResponse.body.on('error',()=>{});bodyResponse.body.destroy(err);bodyResponse.text().catch(e=>{globalThis.result=String(e===err)});",
+        "true");
+    var transfer: ptr<Client> = mem_alloc(size_of<Client>() as i64) as ptr<Client>;
+    if (transfer == null) {
+        check("curl native transfer allocation", false);
+        return;
+    }
+    mem_zero(transfer as ptr<u8>, size_of<Client>() as i64);
+    deref transfer.head = mem_alloc(65537);
+    deref transfer.pending = mem_alloc(65536);
+    var line: str = "HTTP/1.1 200 OK\r\n";
+    receive_header(transfer, line as ptr<u8>, mem_len_cstr(line));
+    line = "Content-Type: x\r\n";
+    receive_header(transfer, line as ptr<u8>, mem_len_cstr(line));
+    receive_header(transfer, "\r\n" as ptr<u8>, 2);
+    check("curl native headers expose final status at header completion", deref transfer.ready && deref transfer.status == 200);
+    receive_body(transfer, &binary_payload[0], 5);
+    check("curl native body preserves NUL and invalid UTF-8", deref transfer.pending_length == 5 && mem_eq(deref transfer.pending,
+        &binary_payload[0], 5));
+    deref transfer.pending_length = 65535;
+    check("curl native body pauses without partial append at capacity", receive_body(transfer, &binary_payload[0],
+        5) == 268435457 && deref transfer.paused && deref transfer.pending_length == 65535);
+    deref transfer.follow = true;
+    line = "HTTP/1.1 303 Redirect\r\n";
+    receive_header(transfer, line as ptr<u8>, mem_len_cstr(line));
+    line = "Location: /next\r\n";
+    receive_header(transfer, line as ptr<u8>, mem_len_cstr(line));
+    receive_header(transfer, "\r\n" as ptr<u8>, 2);
+    receive_body(transfer, &binary_payload[0], 5);
+    check("curl redirect intermediate body is discarded before final response", !deref transfer.ready && deref transfer.location && deref transfer.pending_length == 0);
+    deref transfer.head_length = 65536;
+    check("curl response header capacity rejects overflow", receive_header(transfer, "xx" as ptr<u8>,
+        2) == 0);
+    var scratch: array<u8, 8>;
+    deref transfer.upload = &binary_payload[0];
+    deref transfer.upload_length = 5;
+    check("curl streaming upload returns bounded binary slices", supply_upload(transfer, &scratch[0],
+        2) == 2 && supply_upload(transfer, &scratch[2], 6) == 3 && mem_eq(&scratch[0], &binary_payload[0],
+        5));
+    check("curl streaming upload pauses until another chunk or EOF", supply_upload(transfer, &scratch[0],
+        8) == 268435457 && deref transfer.upload_paused);
+    deref transfer.upload_eof = true;
+    check("curl streaming upload ends only after explicit finalization", supply_upload(transfer, &scratch[0],
+        8) == 0);
+    deref transfer.aborted = true;
+    check("curl streaming upload cancellation aborts native callbacks", supply_upload(transfer, &scratch[0],
+        8) == 268435456);
+    var held: i64 = deref transfer.pending_length;
+    check("aborted transfers reject late native body and header callbacks", receive_body(transfer, &binary_payload[0],
+        5) == 0 && receive_header(transfer, "HTTP/1.1 200 OK\r\n" as ptr<u8>, 17) == 0 && deref transfer.pending_length == held);
+    mem_free(deref transfer.head, 65537);
+    mem_free(deref transfer.pending, 65536);
+    mem_free(transfer as ptr<u8>, size_of<Client>() as i64);
+    var head: HttpOutput = encode_head(200, null, 0, -1, true);
+    check("streaming HTTP head uses chunked framing", contains(head.bytes, head.length, "Transfer-Encoding: chunked\r\n") && !contains(head.bytes,
+        head.length, "Content-Length"));
+    mem_free(head.bytes, head.capacity);
+    var frame: HttpOutput = encode_frame(null, 0, &binary_payload[0], 5, true, true);
+    check("streaming HTTP frame is binary safe and terminates once", frame.length == 15 && mem_eq(frame.bytes,
+        "5\r\n" as ptr<u8>, 3) && mem_eq(frame.bytes + 3, &binary_payload[0], 5) && mem_eq(frame.bytes + 8,
+        "\r\n0\r\n\r\n" as ptr<u8>, 7));
+    mem_free(frame.bytes, frame.capacity);
+    frame = encode_frame(null, 0, null, 0, true, false);
+    check("empty streaming writes do not emit EOF chunks", frame.length == 0);
+    mem_free(frame.bytes, frame.capacity);
+}
+
+pub fun extended_network_tests() {
+    var suite: ptr<TestState> = test_state();
+    var probe: i64 = net_socket_tcp_v4();
+    if (probe == -1 || probe == -13) {
+        if ((deref suite.require_tcp)) {
+            check("required HTTP client and TLS socket capability", false);
+        } else {
+            deref suite.skipped += 1;
+            println("SKIP HTTP streaming/client/DNS/TLS integration suite: socket creation is denied");
+        }
+        return;
+    }
+    if (probe < 0) {
+        check("extended network socket capability", false);
+        return;
+    }
+    net_close(probe);
+    var command: array<str, 3> = [(deref suite.binary) as str, "tests/io_network.js", (deref suite.directory) as str];
+    var expected: str = "network integration passed\n";
+    expect("real streaming HTTP fetch client and file pipeline integration", &command[0], 3, expected as ptr<u8>,
+        mem_len_cstr(expected), 0, "");
+    remove(join((deref suite.directory) as str, "stream-download") as str);
+    var tls_peer: str = join((deref suite.directory) as str, "https-peer") as str;
+    var peer_ready: bool = compile_tls_peer(absolute((deref suite.directory) as str) as str,
+        absolute(tls_peer) as str) == 0;
+    check("build independent TLS upload regression peer", peer_ready);
+    if (!peer_ready) {
+        remove(tls_peer);
+        return;
+    }
+    var cert: str = join((deref suite.directory) as str, "tls-cert.pem") as str;
+    var key: str = join((deref suite.directory) as str, "tls-key.pem") as str;
+    var generate: array<str, 16> = ["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", key, "-out", cert, "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost"];
+    expect("generate isolated local TLS test certificate", &generate[0], 16, "" as ptr<u8>, -1, 0, "");
+    probe = net_socket_tcp_v4();
+    var address: SocketAddrV4 = socket_addr_v4_loopback(0);
+    var status: i64 = net_bind_socket_v4(probe, address);
+    if (status >= 0) {
+        status = net_local_addr_v4(probe, &address);
+    }
+    net_close(probe);
+    if (status < 0) {
+        check("reserve TLS fixture port", false);
+        remove(cert);
+        remove(key);
+        remove(tls_peer);
+        return;
+    }
+    var digits: array<u8, 8>;
+    digits[7] = 0;
+    var at: i64 = 7;
+    var number: i64 = address.port as i64;
+    while (number > 0) {
+        at -= 1;
+        digits[at] = (48 + number % 10) as u8;
+        number /= 10;
+    }
+    var port: str = &digits[at] as str;
+    var endpoint: str = concat("127.0.0.1:", port) as str;
+    var out_path: str = join((deref suite.directory) as str, "tls-out") as str;
+    var err_path: str = join((deref suite.directory) as str, "tls-err") as str;
+    var out_fd: i64 = create(out_path);
+    var err_fd: i64 = create(err_path);
+    var server: array<str, 7> = [absolute(tls_peer) as str, "--listen", endpoint, "--cert", cert,
+        "--key", key];
+    var pid: i64 = spawn(&server[0], 7, out_fd, err_fd);
+    io_close(out_fd);
+    io_close(err_fd);
+    var ready: bool = false;
+    var start: i64 = time_now_monotonic_ns();
+    while (pid >= 0 && time_now_monotonic_ns() - start < 3000000000) {
+        var fd: i64 = net_socket_tcp_v4();
+        if (fd >= 0) {
+            net_set_nonblock(fd, 1);
+            var connected: i64 = net_connect_socket_v4(fd, address);
+            if (connected == 0 || ((connected == -115 || connected == -11) && net_wait_connected(fd,
+                50) > 0)) {
+                ready = true;
+            }
+            net_close(fd);
+        }
+        if (ready) {
+            break;
+        }
+        time_sleep_ms(5);
+    }
+    check("local TLS fixture starts on reserved loopback port", ready);
+    if (ready) {
+        var request: array<str, 4> = [(deref suite.binary) as str, "tests/tls_request.js", port, cert];
+        expected = "TLS integration passed\n";
+        expect("real HTTPS trust hostname uploads cancellation header failures and redirect integration", &request[0],
+            4, expected as ptr<u8>, mem_len_cstr(expected), 0, "");
+    }
+    if (pid >= 0) {
+        proc_kill(pid, 15);
+        wait(pid, 1000);
+    }
+    remove(cert);
+    remove(key);
+    remove(out_path);
+    remove(err_path);
+    remove(tls_peer);
+}

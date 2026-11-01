@@ -1,0 +1,376 @@
+import("./context_state")::{EVENTS_SLOT, context_slot, allocate_context_slot, release_context_slot};
+fun intrinsic(ctx: ptr<u8>, index: i64) -> ptr<ptr<u8>> {
+    return(context_slot(ctx, EVENTS_SLOT) as ptr<ptr<u8>>) + index;
+}
+
+pub fun event_parent(ctx: ptr<u8>) -> ptr<u8> {
+    return deref intrinsic(ctx, 2);
+}
+
+// EventEmitter policy in Wave; WeakMap entries are collected with their owners.
+import("./values")::{get, put, text, plain, define, fail};
+import("./collections")::{weak_map, weak_get, weak_set, list, length, at, append, flag, set_flag};
+import("./config")::{EVENT_LISTENER_LIMIT};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, left: ptr<u8>, right: ptr<u8>) -> bool;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, value: ptr<u8>, parent: ptr<u8>);
+extern(c, "wr_constructor") fun constructor(ctx: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "jsrt_event_callback") fun callback(code: i32) -> ptr<u8>;
+extern(c, "jsrt_event_constructor_callback") fun constructor_callback() -> ptr<u8>;
+pub fun event_state(ctx: ptr<u8>, receiver: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (kind(ctx, receiver) != 5) {
+        fail(ctx, ex, 1, "EventEmitter requires an object receiver");
+        return null;
+    }
+    var state: ptr<u8> = weak_get(ctx, deref intrinsic(ctx, 0), receiver, ex);
+    if (deref ex != null) {
+        return null;
+    }
+    if (kind(ctx, state) == 0) {
+        state = plain(ctx);
+        protect(ctx, state);
+        put(ctx, state, "listeners", list(ctx, ex), ex);
+        weak_set(ctx, deref intrinsic(ctx, 0), receiver, state, ex);
+        unprotect(ctx, state);
+    }
+    return state;
+}
+
+fun valid_name(ctx: ptr<u8>, name: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (kind(ctx, name) == 4 || kind(ctx, name) == 6) {
+        return true;
+    }
+    fail(ctx, ex, 1, "event name must be a string or symbol");
+    return false;
+}
+
+pub fun add_listener(ctx: ptr<u8>, receiver: ptr<u8>, name: ptr<u8>, fn: ptr<u8>, once: bool, prepend: bool,
+    ex: ptr<ptr<u8>>) {
+    if (!valid_name(ctx, name, ex)) {
+        return;
+    }
+    if (kind(ctx, fn) != 5 || !callable(ctx, fn)) {
+        fail(ctx, ex, 1, "listener must be a function");
+        return;
+    }
+    var state: ptr<u8> = event_state(ctx, receiver, ex);
+    if (state == null) {
+        return;
+    }
+    var old: ptr<u8> = get(ctx, state, "listeners", ex);
+    var n: i64 = length(ctx, old, ex);
+    if (n >= EVENT_LISTENER_LIMIT) {
+        fail(ctx, ex, 2, "EventEmitter listener limit exceeded");
+        return;
+    }
+    var entry: ptr<u8> = plain(ctx);
+    protect(ctx, entry);
+    put(ctx, entry, "name", name, ex);
+    put(ctx, entry, "fn", fn, ex);
+    set_flag(ctx, entry, "once", once, ex);
+    if (prepend) {
+        var next: ptr<u8> = list(ctx, ex);
+        protect(ctx, next);
+        append(ctx, next, entry, ex);
+        for (var i: i64 = 0; i < n && deref ex == null; i++) {
+            append(ctx, next, at(ctx, old, i, ex), ex);
+        }
+        put(ctx, state, "listeners", next, ex);
+        unprotect(ctx, next);
+    } else {
+        // Emission captures its initial length. Appending cannot change that
+        // snapshot; removal and prepending still replace the private array.
+        append(ctx, old, entry, ex);
+    }
+    unprotect(ctx, entry);
+    var hook: ptr<u8> = get(ctx, state, "afterAdd", ex);
+    if (kind(ctx, hook) == 5 && deref ex == null) {
+        var args: array<ptr<u8>, 1> = [name];
+        call(ctx, hook, receiver, 1, &args[0], ex);
+    }
+}
+
+pub fun remove_listener(ctx: ptr<u8>, receiver: ptr<u8>, name: ptr<u8>, fn: ptr<u8>, exact: ptr<u8>,
+    ex: ptr<ptr<u8>>) {
+    var state: ptr<u8> = event_state(ctx, receiver, ex);
+    if (state == null) {
+        return;
+    }
+    var old: ptr<u8> = get(ctx, state, "listeners", ex);
+    var n: i64 = length(ctx, old, ex);
+    var found: i64 = -1;
+    for (var i: i64 = n; i > 0 && deref ex == null; i--) {
+        var entry: ptr<u8> = at(ctx, old, i - 1, ex);
+        if ((exact != null && equal(ctx, exact, entry)) || (exact == null && equal(ctx, get(ctx, entry,
+            "name", ex), name) && equal(ctx, get(ctx, entry, "fn", ex), fn))) {
+            found = i - 1;
+            break;
+        }
+    }
+    if (found < 0) {
+        return;
+    }
+    var next: ptr<u8> = list(ctx, ex);
+    protect(ctx, next);
+    for (var i: i64 = 0; i < n && deref ex == null; i++) {
+        if (i != found) {
+            append(ctx, next, at(ctx, old, i, ex), ex);
+        }
+    }
+    put(ctx, state, "listeners", next, ex);
+    unprotect(ctx, next);
+}
+
+pub fun emit_event(ctx: ptr<u8>, receiver: ptr<u8>, name: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> bool {
+    if (!valid_name(ctx, name, ex)) {
+        return false;
+    }
+    protect(ctx, name);
+    var state: ptr<u8> = event_state(ctx, receiver, ex);
+    if (state == null) {
+        unprotect(ctx, name);
+        return false;
+    }
+    var snapshot: ptr<u8> = get(ctx, state, "listeners", ex);
+    protect(ctx, snapshot);
+    var n: i64 = length(ctx, snapshot, ex);
+    var handled: bool = false;
+    for (var i: i64 = 0; i < n && deref ex == null; i++) {
+        var entry: ptr<u8> = at(ctx, snapshot, i, ex);
+        if (!equal(ctx, name, get(ctx, entry, "name", ex)) || flag(ctx, entry, "fired", ex)) {
+            continue;
+        }
+        handled = true;
+        var fn: ptr<u8> = get(ctx, entry, "fn", ex);
+        if (flag(ctx, entry, "once", ex)) {
+            set_flag(ctx, entry, "fired", true, ex);
+            remove_listener(ctx, receiver, name, fn, entry, ex);
+        }
+        if (deref ex == null) {
+            call(ctx, fn, receiver, count, args, ex);
+        }
+    }
+    if (!handled && deref ex == null && equal(ctx, name, text(ctx, "error"))) {
+        if (count > 0 && kind(ctx, args[0]) == 5) {
+            deref ex = args[0];
+        } else {
+            fail(ctx, ex, 0, "Unhandled 'error' event");
+        }
+    }
+    unprotect(ctx, snapshot);
+    unprotect(ctx, name);
+    return handled;
+}
+
+pub fun emit_named(ctx: ptr<u8>, receiver: ptr<u8>, name: str, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> bool {
+    return emit_event(ctx, receiver, text(ctx, name), count, args, ex);
+}
+
+pub fun has_named_listeners(ctx: ptr<u8>, receiver: ptr<u8>, name: str) -> bool {
+    var ex: ptr<u8> = null;
+    var state: ptr<u8> = event_state(ctx, receiver, &ex);
+    if (state == null) {
+        return false;
+    }
+    var listeners: ptr<u8> = get(ctx, state, "listeners", &ex);
+    var wanted: ptr<u8> = text(ctx, name);
+    protect(ctx, wanted);
+    var found: bool = false;
+    for (var i: i64 = 0; i < length(ctx, listeners, &ex) && ex == null; i++) {
+        var entry: ptr<u8> = at(ctx, listeners, i, &ex);
+        if (equal(ctx, wanted, get(ctx, entry, "name", &ex)) && !flag(ctx, entry, "fired", &ex)) {
+            found = true;
+            break;
+        }
+    }
+    unprotect(ctx, wanted);
+    return found && ex == null;
+}
+
+export(c) fun jsrt_event_construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var result: ptr<u8> = object(ctx, null, null);
+    protect(ctx, result);
+    prototype(ctx, result, get(ctx, ctor, "prototype", ex));
+    event_state(ctx, result, ex);
+    unprotect(ctx, result);
+    return result;
+}
+
+export(c) fun jsrt_event_on(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count < 2) {
+        fail(ctx, ex, 1, "listener registration requires event and callback");
+        return undefined(ctx);
+    }
+    // The callback function identity selects the four registration variants.
+    var once: bool = equal(ctx, fn, deref intrinsic(ctx, 3 + (1))) || equal(ctx, fn, deref intrinsic(ctx,
+        3 + (3)));
+    var prepend: bool = equal(ctx, fn, deref intrinsic(ctx, 3 + (2))) || equal(ctx, fn, deref intrinsic(ctx,
+        3 + (3)));
+    add_listener(ctx, receiver, args[0], args[1], once, prepend, ex);
+    return receiver;
+}
+
+export(c) fun jsrt_event_emit(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count < 1) {
+        fail(ctx, ex, 1, "emit requires an event name");
+        return undefined(ctx);
+    }
+    return boolean(ctx, emit_event(ctx, receiver, args[0], count - 1, args + 1, ex));
+}
+
+export(c) fun jsrt_event_off(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count < 2 || !valid_name(ctx, args[0], ex)) {
+        fail(ctx, ex, 1, "off requires an event and listener");
+        return undefined(ctx);
+    }
+    if (kind(ctx, args[1]) != 5 || !callable(ctx, args[1])) {
+        fail(ctx, ex, 1, "listener must be a function");
+        return undefined(ctx);
+    }
+    remove_listener(ctx, receiver, args[0], args[1], null, ex);
+    return receiver;
+}
+
+export(c) fun jsrt_event_clear(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count > 0 && !valid_name(ctx, args[0], ex)) {
+        return undefined(ctx);
+    }
+    var state: ptr<u8> = event_state(ctx, receiver, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    var old: ptr<u8> = get(ctx, state, "listeners", ex);
+    var n: i64 = length(ctx, old, ex);
+    var next: ptr<u8> = list(ctx, ex);
+    protect(ctx, next);
+    for (var i: i64 = 0; count > 0 && i < n && deref ex == null; i++) {
+        var entry: ptr<u8> = at(ctx, old, i, ex);
+        if (!equal(ctx, get(ctx, entry, "name", ex), args[0])) {
+            append(ctx, next, entry, ex);
+        }
+    }
+    put(ctx, state, "listeners", next, ex);
+    unprotect(ctx, next);
+    return receiver;
+}
+
+export(c) fun jsrt_event_inspect(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var names: bool = equal(ctx, fn, deref intrinsic(ctx, 3 + (9)));
+    var counting: bool = equal(ctx, fn, deref intrinsic(ctx, 3 + (8)));
+    if (!names && (count == 0 || !valid_name(ctx, args[0], ex))) {
+        fail(ctx, ex, 1, "event name is required");
+        return undefined(ctx);
+    }
+    var state: ptr<u8> = event_state(ctx, receiver, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    var entries: ptr<u8> = get(ctx, state, "listeners", ex);
+    var n: i64 = length(ctx, entries, ex);
+    var result: ptr<u8> = array(ctx, 0, null, ex);
+    protect(ctx, result);
+    var matched: i64 = 0;
+    for (var i: i64 = 0; i < n && deref ex == null; i++) {
+        var entry: ptr<u8> = at(ctx, entries, i, ex);
+        var name: ptr<u8> = get(ctx, entry, "name", ex);
+        if (names) {
+            var found: bool = false;
+            for (var j: i64 = 0; j < length(ctx, result, ex); j++) {
+                if (equal(ctx, name, at(ctx, result, j, ex))) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                append(ctx, result, name, ex);
+            }
+        } else if (equal(ctx, name, args[0])) {
+            var listener: ptr<u8> = get(ctx, entry, "fn", ex);
+            if (!counting || count < 2 || equal(ctx, listener, args[1])) {
+                matched += 1;
+                if (!counting) {
+                    append(ctx, result, listener, ex);
+                }
+            }
+        }
+    }
+    unprotect(ctx, result);
+    if (counting) {
+        return number(ctx, matched as f64);
+    }
+    return result;
+}
+
+pub fun install_events(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (!allocate_context_slot(ctx, EVENTS_SLOT, 104)) {
+        return false;
+    }
+    deref intrinsic(ctx, 0) = weak_map(ctx, ex);
+    protect(ctx, deref intrinsic(ctx, 0));
+    deref intrinsic(ctx, 1) = constructor(ctx, constructor_callback());
+    protect(ctx, deref intrinsic(ctx, 1));
+    deref intrinsic(ctx, 2) = get(ctx, deref intrinsic(ctx, 1), "prototype", ex);
+    protect(ctx, deref intrinsic(ctx, 2));
+    define(ctx, deref intrinsic(ctx, 2), "constructor", deref intrinsic(ctx, 1), ex, false);
+    define(ctx, deref intrinsic(ctx, 1), "EventEmitter", deref intrinsic(ctx, 1), ex, false);
+    var names: array<str, 10> = ["on", "once", "prependListener", "prependOnceListener", "emit", "off",
+        "removeAllListeners", "listeners", "listenerCount", "eventNames"];
+    var codes: array<i32, 10> = [0, 0, 0, 0, 1, 2, 3, 4, 4, 4];
+    for (var i: i64 = 0; i < 10; i++) {
+        var name: ptr<u8> = utf8(names[i]);
+        deref intrinsic(ctx, 3 + (i)) = function(ctx, name, callback(codes[i]));
+        release(name);
+        protect(ctx, deref intrinsic(ctx, 3 + (i)));
+        define(ctx, deref intrinsic(ctx, 2), names[i], deref intrinsic(ctx, 3 + (i)), ex, false);
+    }
+    define(ctx, deref intrinsic(ctx, 2), "addListener", deref intrinsic(ctx, 3 + (0)), ex, false);
+    define(ctx, deref intrinsic(ctx, 2), "removeListener", deref intrinsic(ctx, 3 + (5)), ex, false);
+    return deref ex == null;
+}
+
+pub fun events_module(ctx: ptr<u8>) -> ptr<u8> {
+    return deref intrinsic(ctx, 1);
+}
+
+pub fun shutdown_events(ctx: ptr<u8>) {
+    if (context_slot(ctx, EVENTS_SLOT) == null) {
+        return;
+    }
+    for (var i: i64 = 0; i < 10; i++) {
+        if (deref intrinsic(ctx, 3 + (i)) != null) {
+            unprotect(ctx, deref intrinsic(ctx, 3 + (i)));
+            deref intrinsic(ctx, 3 + (i)) = null;
+        }
+    }
+    if (deref intrinsic(ctx, 2) != null) {
+        unprotect(ctx, deref intrinsic(ctx, 2));
+        deref intrinsic(ctx, 2) = null;
+    }
+    if (deref intrinsic(ctx, 1) != null) {
+        unprotect(ctx, deref intrinsic(ctx, 1));
+        deref intrinsic(ctx, 1) = null;
+    }
+    if (deref intrinsic(ctx, 0) != null) {
+        unprotect(ctx, deref intrinsic(ctx, 0));
+        deref intrinsic(ctx, 0) = null;
+    }
+    release_context_slot(ctx, EVENTS_SLOT, 104);
+}

@@ -1,0 +1,9 @@
+// The vendored wjson ABI requires this entry point on Linux as well.
+// Callers import and initialize it explicitly rather than relying on info.wave.
+export(c) fun wjn_console_utf8() -> i32 {
+    return 0;
+}
+
+pub fun prepare_wjson() -> i32 {
+    return wjn_console_utf8();
+}

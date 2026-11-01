@@ -1,0 +1,559 @@
+// Owned POSIX child processes. JS callbacks stay on the owning event loop.
+import("./context_state")::{context_slot, owned_context_slot};
+import("./values")::{get, put, plain, text, define, fail, capture};
+import("./events")::{events_module, emit_named};
+import("./process_io")::{process_read_stream, process_write_stream, process_stream_closed, discard_process_stream};
+import("./streams")::{stream_invoke};
+import("./events")::{has_named_listeners};
+import("std::sys::fs")::{fcntl, FS_F_GETFL, FS_F_SETFL, FS_O_NONBLOCK};
+import("std::io::fd")::{io_close};
+import("./system")::{copy_host_path};
+import("./buffer")::{buffer_integer};
+import("./config")::{CHILD_LIMIT, CHILD_ARGUMENT_LIMIT};
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::mem::cstr")::{mem_eq_cstr};
+import("std::process::core")::{proc_kill};
+import("std::process::wait")::{proc_wait, proc_wait_nohang, proc_status_exited, proc_status_exit_code,
+    proc_status_term_signal};
+extern(c, "posix_spawn") fun spawn_native(pid: ptr<i32>, path: str, actions: ptr<u8>, attr: ptr<u8>,
+    argv: ptr<ptr<i8>>, env: ptr<ptr<i8>>) -> i32;
+extern(c, "jsrt_environment") fun environment() -> ptr<ptr<i8>>;
+extern(c, "pipe2") fun make_pipe(fds: ptr<i32>, flags: i32) -> i32;
+extern(c, "jsrt_spawn_actions_size") fun actions_size() -> i64;
+extern(c, "posix_spawn_file_actions_init") fun actions_init(actions: ptr<u8>) -> i32;
+extern(c, "posix_spawn_file_actions_destroy") fun actions_destroy(actions: ptr<u8>) -> i32;
+extern(c, "posix_spawn_file_actions_adddup2") fun actions_dup(actions: ptr<u8>, fd: i32, target: i32) -> i32;
+extern(c, "posix_spawn_file_actions_addclose") fun actions_close(actions: ptr<u8>, fd: i32) -> i32;
+extern(c, "jsrt_child_callback") fun callback(kind: i32) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_construct") fun construct(ctx: ptr<u8>, constructor: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_is_array") fun is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_get_index") fun index(ctx: ptr<u8>, value: ptr<u8>, i: u32, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+const SLOT: i64 = 26;
+const CLOSE_ON_EXEC: i32 = 524288;
+const DUPLICATE_CLOSE_ON_EXEC: i32 = 1030;
+struct Child {
+    pid: i64;
+    owner: ptr<u8>;
+    failure: ptr<u8>;
+    reaped: bool;
+    status: i32;
+    exit_sent: bool;
+    pipes: array<ptr<u8>, 3>;
+}
+
+fun release_child_pipes(ctx: ptr<u8>, child: ptr<Child>, discarding: bool) {
+    for (var i: i64 = 0; i < 3; i++) {
+        var pipe: ptr<u8> = (deref child.pipes)[i];
+        (deref child.pipes)[i] = null;
+        if (pipe != null) {
+            if (discarding) {
+                discard_process_stream(ctx, pipe);
+            }
+            unprotect(ctx, pipe);
+        }
+    }
+}
+
+struct Children {
+    entries: ptr<Child>;
+    exports: ptr<u8>;
+    spawn_fn: ptr<u8>;
+    kill_fn: ptr<u8>;
+    keys_fn: ptr<u8>;
+}
+
+fun storage(ctx: ptr<u8>) -> ptr<Children> {
+    return owned_context_slot(ctx, SLOT, size_of<Children>() as i64) as ptr<Children>;
+}
+
+fun signal_name(signal: i32) -> str {
+    var names: array<str, 32> = ["UNKNOWN", "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT",
+        "SIGBUS", "SIGFPE", "SIGKILL", "SIGUSR1", "SIGSEGV", "SIGUSR2", "SIGPIPE", "SIGALRM", "SIGTERM",
+        "SIGSTKFLT", "SIGCHLD", "SIGCONT", "SIGSTOP", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG", "SIGXCPU",
+        "SIGXFSZ", "SIGVTALRM", "SIGPROF", "SIGWINCH", "SIGIO", "SIGPWR", "SIGSYS"];
+    if (signal > 0 && signal < 32) {
+        return names[signal as i64];
+    }
+    return "UNKNOWN";
+}
+
+export(c) fun jsrt_child_kill(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, argc: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<Children> = storage(ctx);
+    var entries: ptr<Child> = deref s.entries;
+    var signal: i32 = 15;
+    if (argc > 0 && kind(ctx, args[0]) != 0) {
+        if (kind(ctx, args[0]) == 4) {
+            var name: array<u8, 32>;
+            if (copy_host_path(ctx, args[0], &name[0], 32, ex) < 0) {
+                return undefined(ctx);
+            }
+            if (mem_eq_cstr(&name[0] as str, "SIGKILL")) {
+                signal = 9;
+            } else if (mem_eq_cstr(&name[0] as str, "SIGINT")) {
+                signal = 2;
+            } else if (!mem_eq_cstr(&name[0] as str, "SIGTERM")) {
+                fail(ctx, ex, 1, "unsupported child signal");
+                return undefined(ctx);
+            }
+        } else {
+            signal = buffer_integer(ctx, args[0], 1, 15, ex) as i32;
+        }
+    }
+    if (signal != 2 && signal != 9 && signal != 15) {
+        fail(ctx, ex, 1, "unsupported child signal");
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (entries != null) {
+        for (var i: i64 = 0; i < CHILD_LIMIT; i++) {
+            var c: ptr<Child> = entries + i;
+            if (deref c.owner == receiver && deref c.pid > 0 && !deref c.reaped) {
+                var sent: bool = proc_kill(deref c.pid, signal) == 0;
+                if (sent) {
+                    put(ctx, receiver, "killed", boolean(ctx, true), ex);
+                }
+                return boolean(ctx, sent);
+            }
+        }
+    }
+    return boolean(ctx, false);
+}
+
+export(c) fun jsrt_child_spawn(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, argc: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<Children> = storage(ctx);
+    if (deref s.entries == null) {
+        deref s.entries = mem_alloc_zeroed(CHILD_LIMIT * (size_of<Child>() as i64)) as ptr<Child>;
+    }
+    if (deref s.entries == null) {
+        fail(ctx, ex, 0, "cannot allocate child records");
+        return undefined(ctx);
+    }
+    var entries: ptr<Child> = deref s.entries;
+    var selected: ptr<Child> = null;
+    for (var i: i64 = 0; i < CHILD_LIMIT; i++) {
+        var c: ptr<Child> = entries + i;
+        if (deref c.pid == 0) {
+            selected = c;
+            deref c.pid = -1;
+            deref c.reaped = false;
+            deref c.exit_sent = false;
+            for (var j: i64 = 0; j < 3; j++) {
+                (deref c.pipes)[j] = null;
+            }
+            break;
+        }
+    }
+    if (selected == null) {
+        fail(ctx, ex, 2, "pending child process limit exceeded");
+        return undefined(ctx);
+    }
+    var bytes: ptr<u8> = mem_alloc((CHILD_ARGUMENT_LIMIT + 2) * 8192);
+    if (bytes == null) {
+        deref selected.pid = 0;
+        fail(ctx, ex, 0, "cannot allocate child arguments");
+        return undefined(ctx);
+    }
+    var argv: array<ptr<i8>, 65>;
+    var count: i64 = 0;
+    var piped: bool = false;
+    if (argc < 3 || kind(ctx, args[2]) != 5 || !is_array(ctx, args[1])) {
+        fail(ctx, ex, 1, "spawn requires command, argument array and {stdio:'inherit'}");
+    }
+    if (deref ex == null) {
+        var key_args: array<ptr<u8>, 1> = [args[2]];
+        var keys: ptr<u8> = call(ctx, deref s.keys_fn, null, 1, &key_args[0], ex);
+        if (keys == null || deref ex != null) {
+            mem_free(bytes, (CHILD_ARGUMENT_LIMIT + 2) * 8192);
+            deref selected.pid = 0;
+            return undefined(ctx);
+        }
+        protect(ctx, keys);
+        var key_count: i64 = buffer_integer(ctx, get(ctx, keys, "length", ex), 0, 64, ex);
+        for (var i: i64 = 0; i < key_count && deref ex == null; i++) {
+            var key: array<u8, 64>;
+            if (copy_host_path(ctx, index(ctx, keys, i as u32, ex), &key[0], 64, ex) >= 0 && !mem_eq_cstr(&key[0] as str,
+                "stdio")) {
+                fail(ctx, ex, 1, "unsupported child process option");
+            }
+        }
+        unprotect(ctx, keys);
+        var stdio: array<u8, 32>;
+        if (deref ex == null && copy_host_path(ctx, get(ctx, args[2], "stdio", ex), &stdio[0], 32, ex) >= 0) {
+            piped = mem_eq_cstr(&stdio[0] as str, "pipe");
+            if (!piped && !mem_eq_cstr(&stdio[0] as str, "inherit")) {
+                fail(ctx, ex, 1, "child stdio must be inherit or pipe");
+            }
+        }
+        var unsupported: array<str, 8> = ["cwd", "env", "shell", "detached", "timeout", "signal", "uid",
+            "gid"];
+        for (var i: i64 = 0; i < 8 && deref ex == null; i++) {
+            if (kind(ctx, get(ctx, args[2], unsupported[i], ex)) != 0) {
+                fail(ctx, ex, 1, "unsupported child process option");
+            }
+        }
+        if (deref ex == null) {
+            count = buffer_integer(ctx, get(ctx, args[1], "length", ex), 0, CHILD_ARGUMENT_LIMIT, ex);
+        }
+    }
+    if (deref ex == null && copy_host_path(ctx, args[0], bytes, 8192, ex) >= 0) {
+        if (bytes[0] != 47) {
+            fail(ctx, ex, 1, "spawn requires an absolute executable path");
+        }
+        argv[0] = bytes as ptr<i8>;
+        for (var i: i64 = 0; i < count && deref ex == null; i++) {
+            var destination: ptr<u8> = bytes + (i + 1) * 8192;
+            copy_host_path(ctx, index(ctx, args[1], i as u32, ex), destination, 8192, ex);
+            argv[i+1] = destination as ptr<i8>;
+        }
+        argv[count+1] = null;
+    }
+    var owner: ptr<u8> = undefined(ctx);
+    if (deref ex == null) {
+        owner = construct(ctx, events_module(ctx), 0, null, ex);
+        if (deref ex == null) {
+            protect(ctx, owner);
+            deref selected.owner = owner;
+            define(ctx, owner, "kill", deref s.kill_fn, ex, true);
+            define(ctx, owner, "killed", boolean(ctx, false), ex, true);
+            define(ctx, owner, "stdin", js_null(ctx), ex, true);
+            define(ctx, owner, "stdout", js_null(ctx), ex, true);
+            define(ctx, owner, "stderr", js_null(ctx), ex, true);
+            define(ctx, owner, "exitCode", js_null(ctx), ex, true);
+            define(ctx, owner, "signalCode", js_null(ctx), ex, true);
+            var pid: i32 = 0;
+            var status: i32 = -1;
+            var actions: ptr<u8> = null;
+            var actions_ready: bool = false;
+            var fds: array<i32, 6> = [-1, -1, -1, -1, -1, -1];
+            if (piped && deref ex == null) {
+                actions = mem_alloc_zeroed(actions_size());
+                if (actions == null || actions_init(actions) != 0) {
+                    fail(ctx, ex, 0, "cannot initialize child pipe actions");
+                } else {
+                    actions_ready = true;
+                }
+                for (var i: i64 = 0; i < 3 && deref ex == null; i++) {
+                    if (make_pipe(&fds[i * 2], CLOSE_ON_EXEC) != 0) {
+                        fail(ctx, ex, 0, "cannot create child pipe");
+                        break;
+                    }
+                    // Keep file actions away from fd 0..2 even if the parent
+                    // started with a closed standard descriptor.
+                    for (var j: i64 = i * 2; j < i * 2 + 2; j++) {
+                        if (fds[j] < 3) {
+                            var moved: i64 = fcntl(fds[j] as i64, DUPLICATE_CLOSE_ON_EXEC, 3);
+                            if (moved < 0) {
+                                fail(ctx, ex, 0, "cannot reserve child pipe descriptor");
+                                break;
+                            }
+                            io_close(fds[j] as i64);
+                            fds[j] = moved as i32;
+                        }
+                    }
+                    if (deref ex != null) {
+                        break;
+                    }
+                    var child_end: i64 = i * 2 + 1;
+                    var parent_end: i64 = i * 2;
+                    if (i == 0) {
+                        child_end = i * 2;
+                        parent_end = i * 2 + 1;
+                    }
+                    var flags: i64 = fcntl(fds[parent_end] as i64, FS_F_GETFL, 0);
+                    if (flags < 0 || fcntl(fds[parent_end] as i64, FS_F_SETFL, flags | FS_O_NONBLOCK) < 0 ||
+                        actions_dup(actions, fds[child_end], i as i32) != 0 ||
+                        actions_close(actions, fds[parent_end]) != 0 ||
+                        (fds[child_end] != i as i32 && actions_close(actions, fds[child_end]) != 0)) {
+                        fail(ctx, ex, 0, "cannot configure child pipe");
+                    }
+                }
+            }
+            if (deref ex == null) {
+                status = spawn_native(&pid, bytes as str, actions, null, &argv[0], environment());
+            }
+            if (actions_ready) {
+                actions_destroy(actions);
+            }
+            if (actions != null) {
+                mem_free(actions, actions_size());
+            }
+            if (status == 0) {
+                // Transfer parent ends exactly once. Child ends are closed below.
+                deref selected.pid = pid as i64;
+                if (piped) {
+                    var endpoint: i64 = fds[1] as i64;
+                    fds[1] = -1;
+                    var pipe: ptr<u8> = process_write_stream(ctx, endpoint, ex);
+                    if (deref ex == null) {
+                        (deref selected.pipes)[0] = pipe;
+                        protect(ctx, pipe);
+                        put(ctx, owner, "stdin", pipe, ex);
+                    }
+                    if (deref ex == null) {
+                        endpoint = fds[2] as i64;
+                        fds[2] = -1;
+                        pipe = process_read_stream(ctx, endpoint, false, ex);
+                        if (deref ex == null) {
+                            (deref selected.pipes)[1] = pipe;
+                            protect(ctx, pipe);
+                            put(ctx, owner, "stdout", pipe, ex);
+                        }
+                    }
+                    if (deref ex == null) {
+                        endpoint = fds[4] as i64;
+                        fds[4] = -1;
+                        pipe = process_read_stream(ctx, endpoint, false, ex);
+                        if (deref ex == null) {
+                            (deref selected.pipes)[2] = pipe;
+                            protect(ctx, pipe);
+                            put(ctx, owner, "stderr", pipe, ex);
+                        }
+                    }
+                }
+            }
+            for (var i: i64 = 0; i < 6; i++) {
+                if (fds[i] >= 0) {
+                    io_close(fds[i] as i64);
+                }
+            }
+            if (status == 0) {
+                deref selected.pid = pid as i64;
+                define(ctx, owner, "pid", number(ctx, pid as f64), ex, true);
+            } else if (deref ex == null) {
+                var failure: ptr<u8> = null;
+                fail(ctx, &failure, 0, "cannot spawn child process");
+                protect(ctx, failure);
+                var code: str = "EIO";
+                if (status == 2) {
+                    code = "ENOENT";
+                } else if (status == 13) {
+                    code = "EACCES";
+                }
+                define(ctx, failure, "code", text(ctx, code), ex, true);
+                deref selected.failure = failure;
+            }
+        }
+    }
+    mem_free(bytes, (CHILD_ARGUMENT_LIMIT + 2) * 8192);
+    if (deref ex != null) {
+        if (deref selected.pid > 0) {
+            proc_kill(deref selected.pid, 9);
+            var status: i32 = 0;
+            var waited: i64 = proc_wait(deref selected.pid, &status);
+            while (waited == -4) {
+                waited = proc_wait(deref selected.pid, &status);
+            }
+        }
+        release_child_pipes(ctx, selected, true);
+        if (deref selected.owner != null) {
+            unprotect(ctx, deref selected.owner);
+            deref selected.owner = null;
+        }
+        if (deref selected.failure != null) {
+            unprotect(ctx, deref selected.failure);
+            deref selected.failure = null;
+        }
+        deref selected.pid = 0;
+        return undefined(ctx);
+    }
+    return owner;
+}
+
+pub fun child_process_module(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<Children> = storage(ctx);
+    if (deref s.exports != null) {
+        return deref s.exports;
+    }
+    deref s.keys_fn = capture(ctx, get(ctx, global(ctx), "Reflect", ex), "ownKeys", ex);
+    deref s.exports = plain(ctx);
+    protect(ctx, deref s.exports);
+    var key: ptr<u8> = utf8("spawn");
+    deref s.spawn_fn = function(ctx, key, callback(0));
+    release(key);
+    protect(ctx, deref s.spawn_fn);
+    key = utf8("kill");
+    deref s.kill_fn = function(ctx, key, callback(1));
+    release(key);
+    protect(ctx, deref s.kill_fn);
+    define(ctx, deref s.exports, "spawn", deref s.spawn_fn, ex, true);
+    return deref s.exports;
+}
+
+pub fun children_pending(ctx: ptr<u8>) -> bool {
+    var s: ptr<Children> = context_slot(ctx, SLOT) as ptr<Children>;
+    if (s == null) {
+        return false;
+    }
+    var entries: ptr<Child> = deref s.entries;
+    if (entries == null) {
+        return false;
+    }
+    for (var i: i64 = 0; i < CHILD_LIMIT; i++) {
+        var c: ptr<Child> = entries + i;
+        if (deref c.pid != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fun poll_children(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> i32 {
+    var s: ptr<Children> = context_slot(ctx, SLOT) as ptr<Children>;
+    if (s == null) {
+        return 0;
+    }
+    var entries: ptr<Child> = deref s.entries;
+    if (entries == null) {
+        return 0;
+    }
+    var changed: i32 = 0;
+    for (var i: i64 = 0; i < CHILD_LIMIT && deref ex == null; i++) {
+        var c: ptr<Child> = entries + i;
+        if (deref c.pid == 0) {
+            continue;
+        }
+        var status: i32 = 0;
+        var waited: i64 = 0;
+        if (deref c.pid > 0 && !deref c.reaped) {
+            waited = proc_wait_nohang(deref c.pid, &status);
+            if (waited == 0 || waited == -4) {
+                continue;
+            }
+        } else if (deref c.failure == null && !deref c.reaped) {
+            continue;
+        }
+        var owner: ptr<u8> = deref c.owner;
+        var failure: ptr<u8> = deref c.failure;
+        if (waited < 0) {
+            fail(ctx, ex, 0, "cannot reap owned child process");
+            return -1;
+        }
+        changed = 1;
+        if (failure != null) {
+            deref c.pid = 0;
+            deref c.owner = null;
+            deref c.failure = null;
+            var problem: array<ptr<u8>, 1> = [failure];
+            emit_named(ctx, owner, "error", 1, &problem[0], ex);
+            unprotect(ctx, failure);
+            unprotect(ctx, owner);
+        } else {
+            if (!deref c.reaped) {
+                deref c.reaped = true;
+                deref c.status = status;
+            }
+            status = deref c.status;
+            var code: ptr<u8> = js_null(ctx);
+            var signal: ptr<u8> = js_null(ctx);
+            if (proc_status_exited(status)) {
+                code = number(ctx, proc_status_exit_code(status) as f64);
+            } else {
+                signal = text(ctx, signal_name(proc_status_term_signal(status)));
+            }
+            protect(ctx, code);
+            protect(ctx, signal);
+            put(ctx, owner, "exitCode", code, ex);
+            put(ctx, owner, "signalCode", signal, ex);
+            var exit_args: array<ptr<u8>, 2> = [code, signal];
+            if (!deref c.exit_sent) {
+                deref c.exit_sent = true;
+                emit_named(ctx, owner, "exit", 2, &exit_args[0], ex);
+                var input_stream: ptr<u8> = (deref c.pipes)[0];
+                if (input_stream != null && deref ex == null) {
+                    stream_invoke(ctx, input_stream, 6, 0, null, ex);
+                }
+                for (var j: i64 = 1; j < 3 && deref ex == null; j++) {
+                    var output: ptr<u8> = (deref c.pipes)[j];
+                    if (output != null && !has_named_listeners(ctx, output, "data")) {
+                        stream_invoke(ctx, output, 3, 0, null, ex);
+                    }
+                }
+            }
+            if (deref ex == null && process_stream_closed(ctx, (deref c.pipes)[0]) &&
+                process_stream_closed(ctx, (deref c.pipes)[1]) &&
+                process_stream_closed(ctx, (deref c.pipes)[2])) {
+                // Release the slot before close listeners can spawn replacements.
+                deref c.pid = 0;
+                deref c.owner = null;
+                release_child_pipes(ctx, c, false);
+                emit_named(ctx, owner, "close", 2, &exit_args[0], ex);
+                unprotect(ctx, owner);
+            }
+            unprotect(ctx, signal);
+            unprotect(ctx, code);
+        }
+    }
+    if (deref ex != null) {
+        return -1;
+    }
+    return changed;
+}
+
+pub fun shutdown_children(ctx: ptr<u8>) -> bool {
+    var s: ptr<Children> = context_slot(ctx, SLOT) as ptr<Children>;
+    if (s == null) {
+        return true;
+    }
+    var entries: ptr<Child> = deref s.entries;
+    var ok: bool = true;
+    if (entries != null) {
+        for (var i: i64 = 0; i < CHILD_LIMIT; i++) {
+            var c: ptr<Child> = entries + i;
+            if (deref c.pid > 0 && !deref c.reaped) {
+                proc_kill(deref c.pid, 9);
+                var status: i32 = 0;
+                var waited: i64 = proc_wait(deref c.pid, &status);
+                while (waited == -4) {
+                    waited = proc_wait(deref c.pid, &status);
+                }
+                if (waited < 0) {
+                    ok = false;
+                }
+            }
+            release_child_pipes(ctx, c, true);
+            if (deref c.owner != null) {
+                unprotect(ctx, deref c.owner);
+            }
+            if (deref c.failure != null) {
+                unprotect(ctx, deref c.failure);
+            }
+        }
+        mem_free(entries as ptr<u8>, CHILD_LIMIT * (size_of<Child>() as i64));
+        deref s.entries = null;
+    }
+    if (deref s.exports != null) {
+        unprotect(ctx, deref s.exports);
+        deref s.exports = null;
+    }
+    if (deref s.spawn_fn != null) {
+        unprotect(ctx, deref s.spawn_fn);
+        deref s.spawn_fn = null;
+    }
+    if (deref s.kill_fn != null) {
+        unprotect(ctx, deref s.kill_fn);
+        deref s.kill_fn = null;
+    }
+    if (deref s.keys_fn != null) {
+        unprotect(ctx, deref s.keys_fn);
+        deref s.keys_fn = null;
+    }
+    return ok;
+}

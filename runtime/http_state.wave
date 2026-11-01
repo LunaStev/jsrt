@@ -1,0 +1,177 @@
+import("./context_state")::{owned_context_slot, active_context};
+pub struct HttpHostState {
+    servers: ptr<HttpServer>;
+    connections: ptr<HttpConnection>;
+}
+
+pub fun http_state_storage(ctx: ptr<u8>) -> ptr<HttpHostState> {
+    return owned_context_slot(ctx, 15, size_of<HttpHostState>() as i64) as ptr<HttpHostState>;
+}
+
+// Shared HTTP records. Endpoint callbacks only mark completion; JS runs outside uv_run.
+import("std::mem::alloc")::{mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+import("./http_protocol")::{HttpRequest, free_request};
+import("./config")::{HTTP_SERVER_LIMIT, HTTP_CONNECTION_LIMIT, HTTP_HEADER_COUNT};
+
+pub struct HttpServer {
+    kind: i32;
+    object: ptr<u8>;
+    handle: ptr<u8>;
+    listen_callback: ptr<u8>;
+    close_callback: ptr<u8>;
+    listening: bool;
+    closing: bool;
+    listen_pending: bool;
+    close_pending: bool;
+    accept_pending: bool;
+    headers_timeout: i64;
+    request_timeout: i64;
+    idle_timeout: i64;
+    keep_alive: bool;
+    keep_alive_timeout: i64;
+}
+
+pub struct ResponseHeader {
+    name: ptr<u8>;
+    value: ptr<u8>;
+    name_length: i64;
+    value_length: i64;
+    value_count: i64;
+    array_value: bool;
+}
+
+pub struct HttpConnection {
+    kind: i32;
+    handle: ptr<u8>;
+    server: ptr<HttpServer>;
+    request: ptr<HttpRequest>;
+    response: ptr<u8>;
+    write_request: ptr<u8>;
+    incoming: ptr<u8>;
+    incoming_eof: bool;
+    read_paused: bool;
+    head: ptr<u8>;
+    head_length: i64;
+    head_capacity: i64;
+    prepared: bool;
+    chunked: bool;
+    suppress: bool;
+    write_done: ptr<u8>;
+    write_complete: bool;
+    write_status: i32;
+    incoming_destroy_done: ptr<u8>;
+    response_destroy_done: ptr<u8>;
+    output: ptr<u8>;
+    output_length: i64;
+    output_capacity: i64;
+    headers: ptr<ResponseHeader>;
+    header_count: i64;
+    header_bytes: i64;
+    dispatched: bool;
+    ending: bool;
+    end_requested: bool;
+    busy: bool;
+    closing: bool;
+    closed: bool;
+    accepted_at: i64;
+    activity_at: i64;
+    keep_alive: bool;
+    response_finished: bool;
+    reused: bool;
+}
+
+pub fun allocate_http_state() -> bool {
+    var host_state: ptr<HttpHostState> = http_state_storage(active_context());
+    (deref host_state.servers) = mem_alloc_zeroed(HTTP_SERVER_LIMIT * (size_of<HttpServer>() as i64)) as ptr<HttpServer>;
+    (deref host_state.connections) = mem_alloc_zeroed(HTTP_CONNECTION_LIMIT * (size_of<HttpConnection>() as i64)) as ptr<HttpConnection>;
+    return(deref host_state.servers) != null && (deref host_state.connections) != null;
+}
+
+pub fun server_for(value: ptr<u8>) -> ptr<HttpServer> {
+    var host_state: ptr<HttpHostState> = http_state_storage(active_context());
+    if ((deref host_state.servers) == null) {
+        return null;
+    }
+    for (var i: i64 = 0; i < HTTP_SERVER_LIMIT; i++) {
+        var server: ptr<HttpServer> = (deref host_state.servers) + i;
+        if (deref server.object == value) {
+            return server;
+        }
+    }
+    return null;
+}
+
+pub fun connection_for(value: ptr<u8>) -> ptr<HttpConnection> {
+    var host_state: ptr<HttpHostState> = http_state_storage(active_context());
+    if ((deref host_state.connections) == null) {
+        return null;
+    }
+    for (var i: i64 = 0; i < HTTP_CONNECTION_LIMIT; i++) {
+        var client: ptr<HttpConnection> = (deref host_state.connections) + i;
+        if (deref client.response == value && !deref client.closed && !deref client.closing) {
+            return client;
+        }
+    }
+    return null;
+}
+
+pub fun endpoint_for(value: ptr<u8>) -> ptr<HttpConnection> {
+    var host_state: ptr<HttpHostState> = http_state_storage(active_context());
+    if ((deref host_state.connections) == null) {
+        return null;
+    }
+    for (var i: i64 = 0; i < HTTP_CONNECTION_LIMIT; i++) {
+        var client: ptr<HttpConnection> = (deref host_state.connections) + i;
+        if (!deref client.closed && (deref client.response == value || deref client.incoming == value)) {
+            return client;
+        }
+    }
+    return null;
+}
+
+pub fun server_connections(server: ptr<HttpServer>) -> i64 {
+    var host_state: ptr<HttpHostState> = http_state_storage(active_context());
+    var count: i64 = 0;
+    for (var i: i64 = 0; i < HTTP_CONNECTION_LIMIT; i++) {
+        var client: ptr<HttpConnection> = (deref host_state.connections) + i;
+        if (deref client.server == server && deref client.kind != 0) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+pub fun free_connection_bytes(client: ptr<HttpConnection>) {
+    free_request(deref client.request);
+    deref client.request = null;
+    if (deref client.head != null) {
+        mem_free(deref client.head, deref client.head_capacity);
+        deref client.head = null;
+    }
+    if (deref client.output != null) {
+        mem_free(deref client.output, deref client.output_capacity);
+        deref client.output = null;
+    }
+    if (deref client.headers != null) {
+        for (var i: i64 = 0; i < deref client.header_count; i++) {
+            var header: ptr<ResponseHeader> = deref client.headers + i;
+            mem_free(deref header.name, deref header.name_length + 1);
+            mem_free(deref header.value, deref header.value_length + 1);
+        }
+        mem_free(deref client.headers as ptr<u8>, HTTP_HEADER_COUNT * (size_of<ResponseHeader>() as i64));
+        deref client.headers = null;
+    }
+}
+
+pub fun release_http_state() {
+    var host_state: ptr<HttpHostState> = http_state_storage(active_context());
+    if ((deref host_state.servers) != null) {
+        mem_free((deref host_state.servers) as ptr<u8>, HTTP_SERVER_LIMIT * (size_of<HttpServer>() as i64));
+        (deref host_state.servers) = null;
+    }
+    if ((deref host_state.connections) != null) {
+        mem_free((deref host_state.connections) as ptr<u8>, HTTP_CONNECTION_LIMIT * (size_of<HttpConnection>() as i64));
+        (deref host_state.connections) = null;
+    }
+}

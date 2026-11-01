@@ -1,0 +1,208 @@
+// OpenSSL contexts are owned by private JSC ArrayBuffers and freed by their deallocator.
+// Finalization uses only native memory/OpenSSL and may run on a GC thread.
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+import("./values")::{fail};
+import("./buffer_core")::{byte_view_length, copy_byte_view, buffer_from_bytes};
+import("./byte_codec")::{decode_bytes};
+extern(c, "EVP_sha256") fun sha256() -> ptr<u8>;
+extern(c, "EVP_sha384") fun sha384() -> ptr<u8>;
+extern(c, "EVP_sha512") fun sha512() -> ptr<u8>;
+extern(c, "EVP_MD_CTX_new") fun digest_new() -> ptr<u8>;
+extern(c, "EVP_MD_CTX_free") fun digest_free(state: ptr<u8>);
+extern(c, "EVP_DigestInit_ex") fun digest_init(state: ptr<u8>, algorithm: ptr<u8>, engine: ptr<u8>) -> i32;
+extern(c, "EVP_DigestUpdate") fun digest_update(state: ptr<u8>, bytes: ptr<u8>, size: u64) -> i32;
+extern(c, "EVP_DigestFinal_ex") fun digest_final(state: ptr<u8>, bytes: ptr<u8>, size: ptr<u32>) -> i32;
+extern(c, "EVP_MAC_fetch") fun mac_fetch(ctx: ptr<u8>, name: str, properties: ptr<u8>) -> ptr<u8>;
+extern(c, "EVP_MAC_free") fun mac_free(mac: ptr<u8>);
+extern(c, "EVP_MAC_CTX_new") fun mac_new(mac: ptr<u8>) -> ptr<u8>;
+extern(c, "EVP_MAC_CTX_free") fun mac_ctx_free(ctx: ptr<u8>);
+extern(c, "EVP_MAC_init") fun mac_init(ctx: ptr<u8>, key: ptr<u8>, size: u64, params: ptr<Param>) -> i32;
+extern(c, "EVP_MAC_update") fun mac_update(ctx: ptr<u8>, bytes: ptr<u8>, size: u64) -> i32;
+extern(c, "EVP_MAC_final") fun mac_final(ctx: ptr<u8>, bytes: ptr<u8>, size: ptr<u64>, capacity: u64) -> i32;
+extern(c, "OPENSSL_cleanse") fun cleanse(bytes: ptr<u8>, size: u64);
+extern(c, "wr_external_buffer") fun external_buffer(ctx: ptr<u8>, bytes: ptr<u8>, size: i64, callback: ptr<u8>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_array_buffer_bytes") fun external_bytes(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "jsrt_crypto_deallocator") fun deallocator() -> ptr<u8>;
+struct Param {
+    key: ptr<u8>;
+    data_type: u32;
+    data: ptr<u8>;
+    data_size: u64;
+    return_size: u64;
+}
+
+struct State {
+    digest: ptr<u8>;
+    mac: ptr<u8>;
+}
+
+fun close_state(state: ptr<State>) {
+    if (deref state.digest != null) {
+        digest_free(deref state.digest);
+        deref state.digest = null;
+    }
+    if (deref state.mac != null) {
+        mac_ctx_free(deref state.mac);
+        deref state.mac = null;
+    }
+}
+
+export(c) fun jsrt_crypto_finalize(bytes: ptr<u8>, ignored: ptr<u8>) {
+    var state: ptr<State> = bytes as ptr<State>;
+    close_state(state);
+    cleanse(bytes, size_of<State>() as u64);
+    mem_free(bytes, size_of<State>() as i64);
+}
+
+pub fun create_hash_state(ctx: ptr<u8>, alg: i64, keyed: bool, key: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<State> = mem_alloc_zeroed(size_of<State>() as i64) as ptr<State>;
+    if (state == null) {
+        fail(ctx, ex, 2, "cannot allocate hash state");
+        return undefined(ctx);
+    }
+    var ok: bool = false;
+    if (!keyed) {
+        deref state.digest = digest_new();
+        var selected: ptr<u8> = sha256();
+        if (alg == 1) {
+            selected = sha384();
+        } else if (alg == 2) {
+            selected = sha512();
+        }
+        if (deref state.digest != null) {
+            ok = digest_init(deref state.digest, selected, null) == 1;
+        }
+    } else {
+        var size: i64 = byte_view_length(ctx, key, ex);
+        var capacity: i64 = size;
+        if (capacity <= 0) {
+            capacity = 1;
+        }
+        var bytes: ptr<u8> = null;
+        if (deref ex == null) {
+            bytes = mem_alloc(capacity);
+        }
+        if (bytes == null && deref ex == null) {
+            fail(ctx, ex, 2, "cannot allocate HMAC key scratch");
+        }
+        if (bytes != null && copy_byte_view(ctx, key, bytes, capacity, ex) >= 0) {
+            var mac: ptr<u8> = mac_fetch(null, "HMAC", null);
+            if (mac != null) {
+                deref state.mac = mac_new(mac);
+                mac_free(mac);
+            }
+            var name: str = "SHA256";
+            if (alg == 1) {
+                name = "SHA384";
+            } else if (alg == 2) {
+                name = "SHA512";
+            }
+            var params: array<Param, 2> = [Param {
+                key: "digest" as ptr<u8>, data_type: 4, data: name as ptr<u8>, data_size: 0, return_size: 0
+            }
+            , Param {
+                key: null, data_type: 0, data: null, data_size: 0, return_size: 0
+            }
+            ];
+            if (deref state.mac != null) {
+                ok = mac_init(deref state.mac, bytes, size as u64, &params[0]) == 1;
+            }
+        }
+        if (bytes != null) {
+            cleanse(bytes, capacity as u64);
+            mem_free(bytes, capacity);
+        }
+    }
+    if (!ok || deref ex != null) {
+        jsrt_crypto_finalize(state as ptr<u8>, null);
+        if (deref ex == null) {
+            fail(ctx, ex, 0, "OpenSSL hash initialization failed");
+        }
+        return undefined(ctx);
+    }
+    // JSC calls the supplied deallocator itself if construction throws.
+    var result: ptr<u8> = external_buffer(ctx, state as ptr<u8>, size_of<State>() as i64, deallocator(),
+        ex);
+    if (result == null) {
+        if (deref ex == null) {
+            jsrt_crypto_finalize(state as ptr<u8>, null);
+            fail(ctx, ex, 0, "cannot attach hash state to engine");
+        }
+        return undefined(ctx);
+    }
+    return result;
+}
+
+pub fun update_hash_state(ctx: ptr<u8>, owner: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    protect(ctx, owner);
+    var size: i64 = byte_view_length(ctx, value, ex);
+    var capacity: i64 = size;
+    if (capacity <= 0) {
+        capacity = 1;
+    }
+    var bytes: ptr<u8> = null;
+    if (deref ex == null) {
+        bytes = mem_alloc(capacity);
+    }
+    if (bytes == null && deref ex == null) {
+        fail(ctx, ex, 2, "cannot allocate hash input scratch");
+    }
+    if (bytes != null && copy_byte_view(ctx, value, bytes, capacity, ex) >= 0) {
+        var state: ptr<State> = external_bytes(ctx, owner, ex) as ptr<State>;
+        var ok: bool = false;
+        if (state != null && deref ex == null) {
+            if (deref state.digest != null) {
+                ok = digest_update(deref state.digest, bytes, size as u64) == 1;
+            } else if (deref state.mac != null) {
+                ok = mac_update(deref state.mac, bytes, size as u64) == 1;
+            }
+            if (!ok) {
+                close_state(state);
+            }
+        }
+        if (!ok && deref ex == null) {
+            fail(ctx, ex, 0, "OpenSSL hash update failed");
+        }
+    }
+    if (bytes != null) {
+        cleanse(bytes, capacity as u64);
+        mem_free(bytes, capacity);
+    }
+    unprotect(ctx, owner);
+}
+
+pub fun finish_hash_state(ctx: ptr<u8>, owner: ptr<u8>, code: i32, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    protect(ctx, owner);
+    var state: ptr<State> = external_bytes(ctx, owner, ex) as ptr<State>;
+    var bytes: array<u8, 64>;
+    var size: u64 = 0;
+    var ok: bool = false;
+    if (state != null && deref ex == null) {
+        if (deref state.digest != null) {
+            var n: u32 = 0;
+            ok = digest_final(deref state.digest, &bytes[0], &n) == 1;
+            size = n as u64;
+        } else if (deref state.mac != null) {
+            ok = mac_final(deref state.mac, &bytes[0], &size, 64) == 1;
+        }
+        close_state(state);
+    }
+    var result: ptr<u8> = undefined(ctx);
+    if (!ok || size > 64) {
+        if (deref ex == null) {
+            fail(ctx, ex, 0, "OpenSSL hash finalization failed");
+        }
+    } else if (code == -1) {
+        result = buffer_from_bytes(ctx, &bytes[0], size as i64, ex);
+    } else {
+        result = decode_bytes(ctx, &bytes[0], size as i64, code, ex);
+    }
+    cleanse(&bytes[0], 64);
+    unprotect(ctx, owner);
+    return result;
+}

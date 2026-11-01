@@ -1,0 +1,5 @@
+// Standalone Wave deployment entry point; no compiler or JS engine is required.
+import("./deploy_app")::{deploy_main};
+fun main() -> i32 {
+    return deploy_main();
+}

@@ -1,0 +1,267 @@
+// Readable adapters preserve private ownership and perform JS only on the main loop.
+import("./web_stream_core")::{storage, WebStreamState, lookup, record, capability, settle, job, follow, error_readable, READABLE, READER, OPEN, JOB_ADAPTER_READ, JOB_ADAPTER_DESTROY};
+import("./web_readable")::{create_readable, reader, read, cancel, release_reader, enqueue_readable, request_close};
+import("./streams")::{stream_invoke};
+import("./stream_state")::{stream_state, stream_state_storage, StreamHostState};
+import("./stream_utils")::{premature_error};
+import("./events")::{add_listener, remove_listener};
+import("./values")::{get, put, plain, text, define, fail};
+import("./collections")::{list, append, at, length, integer, flag, set_flag, bind_one};
+import("./web_support")::{apply};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_construct") fun construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+pub const TO_WEB: i64 = 52;
+pub const FROM_WEB: i64 = 53;
+pub const WEB_PULL: i64 = 54;
+pub const WEB_CANCEL: i64 = 55;
+pub const HOST_READABLE: i64 = 56;
+pub const HOST_ERROR: i64 = 57;
+pub const HOST_END: i64 = 58;
+pub const HOST_CLOSE: i64 = 59;
+pub const HOST_READ: i64 = 60;
+pub const HOST_DESTROY: i64 = 61;
+pub fun is_web_readable(ctx: ptr<u8>, owner: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var r: ptr<u8> = lookup(ctx, owner, ex);
+    return kind(ctx, r) == 5 && integer(ctx, r, "kind", ex) == READABLE;
+}
+fun drain(ctx: ptr<u8>, bridge: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var wait: ptr<u8> = get(ctx, bridge, "wait", ex);
+    var r: ptr<u8> = get(ctx, bridge, "webState", ex);
+    if (kind(ctx, wait) != 5 || kind(ctx, r) != 5 || integer(ctx, r, "state", ex) != OPEN || flag(ctx, bridge, "draining", ex)) {
+        return;
+    }
+    set_flag(ctx, bridge, "draining", true, ex);
+    var problem: ptr<u8> = null;
+    var chunk: ptr<u8> = stream_invoke(ctx, get(ctx, bridge, "host", ex), 1, 0, null, &problem);
+    if (problem != null) {
+        error_readable(ctx, r, problem, ex);
+        settle(ctx, wait, undefined(ctx), false, ex);
+        put(ctx, bridge, "wait", undefined(ctx), ex);
+    } else if (kind(ctx, chunk) != 1) {
+        enqueue_readable(ctx, r, chunk, &problem);
+        if (problem != null) {
+            error_readable(ctx, r, problem, ex);
+        }
+        settle(ctx, wait, undefined(ctx), false, ex);
+        put(ctx, bridge, "wait", undefined(ctx), ex);
+    }
+    set_flag(ctx, bridge, "draining", false, ex);
+}
+fun detach(ctx: ptr<u8>, bridge: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var hooks: ptr<u8> = get(ctx, bridge, "hooks", ex);
+    var host: ptr<u8> = get(ctx, bridge, "host", ex);
+    var names: array<str, 4> = ["readable", "error", "end", "close"];
+    for (var i: i64 = 0; i < length(ctx, hooks, ex); i++) {
+        remove_listener(ctx, host, text(ctx, names[i]), at(ctx, hooks, i, ex), null, ex);
+    }
+    put(ctx, bridge, "hooks", list(ctx, ex), ex);
+}
+pub fun to_web(ctx: ptr<u8>, host: ptr<u8>, options: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<u8> = stream_state(ctx, host, 1, ex);
+    if (state == null || deref ex != null) {
+        return undefined(ctx);
+    }
+    var strategy: ptr<u8> = undefined(ctx);
+    if (kind(ctx, options) == 5) {
+        strategy = get(ctx, options, "strategy", ex);
+    } else if (kind(ctx, options) != 0) {
+        fail(ctx, ex, 1, "toWeb options must be an object");
+    }
+    var bridge: ptr<u8> = plain(ctx);
+    protect(ctx, bridge);
+    put(ctx, bridge, "host", host, ex);
+    var s: ptr<WebStreamState> = storage(ctx);
+    var source: ptr<u8> = plain(ctx);
+    protect(ctx, source);
+    put(ctx, source, "pull", bind_one(ctx, (deref s.methods)[WEB_PULL], undefined(ctx), bridge, ex), ex);
+    put(ctx, source, "cancel", bind_one(ctx, (deref s.methods)[WEB_CANCEL], undefined(ctx), bridge, ex), ex);
+    var owner: ptr<u8> = create_readable(ctx, source, strategy, 1.0, ex);
+    protect(ctx, owner);
+    var r: ptr<u8> = record(ctx, owner, READABLE, ex);
+    put(ctx, bridge, "webState", r, ex);
+    var hooks: ptr<u8> = list(ctx, ex);
+    protect(ctx, hooks);
+    put(ctx, bridge, "hooks", hooks, ex);
+    var names: array<str, 4> = ["readable", "error", "end", "close"];
+    for (var i: i64 = 0; i < 4 && deref ex == null; i++) {
+        var hook: ptr<u8> = bind_one(ctx, (deref s.methods)[HOST_READABLE + i], undefined(ctx), bridge, ex);
+        protect(ctx, hook);
+        append(ctx, hooks, hook, ex);
+        add_listener(ctx, host, text(ctx, names[i]), hook, false, false, ex);
+        unprotect(ctx, hook);
+    }
+    if (flag(ctx, state, "endEmitted", ex)) {
+        request_close(ctx, r, ex);
+    } else if (flag(ctx, state, "destroyed", ex)) {
+        var reason: ptr<u8> = get(ctx, state, "failure", ex);
+        if (kind(ctx, reason) == 0) {
+            reason = premature_error(ctx);
+        }
+        error_readable(ctx, r, reason, ex);
+    }
+    if (deref ex != null) {
+        var ignored: ptr<u8> = null;
+        detach(ctx, bridge, &ignored);
+    }
+    unprotect(ctx, hooks);
+    unprotect(ctx, owner);
+    unprotect(ctx, source);
+    unprotect(ctx, bridge);
+    return owner;
+}
+fun release(ctx: ptr<u8>, bridge: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (!flag(ctx, bridge, "released", ex)) {
+        set_flag(ctx, bridge, "released", true, ex);
+        release_reader(ctx, record(ctx, get(ctx, bridge, "reader", ex), READER, ex), ex);
+    }
+}
+pub fun from_web(ctx: ptr<u8>, source: ptr<u8>, options: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    record(ctx, source, READABLE, ex);
+    var selected: ptr<u8> = plain(ctx);
+    protect(ctx, selected);
+    if (kind(ctx, options) == 5) {
+        var names: array<str, 4> = ["encoding", "highWaterMark", "objectMode", "signal"];
+        for (var i: i64 = 0; i < 4 && deref ex == null; i++) {
+            put(ctx, selected, names[i], get(ctx, options, names[i], ex), ex);
+        }
+    } else if (kind(ctx, options) != 0) {
+        fail(ctx, ex, 1, "fromWeb options must be an object");
+    }
+    var bridge: ptr<u8> = plain(ctx);
+    protect(ctx, bridge);
+    put(ctx, bridge, "reader", reader(ctx, source, undefined(ctx), ex), ex);
+    var roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var call_args: array<ptr<u8>, 1> = [selected];
+    var owner: ptr<u8> = undefined(ctx);
+    if (deref ex == null) {
+        owner = construct(ctx, (deref roots.stream_constructors)[0], 1, &call_args[0], ex);
+    }
+    protect(ctx, owner);
+    if (deref ex == null) {
+        put(ctx, bridge, "host", owner, ex);
+        var s: ptr<WebStreamState> = storage(ctx);
+        define(ctx, owner, "_read", bind_one(ctx, (deref s.methods)[HOST_READ], undefined(ctx), bridge, ex), ex, false);
+        define(ctx, owner, "_destroy", bind_one(ctx, (deref s.methods)[HOST_DESTROY], undefined(ctx), bridge, ex), ex, false);
+    } else {
+        var ignored: ptr<u8> = null;
+        if (kind(ctx, get(ctx, bridge, "reader", &ignored)) == 5) {
+            release(ctx, bridge, &ignored);
+        }
+    }
+    unprotect(ctx, owner);
+    unprotect(ctx, bridge);
+    unprotect(ctx, selected);
+    return owner;
+}
+pub fun adapter_hook(ctx: ptr<u8>, mode: i64, bridge: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var value: ptr<u8> = undefined(ctx);
+    if (count > 1) {
+        value = args[1];
+    }
+    if (mode == WEB_PULL) {
+        var wait: ptr<u8> = capability(ctx, ex);
+        protect(ctx, wait);
+        put(ctx, bridge, "wait", wait, ex);
+        drain(ctx, bridge, ex);
+        var result: ptr<u8> = get(ctx, wait, "promise", ex);
+        unprotect(ctx, wait);
+        return result;
+    }
+    if (mode == WEB_CANCEL) {
+        var wait: ptr<u8> = capability(ctx, ex);
+        protect(ctx, wait);
+        put(ctx, bridge, "cancelWait", wait, ex);
+        set_flag(ctx, bridge, "cancelled", true, ex);
+        settle(ctx, get(ctx, bridge, "wait", ex), undefined(ctx), false, ex);
+        var host: ptr<u8> = get(ctx, bridge, "host", ex);
+        var state: ptr<u8> = stream_state(ctx, host, 1, ex);
+        if (flag(ctx, state, "closed", ex)) {
+            settle(ctx, wait, undefined(ctx), false, ex);
+        } else {
+            var call_args: array<ptr<u8>, 1> = [value];
+            stream_invoke(ctx, host, 6, 1, &call_args[0], ex);
+        }
+        var result: ptr<u8> = get(ctx, wait, "promise", ex);
+        unprotect(ctx, wait);
+        return result;
+    }
+    if (mode >= HOST_READABLE && mode <= HOST_CLOSE) {
+        var r: ptr<u8> = get(ctx, bridge, "webState", ex);
+        if (mode == HOST_READABLE) {
+            drain(ctx, bridge, ex);
+        } else if (mode == HOST_ERROR) {
+            error_readable(ctx, r, value, ex);
+            settle(ctx, get(ctx, bridge, "wait", ex), undefined(ctx), false, ex);
+        } else if (mode == HOST_END) {
+            set_flag(ctx, bridge, "ended", true, ex);
+            if (integer(ctx, r, "state", ex) == OPEN && !flag(ctx, r, "closeRequested", ex)) {
+                request_close(ctx, r, ex);
+            }
+            settle(ctx, get(ctx, bridge, "wait", ex), undefined(ctx), false, ex);
+        } else {
+            if (!flag(ctx, bridge, "ended", ex) && !flag(ctx, bridge, "cancelled", ex)) {
+                error_readable(ctx, r, premature_error(ctx), ex);
+            }
+            settle(ctx, get(ctx, bridge, "wait", ex), undefined(ctx), false, ex);
+            settle(ctx, get(ctx, bridge, "cancelWait", ex), undefined(ctx), false, ex);
+            detach(ctx, bridge, ex);
+        }
+        return undefined(ctx);
+    }
+    if (mode == HOST_READ) {
+        if (!flag(ctx, bridge, "pending", ex) && !flag(ctx, bridge, "released", ex) && !flag(ctx, bridge, "destroying", ex)) {
+            set_flag(ctx, bridge, "pending", true, ex);
+            follow(ctx, read(ctx, get(ctx, bridge, "reader", ex), ex), job(ctx, JOB_ADAPTER_READ, bridge, undefined(ctx), ex), ex);
+        }
+        return undefined(ctx);
+    }
+    if (mode == HOST_DESTROY && count > 2) {
+        set_flag(ctx, bridge, "destroying", true, ex);
+        put(ctx, bridge, "reason", value, ex);
+        put(ctx, bridge, "done", args[2], ex);
+        var result: ptr<u8> = undefined(ctx);
+        if (!flag(ctx, bridge, "released", ex)) {
+            var cursor: ptr<u8> = record(ctx, get(ctx, bridge, "reader", ex), READER, ex);
+            result = cancel(ctx, get(ctx, cursor, "stream", ex), value, ex);
+        }
+        follow(ctx, result, job(ctx, JOB_ADAPTER_DESTROY, bridge, undefined(ctx), ex), ex);
+    }
+    return undefined(ctx);
+}
+pub fun adapter_job(ctx: ptr<u8>, bridge: ptr<u8>, operation: i64, value: ptr<u8>, failed: bool, ex: ptr<ptr<u8>>) {
+    var host: ptr<u8> = get(ctx, bridge, "host", ex);
+    if (operation == JOB_ADAPTER_DESTROY) {
+        release(ctx, bridge, ex);
+        var reason: ptr<u8> = get(ctx, bridge, "reason", ex);
+        if (failed && (kind(ctx, reason) == 0 || kind(ctx, reason) == 1)) {
+            reason = value;
+        }
+        var call_args: array<ptr<u8>, 1> = [reason];
+        apply(ctx, get(ctx, bridge, "done", ex), undefined(ctx), 1, &call_args[0], ex);
+        put(ctx, bridge, "done", undefined(ctx), ex);
+        return;
+    }
+    set_flag(ctx, bridge, "pending", false, ex);
+    if (flag(ctx, bridge, "destroying", ex)) {
+        return;
+    }
+    var problem: ptr<u8> = null;
+    if (failed) {
+        problem = value;
+    } else if (flag(ctx, value, "done", ex)) {
+        var call_args: array<ptr<u8>, 1> = [js_null(ctx)];
+        stream_invoke(ctx, host, 0, 1, &call_args[0], &problem);
+        release(ctx, bridge, ex);
+    } else {
+        var call_args: array<ptr<u8>, 1> = [get(ctx, value, "value", ex)];
+        stream_invoke(ctx, host, 0, 1, &call_args[0], &problem);
+    }
+    if (problem != null) {
+        var call_args: array<ptr<u8>, 1> = [problem];
+        stream_invoke(ctx, host, 6, 1, &call_args[0], ex);
+    }
+}

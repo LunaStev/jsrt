@@ -1,0 +1,260 @@
+// Stream constructors, callback registration and public host entry points.
+import("./stream_readable")::{stream_push, stream_read, stream_flow, stream_after_add, stream_pipe, stream_drain,
+    stream_pump_read};
+import("./stream_writable")::{stream_write, stream_end, stream_pump_write, stream_done, stream_complete};
+import("./stream_lifecycle")::{stream_destroy, stream_close, stream_get, stream_hook_done};
+import("./stream_transform")::{configure_transform};
+import("./stream_options")::{configure_stream_options};
+import("./collections")::{set_flag, weak_get, integer};
+import("./context_state")::{active_context};
+import("./values")::{get, put, plain, define, define_key, getter, capture, fail};
+import("./web_support")::{apply};
+import("./events")::{event_parent, event_state};
+import("./stream_state")::{initialize_stream_state, new_stream_state, shutdown_stream_state, stream_state_storage,
+    StreamHostState, STREAM_METHOD_COUNT, STREAM_CLASS_COUNT, STREAM_DUPLEX_CLASS, STREAM_CORK_METHOD,
+    STREAM_UNCORK_METHOD, STREAM_CORKED_GETTER, STREAM_INSTANCE_METHOD};
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, left: ptr<u8>, right: ptr<u8>) -> bool;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, value: ptr<u8>, parent: ptr<u8>);
+extern(c, "wr_constructor") fun constructor(ctx: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "jsrt_stream_callback") fun callback(code: i32) -> ptr<u8>;
+extern(c, "jsrt_stream_constructor_callback") fun constructor_callback() -> ptr<u8>;
+extern(c, "wr_construct") fun construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+
+export(c) fun jsrt_stream_construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var category: i64 = 1;
+    if (equal(ctx, ctor, (deref stream_state_roots.stream_constructors)[1])) {
+        category = 2;
+    } else if (equal(ctx, ctor, (deref stream_state_roots.stream_constructors)[2]) ||
+        equal(ctx, ctor, (deref stream_state_roots.stream_constructors)[3]) ||
+        equal(ctx, ctor, (deref stream_state_roots.stream_constructors)[STREAM_DUPLEX_CLASS])) {
+        category = 3;
+    }
+    var result: ptr<u8> = object(ctx, null, null);
+    protect(ctx, result);
+    prototype(ctx, result, get(ctx, ctor, "prototype", ex));
+    var options: ptr<u8> = undefined(ctx);
+    if (count > 0) {
+        options = args[0];
+    }
+    var state: ptr<u8> = new_stream_state(ctx, result, category, options, ex);
+    if (state != null && deref ex == null) {
+        set_flag(ctx, state, "passThrough", equal(ctx, ctor, (deref stream_state_roots.stream_constructors)[2]), ex);
+    }
+    if (state != null && deref ex == null && equal(ctx, ctor, (deref stream_state_roots.stream_constructors)[3])) {
+        configure_transform(ctx, result, state, options, ex);
+    }
+    if (state != null && deref ex == null) {
+        var events: ptr<u8> = event_state(ctx, result, ex);
+        put(ctx, events, "afterAdd", (deref stream_state_roots.stream_methods)[13], ex);
+        configure_stream_options(ctx, result, state, options, ex);
+    }
+    unprotect(ctx, result);
+    return result;
+}
+
+export(c) fun jsrt_stream_push(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_push(ctx, fn, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_stream_read(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_read(ctx, fn, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_stream_flow(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_flow(ctx, fn, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_stream_after_add(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_after_add(ctx, fn, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_stream_write(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_write(ctx, fn, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_stream_end(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_end(ctx, fn, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_stream_destroy(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_destroy(ctx, fn, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_stream_pump_write(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_pump_write(ctx, fn, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_stream_done(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_done(ctx, fn, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_stream_complete(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_complete(ctx, fn, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_stream_pipe(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_pipe(ctx, fn, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_stream_drain(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_drain(ctx, fn, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_stream_pump_read(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_pump_read(ctx, fn, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_stream_close(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_close(ctx, fn, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_stream_get(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_get(ctx, fn, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_stream_hook_done(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stream_hook_done(ctx, fn, receiver, count, args, ex);
+}
+
+pub fun stream_invoke(ctx: ptr<u8>, receiver: ptr<u8>, code: i64, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    return call(ctx, (deref stream_state_roots.stream_methods)[code], receiver, count, args, ex);
+}
+
+pub fun create_stream(ctx: ptr<u8>, category: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    return construct(ctx, (deref stream_state_roots.stream_constructors)[category - 1], 0, null, ex);
+}
+
+export(c) fun jsrt_stream_has_instance(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    if (count > 0 && kind(ctx, args[0]) == 5 && equal(ctx, receiver, (deref roots.stream_constructors)[1])) {
+        var state: ptr<u8> = weak_get(ctx, deref roots.stream_states, args[0], ex);
+        if (kind(ctx, state) == 5 && (integer(ctx, state, "type", ex) & 2) != 0) {
+            return boolean(ctx, true);
+        }
+    }
+    var value: ptr<u8> = undefined(ctx);
+    if (count > 0) {
+        value = args[0];
+    }
+    var parent: ptr<u8> = get(ctx, receiver, "prototype", ex);
+    if (kind(ctx, parent) != 5) {
+        fail(ctx, ex, 1, "constructor prototype must be an object");
+        return undefined(ctx);
+    }
+    var call_args: array<ptr<u8>, 1> = [value];
+    return apply(ctx, deref roots.is_prototype_of, parent, 1, &call_args[0], ex);
+}
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+
+pub fun install_streams(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    if (!initialize_stream_state(ctx, ex)) {
+        return false;
+    }
+    var names: array<str, 34> = ["push", "read", "pause", "resume", "write", "end", "destroy", "pipe",
+        "unpipe", "readJob", "writeJob", "writeDone", "writeComplete", "afterAdd", "drainResume", "closeJob",
+        "readableLength", "writableLength", "destroyed", "readableEnded", "writableFinished", "writableNeedDrain",
+        "readableFlowing", "finalDone", "destroyDone", "transformDone", "flushDone", "setEncoding", "readableEncoding",
+        "cork", "uncork", "writableCorked", "streamAbort", "hasInstance"];
+    for (var i: i64 = 0; i < STREAM_METHOD_COUNT; i++) {
+        var name: ptr<u8> = utf8(names[i]);
+        (deref stream_state_roots.stream_methods)[i] = function(ctx, name, callback(i as i32));
+        release(name);
+        protect(ctx, (deref stream_state_roots.stream_methods)[i]);
+    }
+    (deref stream_state_roots.stream_exports) = plain(ctx);
+    protect(ctx, (deref stream_state_roots.stream_exports));
+    var classes: array<str, 5> = ["Readable", "Writable", "PassThrough", "Transform", "Duplex"];
+    for (var i: i64 = 0; i < STREAM_CLASS_COUNT; i++) {
+        (deref stream_state_roots.stream_constructors)[i] = constructor(ctx, constructor_callback());
+        protect(ctx, (deref stream_state_roots.stream_constructors)[i]);
+        (deref stream_state_roots.stream_prototypes)[i] = get(ctx, (deref stream_state_roots.stream_constructors)[i],
+            "prototype", ex);
+        protect(ctx, (deref stream_state_roots.stream_prototypes)[i]);
+        var parent: ptr<u8> = event_parent(ctx);
+        if (i >= 2) {
+            parent = (deref stream_state_roots.stream_prototypes)[0];
+        }
+        prototype(ctx, (deref stream_state_roots.stream_prototypes)[i], parent);
+        define(ctx, (deref stream_state_roots.stream_prototypes)[i], "constructor", (deref stream_state_roots.stream_constructors)[i],
+            ex, false);
+        for (var j: i64 = 0; j < 9; j++) {
+            var readable: bool = j < 4 || j == 7 || j == 8;
+            if (j == 6 || i >= 2 || (i == 0 && readable) || (i == 1 && !readable)) {
+                define(ctx, (deref stream_state_roots.stream_prototypes)[i], names[j], (deref stream_state_roots.stream_methods)[j],
+                    ex, false);
+            }
+        }
+        for (var j: i64 = 16; j < 23; j++) {
+            if (j == 18 || i >= 2 || (i == 0 && (j == 16 || j == 19 || j == 22)) || (i == 1 && (j == 17 || j == 20 || j == 21))) {
+                getter(ctx, (deref stream_state_roots.stream_prototypes)[i], names[j], (deref stream_state_roots.stream_methods)[j],
+                    ex);
+            }
+        }
+        put(ctx, (deref stream_state_roots.stream_exports), classes[i], (deref stream_state_roots.stream_constructors)[i],
+            ex);
+        if (i != 0) {
+            define(ctx, (deref stream_state_roots.stream_prototypes)[i], "cork",
+                (deref stream_state_roots.stream_methods)[STREAM_CORK_METHOD], ex, false);
+            define(ctx, (deref stream_state_roots.stream_prototypes)[i], "uncork",
+                (deref stream_state_roots.stream_methods)[STREAM_UNCORK_METHOD], ex, false);
+            getter(ctx, (deref stream_state_roots.stream_prototypes)[i], "writableCorked",
+                (deref stream_state_roots.stream_methods)[STREAM_CORKED_GETTER], ex);
+        }
+        if (i != 1) {
+            define(ctx, (deref stream_state_roots.stream_prototypes)[i], "setEncoding",
+                (deref stream_state_roots.stream_methods)[27], ex, false);
+            getter(ctx, (deref stream_state_roots.stream_prototypes)[i], "readableEncoding",
+                (deref stream_state_roots.stream_methods)[28], ex);
+        }
+    }
+    prototype(ctx, (deref stream_state_roots.stream_prototypes)[2], (deref stream_state_roots.stream_prototypes)[3]);
+    prototype(ctx, (deref stream_state_roots.stream_prototypes)[3], (deref stream_state_roots.stream_prototypes)[STREAM_DUPLEX_CLASS]);
+    var symbol: ptr<u8> = get(ctx, get(ctx, global(ctx), "Symbol", ex), "hasInstance", ex);
+    var parent: ptr<u8> = get(ctx, get(ctx, global(ctx), "Object", ex), "prototype", ex);
+    deref stream_state_roots.is_prototype_of = capture(ctx, parent, "isPrototypeOf", ex);
+    define_key(ctx, (deref stream_state_roots.stream_constructors)[1], symbol,
+        (deref stream_state_roots.stream_methods)[STREAM_INSTANCE_METHOD], ex, false);
+    return deref ex == null;
+}
+
+pub fun streams_module() -> ptr<u8> {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(active_context());
+    return (deref stream_state_roots.stream_exports);
+}
+
+pub fun shutdown_streams(ctx: ptr<u8>) {
+    shutdown_stream_state(ctx);
+}

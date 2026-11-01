@@ -1,0 +1,23 @@
+// Wave owns addon policy/lifetime; C++ only adapts Node-API handles and callbacks.
+import("./values")::{fail};
+import("./config")::{ADDON_LIMIT, ADDON_FUNCTION_LIMIT, ADDON_HANDLE_LIMIT, SOURCE_LIMIT};
+extern(c, "jsrt_addon_prepare") fun prepare(ctx: ptr<u8>, modules: i64, functions: i64, handles: i64,
+    strings: i64) -> bool;
+extern(c, "jsrt_addon_load") fun load(ctx: ptr<u8>, path: str, exports: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "jsrt_addon_stop") fun stop(ctx: ptr<u8>);
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+pub fun load_addon(ctx: ptr<u8>, path: str, exports: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (!prepare(ctx, ADDON_LIMIT, ADDON_FUNCTION_LIMIT, ADDON_HANDLE_LIMIT, SOURCE_LIMIT)) {
+        fail(ctx, ex, 0, "cannot initialize native addon environment");
+        return undefined(ctx);
+    }
+    return load(ctx, path, exports, ex);
+}
+
+pub fun shutdown_addons(ctx: ptr<u8>) {
+    stop(ctx);
+}
+
+pub fun install_addons(ctx: ptr<u8>) -> bool {
+    return prepare(ctx, ADDON_LIMIT, ADDON_FUNCTION_LIMIT, ADDON_HANDLE_LIMIT, SOURCE_LIMIT);
+}

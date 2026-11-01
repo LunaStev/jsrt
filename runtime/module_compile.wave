@@ -1,0 +1,58 @@
+// Prepare and compile CommonJS source through JavaScriptCore.
+import("./module_support")::{error};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::ops")::{mem_copy};
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_utf16") fun wr_string_utf16(text: ptr<u16>, count: i64) -> ptr<u8>;
+extern(c, "wr_string_length") fun wr_string_length(text: ptr<u8>) -> i64;
+extern(c, "wr_string_characters") fun wr_string_characters(text: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_compile_function") fun wr_compile_function(ctx: ptr<u8>, name: ptr<u8>, count: u32, parameters: ptr<ptr<u8>>,
+    body: ptr<u8>, url: ptr<u8>, line: i32, ex: ptr<ptr<u8>>) -> ptr<u8>;
+// Preserve line numbers while allowing a leading hashbang in a CommonJS body.
+pub fun body(ctx: ptr<u8>, source: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var units: ptr<u16> = wr_string_characters(source);
+    var length: i64 = wr_string_length(source);
+    for (var i: i64 = 0; i < length; i++) {
+        if (units[i] == 0) {
+            error(ctx, ex, 3, "module source contains a NUL byte", "ERR_INVALID_MODULE_SOURCE");
+            return null;
+        }
+    }
+    var first: i64 = 0;
+    if (length > 0 && units[0] == 65279) {
+        first = 1;
+    }
+    if (first + 1 < length && units[first] == 35 && units[first + 1] == 33) {
+        var copy: ptr<u16> = mem_alloc((length + 1) * 2) as ptr<u16>;
+        if (copy == null) {
+            error(ctx, ex, 2, "cannot allocate module source", "ERR_MODULE_LIMIT");
+            return null;
+        }
+        mem_copy(copy as ptr<u8>, units as ptr<u8>, length * 2);
+        var at: i64 = first;
+        while (at < length && copy[at] != 10 && copy[at] != 13) {
+            deref copy[at] = 32;
+            at += 1;
+        }
+        var result: ptr<u8> = wr_string_utf16(copy, length);
+        mem_free(copy as ptr<u8>, (length + 1) * 2);
+        return result;
+    }
+    return wr_string_utf16(units, length);
+}
+
+pub fun compile_module(ctx: ptr<u8>, source: ptr<u8>, url: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var prepared: ptr<u8> = body(ctx, source, ex);
+    if (prepared == null) {
+        return null;
+    }
+    var parameters: array<ptr<u8>, 5> = [wr_string_utf8("exports"), wr_string_utf8("require"), wr_string_utf8("module"),
+        wr_string_utf8("__filename"), wr_string_utf8("__dirname")];
+    var function: ptr<u8> = wr_compile_function(ctx, null, 5, &parameters[0], prepared, url, 1, ex);
+    for (var i: i64 = 0; i < 5; i++) {
+        wr_string_release(parameters[i]);
+    }
+    wr_string_release(prepared);
+    return function;
+}

@@ -1,0 +1,133 @@
+// Native snapshots for descriptor jobs. perform_handle_job never accesses JSC.
+import("./system")::{FileWork, complete_file, io_failure, decode_file};
+import("./fs_sync")::{file_stats};
+import("./buffer_core")::{buffer_from_bytes};
+import("std::sys::fs")::{open, fstat, ftruncate, fsync, Stat, FS_O_NONBLOCK};
+import("std::io::fd")::{io_close, io_read_at_most, io_write_all, io_read, io_write};
+import("./config")::{FILE_LIMIT, FILE_HANDLE_OPEN_OPERATION, FILE_HANDLE_CLOSE_OPERATION};
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+pub const HANDLE_OPEN: i32 = FILE_HANDLE_OPEN_OPERATION;
+pub const HANDLE_CLOSE: i32 = FILE_HANDLE_CLOSE_OPERATION;
+pub const HANDLE_READ_FILE: i32 = 16;
+pub const HANDLE_WRITE_FILE: i32 = 17;
+pub const HANDLE_STAT: i32 = 18;
+pub const HANDLE_TRUNCATE: i32 = 19;
+pub const HANDLE_SYNC: i32 = 20;
+pub const HANDLE_READ: i32 = 21;
+pub const HANDLE_WRITE: i32 = 22;
+const CLOSE_ON_EXEC: i32 = 524288;
+extern(c, "pread") fun read_at(fd: i32, bytes: ptr<u8>, length: i64, offset: i64) -> i64;
+extern(c, "pwrite") fun write_at(fd: i32, bytes: ptr<u8>, length: i64, offset: i64) -> i64;
+extern(c, "__errno_location") fun errno_location() -> ptr<i32>;
+const REGULAR_MASK: i32 = 61440;
+const REGULAR_KIND: i32 = 32768;
+
+pub fun perform_handle_job(work: ptr<FileWork>) {
+    var mode: i32 = deref work.mode;
+    var result: i64 = 0;
+    if (mode == HANDLE_OPEN) {
+        deref work.operation = "open";
+        var fd: i64 = open(deref work.path as str, deref work.permissions | FS_O_NONBLOCK | CLOSE_ON_EXEC,
+            deref work.offset as i32);
+        if (fd < 0) {
+            result = fd;
+        } else {
+            deref work.fd = fd;
+            result = fstat(fd, &(deref work.info));
+            if (result == 0 && (deref work.info.mode & REGULAR_MASK) != REGULAR_KIND) {
+                deref work.status = 2;
+            }
+            if (result == 0 && deref work.status == 0 && deref work.recursive) {
+                result = ftruncate(fd, 0);
+                deref work.operation = "ftruncate";
+            }
+        }
+    } else if (mode == HANDLE_CLOSE) {
+        deref work.operation = "close";
+        result = io_close(deref work.fd);
+        // Ownership was transferred when the close job was submitted. Never retry
+        // close on a descriptor number that the OS might already have reused.
+        deref work.fd = -1;
+    } else if (mode == HANDLE_READ_FILE) {
+        deref work.operation = "read";
+        deref work.length = io_read_at_most(deref work.fd, deref work.bytes, FILE_LIMIT + 1);
+        if (deref work.length < 0) {
+            result = deref work.length;
+        } else if (deref work.length > FILE_LIMIT) {
+            deref work.status = 3;
+        }
+    } else if (mode == HANDLE_WRITE_FILE) {
+        deref work.operation = "write";
+        result = io_write_all(deref work.fd, deref work.bytes, deref work.length);
+        if (result >= 0 && result != deref work.length) {
+            deref work.status = 4;
+        }
+    } else if (mode == HANDLE_STAT) {
+        deref work.operation = "fstat";
+        result = fstat(deref work.fd, &(deref work.info));
+    } else if (mode == HANDLE_TRUNCATE) {
+        deref work.operation = "ftruncate";
+        result = ftruncate(deref work.fd, deref work.offset);
+    } else if (mode == HANDLE_SYNC) {
+        deref work.operation = "fsync";
+        result = fsync(deref work.fd);
+    } else if (mode == HANDLE_READ || mode == HANDLE_WRITE) {
+        deref work.operation = "read";
+        if (mode == HANDLE_WRITE) {
+            deref work.operation = "write";
+        }
+        if (deref work.offset < 0) {
+            if (mode == HANDLE_READ) {
+                result = io_read(deref work.fd, deref work.bytes, deref work.length);
+            } else {
+                result = io_write(deref work.fd, deref work.bytes, deref work.length);
+            }
+        } else {
+            while (true) {
+                if (mode == HANDLE_READ) {
+                    result = read_at(deref work.fd as i32, deref work.bytes, deref work.length, deref work.offset);
+                } else {
+                    result = write_at(deref work.fd as i32, deref work.bytes, deref work.length, deref work.offset);
+                }
+                if (result >= 0) {
+                    break;
+                }
+                result = -(deref errno_location() as i64);
+                if (result != -4) {
+                    break;
+                }
+            }
+        }
+        deref work.length = result;
+    }
+    if (result < 0) {
+        deref work.status = 1;
+        deref work.errno = result;
+    }
+}
+
+pub fun complete_handle_job(ctx: ptr<u8>, work: ptr<FileWork>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (deref work.status != 0) {
+        return complete_file(ctx, work, ex);
+    }
+    if (deref work.mode == HANDLE_OPEN) {
+        return number(ctx, deref work.fd as f64);
+    }
+    if (deref work.mode == HANDLE_READ_FILE || deref work.mode == HANDLE_READ) {
+        if (deref work.mode == HANDLE_READ) {
+            return buffer_from_bytes(ctx, deref work.bytes, deref work.length, ex);
+        }
+        if (deref work.binary) {
+            return buffer_from_bytes(ctx, deref work.bytes, deref work.length, ex);
+        }
+        return decode_file(ctx, deref work.bytes, deref work.length, ex);
+    }
+    if (deref work.mode == HANDLE_STAT) {
+        return file_stats(ctx, &(deref work.info), ex);
+    }
+    if (deref work.mode == HANDLE_WRITE) {
+        return number(ctx, deref work.length as f64);
+    }
+    return undefined(ctx);
+}

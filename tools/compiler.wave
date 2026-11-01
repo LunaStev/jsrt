@@ -1,0 +1,137 @@
+// Compile and link commands; orchestration stays in build_pipeline.wave.
+import("./support")::{run, concat, join, env, private_directory};
+import("./private_files")::{clean_private_directory};
+import("std::mem::cstr")::{mem_find_cstr_char};
+import("std::path::copy")::{path_dirname_copy};
+
+pub fun compile_wave(compiler: str, standard: str, source: str, output: str) -> i32 {
+    return compile_wave_source(compiler, standard, source, output, false);
+}
+
+pub fun compile_test_runner(compiler: str, standard: str, output: str) -> i32 {
+    return compile_wave_source(compiler, standard, "test.wave", output, true);
+}
+
+// Only live TLS regression tests need Go; it is not linked into the runtime.
+pub fun compile_tls_peer(directory: str, output: str) -> i32 {
+    var scratch: ptr<u8> = private_directory(directory, "tls-compile-");
+    if (scratch == null) {
+        return 1;
+    }
+    var command: array<str, 11> = ["/usr/bin/env",
+        concat("GOCACHE=", join(scratch as str, "go-cache") as str) as str,
+        concat("GOMODCACHE=", join(scratch as str, "go-mod-cache") as str) as str,
+        "GOENV=off", "GOTOOLCHAIN=local", env("JSRT_GO", "go") as str,
+        "build", "-trimpath", "-o", output, "tests/https_peer.go"];
+    var result: i32 = run(&command[0], 11);
+    if (!clean_private_directory(scratch as str)) {
+        return 1;
+    }
+    return result;
+}
+
+fun compile_wave_source(compiler: str, standard: str, source: str, output: str, project_imports: bool) -> i32 {
+    var flag: ptr<u8> = concat("--std-root=", standard);
+    if (flag == null) {
+        return 1;
+    }
+    // Suite modules cannot use parent-directory imports. Map their canonical
+    // jsrt::runtime / jsrt::tools imports to this project only for the test runner.
+    var command: array<str, 11> = [compiler, flag as str, "build", source, "--dep=wjson=vendor/wjson",
+        "--emit=obj", "-C", "relocation-model=pic", "-o", output, "--dep=jsrt=."];
+    var count: i64 = 10;
+    if (project_imports) {
+        count = 11;
+    }
+    return run(&command[0], count);
+}
+
+pub fun compile_c(compiler: str, source: str, output: str, compatibility: bool) -> i32 {
+    var command: array<str, 12> = [compiler, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIE",
+        "-c", source, "-o", output, "-DJSRT_ALLOW_OLDER_ENGINE=1"];
+    var count: i64 = 11;
+    if (compatibility) {
+        count = 12;
+    }
+    return run(&command[0], count);
+}
+
+pub fun compile_cpp(compiler: str, source: str, output: str) -> i32 {
+    var command: array<str, 11> = [compiler, "-std=c++20", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIC",
+        "-c", source, "-o", output];
+    return run(&command[0], 11);
+}
+
+pub fun compile_addon_fixture(compiler: str, source: str, output: str, mode: str) -> i32 {
+    var command: array<str, 13> = [compiler, "-std=c11", "-shared", "-fPIC", "-pthread", "-O2", "-Wall",
+        "-Wextra", "-Werror", mode, source, "-o", output];
+    return run(&command[0], 13);
+}
+
+pub fun link(compiler: str, object: str, args: str, adapter: str, bridge: str, library: str, output: str,
+    directory: str, testing: bool) -> i32 {
+    return link_with_rpath(compiler, object, args, adapter, bridge, library, output, directory, testing, "");
+}
+
+pub fun link_with_rpath(compiler: str, object: str, args: str, adapter: str, bridge: str, library: str, output: str,
+    directory: str, testing: bool, runpath: str) -> i32 {
+    var custom: bool = mem_find_cstr_char(library, 47) >= 0;
+    var selected: str = library;
+    if (!custom) {
+        selected = concat("-l:", library) as str;
+    }
+    var parent: array<u8, 8192>;
+    var command: array<str, 34> = [compiler, "-pie", object, args, adapter, selected, "-Wl,--wrap=main",
+        "-Wl,-z,relro,-z,now", "-Wl,-z,noexecstack", "-pthread", "-o", output, "-Xlinker", "-rpath",
+        "-Xlinker", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""];
+    var count: i64 = 12;
+    if (custom) {
+        if (path_dirname_copy(&parent[0], 8192, library) < 0) {
+            return 1;
+        }
+        command[15] = &parent[0] as str;
+        if (runpath[0] != 0) {
+            command[15] = runpath;
+        }
+        count = 16;
+    }
+    command[count] = bridge;
+    count += 1;
+    command[count] = join(directory, "network-abi.o") as str;
+    count += 1;
+    command[count] = join(directory, "curl-abi.o") as str;
+    count += 1;
+    command[count] = join(directory, "http-abi.o") as str;
+    count += 1;
+    command[count] = join(directory, "http-api.o") as str;
+    count += 1;
+    command[count] = join(directory, "http-core.o") as str;
+    count += 1;
+    command[count] = join(directory, "http-parser.o") as str;
+    count += 1;
+    command[count] = "target/deps/libuv/libuv.a";
+    count += 1;
+    command[count] = "-l:libcurl.so.4";
+    count += 1;
+    command[count] = "-l:libcrypto.so.3";
+    count += 1;
+    command[count] = "-l:libarchive.so.13";
+    count += 1;
+    command[count] = join(directory, "filesystem-abi.o") as str;
+    count += 1;
+    command[count] = join(directory, "node-api.o") as str;
+    count += 1;
+    command[count] = "-lstdc++";
+    count += 1;
+    command[count] = "-ldl";
+    count += 1;
+    command[count] = "-lm";
+    count += 1;
+    command[count] = "-Wl,--export-dynamic-symbol=napi_*";
+    count += 1;
+    if (testing) {
+        command[count] = join(directory, "test-threads.o") as str;
+        count += 1;
+    }
+    return run(&command[0], count);
+}

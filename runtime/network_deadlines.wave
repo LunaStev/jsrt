@@ -1,0 +1,30 @@
+// Pure monotonic deadline arithmetic, shared by server dispatch and loop waiting.
+pub fun earliest(current: i64, candidate: i64) -> i64 {
+    if (candidate >= 0 && (current < 0 || candidate < current)) {
+        return candidate;
+    }
+    return current;
+}
+
+fun after(base: i64, millis: i64) -> i64 {
+    if (base < 0 || millis <= 0) {
+        return -1;
+    }
+    var delta: i64 = millis * 1000000;
+    if (base > 9223372036854775807 - delta) {
+        return 9223372036854775807;
+    }
+    return base + delta;
+}
+
+pub fun connection_deadline(accepted: i64, activity: i64, headers_done: bool, request_done: bool, headers_ms: i64,
+    request_ms: i64, idle_ms: i64) -> i64 {
+    var deadline: i64 = after(activity, idle_ms);
+    if (!headers_done) {
+        deadline = earliest(deadline, after(accepted, headers_ms));
+    }
+    if (!request_done) {
+        deadline = earliest(deadline, after(accepted, request_ms));
+    }
+    return deadline;
+}

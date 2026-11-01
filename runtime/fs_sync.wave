@@ -1,0 +1,411 @@
+// Synchronous filesystem policy stays in Wave and uses Wave std syscalls.
+import("./context_state")::{context_slot, allocate_context_slot, release_context_slot};
+import("./system")::{copy_host_path, io_failure};
+import("./values")::{get, define, capture, plain, fail};
+import("./collections")::{length, at, weak_map, weak_set, weak_get};
+import("std::sys::fs")::{access, stat, unlink, rename_path, mkdir, rmdir, Stat};
+import("std::mem::layout")::{size_of};
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_to_number") fun numeric(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_value") fun string_value(ctx: ptr<u8>, value: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_construct") fun construct(ctx: ptr<u8>, fn: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "jsrt_fs_sync_callback") fun callback() -> ptr<u8>;
+extern(c, "lstat") fun link_stat(path: str, info: ptr<Stat>) -> i32;
+extern(c, "__errno_location") fun errno_location() -> ptr<i32>;
+const SLOT: i64 = 28;
+const EXISTS: i64 = 0;
+const ACCESS: i64 = 1;
+const STAT: i64 = 2;
+const UNLINK: i64 = 3;
+const RENAME: i64 = 4;
+const MKDIR: i64 = 5;
+const RMDIR: i64 = 6;
+const STAT_METHOD_START: i64 = 7;
+const LSTAT: i64 = 14;
+const METHOD_COUNT: i64 = 15;
+const DEFAULT_DIRECTORY_MODE: i64 = 511;
+const FILE_KIND_MASK: i32 = 61440;
+const DIRECTORY_KIND: i32 = 16384;
+struct FsState {
+    methods: array<ptr<u8>, 15>;
+    dates: ptr<u8>;
+    keys: ptr<u8>;
+    modes: ptr<u8>;
+}
+
+pub struct DirectoryOptions {
+    mode: i64;
+    recursive: bool;
+}
+
+fun storage(ctx: ptr<u8>) -> ptr<FsState> {
+    return context_slot(ctx, SLOT) as ptr<FsState>;
+}
+
+fun text(ctx: ptr<u8>, content: str) -> ptr<u8> {
+    var s: ptr<u8> = utf8(content);
+    var result: ptr<u8> = string_value(ctx, s);
+    release(s);
+    return result;
+}
+
+fun mode_number(ctx: ptr<u8>, value: ptr<u8>, max: i64, ex: ptr<ptr<u8>>) -> i64 {
+    if (kind(ctx, value) != 3) {
+        fail(ctx, ex, 1, "filesystem mode must be a number");
+        return 0;
+    }
+    var n: f64 = numeric(ctx, value, ex);
+    if (!(n >= 0.0 && n <= max as f64) || n != (n as i64) as f64) {
+        fail(ctx, ex, 2, "filesystem mode is out of range");
+        return 0;
+    }
+    return n as i64;
+}
+
+pub fun directory_options(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> DirectoryOptions {
+    var options: DirectoryOptions;
+    options.mode = DEFAULT_DIRECTORY_MODE;
+    options.recursive = false;
+    if (kind(ctx, value) == 0) {
+        return options;
+    }
+    if (kind(ctx, value) != 5) {
+        options.mode = mode_number(ctx, value, 4095, ex);
+        return options;
+    }
+
+    var s: ptr<FsState> = storage(ctx);
+    var args: array<ptr<u8>, 1> = [value];
+    var keys: ptr<u8> = call(ctx, deref s.keys, null, 1, &args[0], ex);
+    if (deref ex != null) {
+        return options;
+    }
+    protect(ctx, keys);
+    for (var i: i64 = 0; i < length(ctx, keys, ex) && deref ex == null; i++) {
+        var key: ptr<u8> = at(ctx, keys, i, ex);
+        if (!equal(ctx, key, text(ctx, "recursive")) && !equal(ctx, key, text(ctx, "mode"))) {
+            fail(ctx, ex, 1, "unsupported mkdirSync option");
+        }
+    }
+    unprotect(ctx, keys);
+
+    if (deref ex != null) {
+        return options;
+    }
+
+    var recursive: ptr<u8> = get(ctx, value, "recursive", ex);
+    if (deref ex != null) {
+        return options;
+    }
+    if (kind(ctx, recursive) != 0) {
+        if (kind(ctx, recursive) != 2) {
+            fail(ctx, ex, 1, "recursive must be a boolean");
+        } else {
+            options.recursive = equal(ctx, recursive, boolean(ctx, true));
+        }
+    }
+    if (deref ex != null) {
+        return options;
+    }
+    var mode: ptr<u8> = get(ctx, value, "mode", ex);
+    if (kind(ctx, mode) != 0 && deref ex == null) {
+        options.mode = mode_number(ctx, mode, 4095, ex);
+    }
+    return options;
+}
+
+fun method_index(ctx: ptr<u8>, fn: ptr<u8>) -> i64 {
+    var s: ptr<FsState> = storage(ctx);
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        if (equal(ctx, fn, (deref s.methods)[i])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+fun stat_predicate(ctx: ptr<u8>, receiver: ptr<u8>, method: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (kind(ctx, receiver) != 5) {
+        fail(ctx, ex, 1, "invalid file statistics receiver");
+        return undefined(ctx);
+    }
+    var s: ptr<FsState> = storage(ctx);
+    var value: ptr<u8> = weak_get(ctx, deref s.modes, receiver, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (kind(ctx, value) != 3) {
+        fail(ctx, ex, 1, "invalid file statistics receiver");
+        return undefined(ctx);
+    }
+    var expected: array<i64, 7> = [32768, 16384, 24576, 8192, 40960, 4096, 49152];
+    var actual: i64 = numeric(ctx, value, ex) as i64 & FILE_KIND_MASK as i64;
+    return boolean(ctx, actual == expected[method-STAT_METHOD_START]);
+}
+
+pub fun file_stats(ctx: ptr<u8>, info: ptr<Stat>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<FsState> = storage(ctx);
+    var result: ptr<u8> = object(ctx, null, null);
+    protect(ctx, result);
+    var names: array<str, 10> = ["dev", "ino", "nlink", "mode", "uid", "gid", "rdev", "size", "blksize",
+        "blocks"];
+    var numbers: array<i64, 10> = [deref info.dev, deref info.ino, deref info.nlink, deref info.mode as i64,
+        deref info.uid as i64, deref info.gid as i64, deref info.rdev, deref info.size, deref info.blksize,
+        deref info.blocks];
+    for (var i: i64 = 0; i < 10; i++) {
+        define(ctx, result, names[i], number(ctx, numbers[i] as f64), ex, true);
+    }
+    var dates: array<str, 4> = ["atime", "mtime", "ctime", "birthtime"];
+    var ms_names: array<str, 4> = ["atimeMs", "mtimeMs", "ctimeMs", "birthtimeMs"];
+    // Linux stat does not report birth time. Expose an explicit zero/epoch value.
+    var times: array<f64, 4> = [deref info.atime as f64 * 1000.0 + deref info.atime_nsec as f64 / 1000000.0,
+        deref info.mtime as f64 * 1000.0 + deref info.mtime_nsec as f64 / 1000000.0, deref info.ctime as f64 * 1000.0 + deref info.ctime_nsec as f64 / 1000000.0,
+        0.0];
+    for (var i: i64 = 0; i < 4; i++) {
+        var args: array<ptr<u8>, 1> = [number(ctx, times[i])];
+        define(ctx, result, ms_names[i], args[0], ex, true);
+        if (deref ex == null) {
+            define(ctx, result, dates[i], construct(ctx, deref s.dates, 1, &args[0], ex), ex, true);
+        }
+    }
+    var predicates: array<str, 7> = ["isFile", "isDirectory", "isBlockDevice", "isCharacterDevice", "isSymbolicLink",
+        "isFIFO", "isSocket"];
+    for (var i: i64 = 0; i < 7; i++) {
+        define(ctx, result, predicates[i], (deref s.methods)[7+i], ex, false);
+    }
+    weak_set(ctx, deref s.modes, result, number(ctx, deref info.mode as f64), ex);
+    unprotect(ctx, result);
+    return result;
+}
+
+pub fun directory_entry(ctx: ptr<u8>, name: ptr<u8>, parent: ptr<u8>, mode: i64,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<FsState> = storage(ctx);
+    var result: ptr<u8> = object(ctx, null, null);
+    protect(ctx, result);
+    define(ctx, result, "name", name, ex, true);
+    define(ctx, result, "parentPath", parent, ex, true);
+    var predicates: array<str, 7> = ["isFile", "isDirectory", "isBlockDevice", "isCharacterDevice",
+        "isSymbolicLink", "isFIFO", "isSocket"];
+    for (var i: i64 = 0; i < 7 && deref ex == null; i++) {
+        define(ctx, result, predicates[i], (deref s.methods)[STAT_METHOD_START + i], ex, false);
+    }
+    if (deref ex == null) {
+        weak_set(ctx, deref s.modes, result, number(ctx, mode as f64), ex);
+    }
+    unprotect(ctx, result);
+    return result;
+}
+
+fun create_directory(ctx: ptr<u8>, path: ptr<u8>, size: i64, mode: i32, recursive: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (!recursive) {
+        var status: i64 = mkdir(path as str, mode);
+        if (status < 0) {
+            io_failure(ctx, ex, "mkdir", path as str, status);
+        }
+        return undefined(ctx);
+    }
+    var first: ptr<u8> = undefined(ctx);
+    protect(ctx, first);
+    // Preserve the caller's spelling, including absolute prefixes and repeated '/'.
+    for (var i: i64 = 1; i <= size; i++) {
+        if (i != size && path[i] != 47) {
+            continue;
+        }
+        if (path[i-1] == 47) {
+            continue;
+        }
+        var saved: u8 = path[i];
+        path[i] = 0;
+        var status: i64 = mkdir(path as str, mode);
+        if (status == -17) {
+            var info: Stat;
+            status = stat(path as str, &info);
+            if (status == 0 && (info.mode & FILE_KIND_MASK) != DIRECTORY_KIND) {
+                status = -20;
+            }
+        } else if (status == 0 && kind(ctx, first) == 0) {
+            unprotect(ctx, first);
+            first = text(ctx, path as str);
+            protect(ctx, first);
+        }
+        if (status < 0) {
+            io_failure(ctx, ex, "mkdir", path as str, status);
+            path[i] = saved;
+            break;
+        }
+        path[i] = saved;
+    }
+    // Empty paths must still fail, and '/' must still be checked for access/errors.
+    if (size == 0 || (size > 0 && path[size-1] == 47)) {
+        var info: Stat;
+        var status: i64 = stat(path as str, &info);
+        if (status < 0) {
+            io_failure(ctx, ex, "mkdir", path as str, status);
+        } else if ((info.mode & FILE_KIND_MASK) != DIRECTORY_KIND) {
+            io_failure(ctx, ex, "mkdir", path as str, -20);
+        }
+    }
+    unprotect(ctx, first);
+    return first;
+}
+
+export(c) fun jsrt_fs_sync(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var operation_id: i64 = method_index(ctx, fn);
+    if (operation_id >= STAT_METHOD_START && operation_id < LSTAT) {
+        return stat_predicate(ctx, receiver, operation_id, ex);
+    }
+    if (operation_id < 0 || count == 0) {
+        if (operation_id == EXISTS) {
+            return boolean(ctx, false);
+        }
+        fail(ctx, ex, 1, "filesystem path is required");
+        return undefined(ctx);
+    }
+    var path: array<u8, 16385>;
+    var size: i64 = copy_host_path(ctx, args[0], &path[0], 16385, ex);
+    if (deref ex != null) {
+        if (operation_id == EXISTS) {
+            deref ex = null;
+            return boolean(ctx, false);
+        }
+        return undefined(ctx);
+    }
+    var other: array<u8, 16385>;
+    var mode: i64 = 0;
+    var recursive: bool = false;
+    if (operation_id == RENAME) {
+        if (count < 2) {
+            fail(ctx, ex, 1, "renameSync requires a destination path");
+        } else {
+            copy_host_path(ctx, args[1], &other[0], 16385, ex);
+        }
+    } else if (operation_id == MKDIR) {
+        var value: ptr<u8> = undefined(ctx);
+        if (count > 1) {
+            value = args[1];
+        }
+        var options: DirectoryOptions = directory_options(ctx, value, ex);
+        mode = options.mode;
+        recursive = options.recursive;
+    } else if (operation_id == ACCESS && count > 1 && kind(ctx, args[1]) != 0) {
+        mode = mode_number(ctx, args[1], 7, ex);
+    } else if ((operation_id == STAT || operation_id == LSTAT || operation_id == RMDIR) && count > 1 && kind(ctx,
+        args[1]) != 0) {
+        fail(ctx, ex, 1, "options for statSync and rmdirSync are not supported");
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (operation_id == MKDIR) {
+        return create_directory(ctx, &path[0], size, mode as i32, recursive, ex);
+    }
+    var status: i64 = 0;
+    var operation: str = "access";
+    var info: Stat;
+    if (operation_id == EXISTS || operation_id == ACCESS) {
+        status = access(&path[0] as str, mode as i32);
+    } else if (operation_id == STAT) {
+        operation = "stat";
+        status = stat(&path[0] as str, &info);
+    } else if (operation_id == LSTAT) {
+        operation = "lstat";
+        if (link_stat(&path[0] as str, &info) < 0) {
+            status = -(deref errno_location() as i64);
+        }
+    } else if (operation_id == UNLINK) {
+        operation = "unlink";
+        status = unlink(&path[0] as str);
+    } else if (operation_id == RENAME) {
+        operation = "rename";
+        status = rename_path(&path[0] as str, &other[0] as str);
+    } else if (operation_id == RMDIR) {
+        operation = "rmdir";
+        status = rmdir(&path[0] as str);
+    }
+    if (operation_id == EXISTS) {
+        return boolean(ctx, status == 0);
+    }
+    if (status < 0) {
+        io_failure(ctx, ex, operation, &path[0] as str, status);
+        if (operation_id == RENAME) {
+            var ignored: ptr<u8> = null;
+            define(ctx, deref ex, "dest", text(ctx, &other[0] as str), &ignored, true);
+        }
+        return undefined(ctx);
+    }
+    if (operation_id == STAT || operation_id == LSTAT) {
+        return file_stats(ctx, &info, ex);
+    }
+    return undefined(ctx);
+}
+
+pub fun install_fs_sync(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (!allocate_context_slot(ctx, SLOT, size_of<FsState>() as i64)) {
+        return false;
+    }
+    var s: ptr<FsState> = storage(ctx);
+    deref s.dates = capture(ctx, global(ctx), "Date", ex);
+    deref s.keys = capture(ctx, get(ctx, global(ctx), "Reflect", ex), "ownKeys", ex);
+    deref s.modes = weak_map(ctx, ex);
+    protect(ctx, deref s.modes);
+    var fs: ptr<u8> = get(ctx, global(ctx), "fs", ex);
+    var names: array<str, 15> = ["existsSync", "accessSync", "statSync", "unlinkSync", "renameSync",
+        "mkdirSync", "rmdirSync", "isFile", "isDirectory", "isBlockDevice", "isCharacterDevice", "isSymbolicLink",
+        "isFIFO", "isSocket", "lstatSync"];
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        var name: ptr<u8> = utf8(names[i]);
+        (deref s.methods)[i] = function(ctx, name, callback());
+        release(name);
+        protect(ctx, (deref s.methods)[i]);
+        if (i < STAT_METHOD_START || i == LSTAT) {
+            define(ctx, fs, names[i], (deref s.methods)[i], ex, true);
+        }
+    }
+    var constants: ptr<u8> = plain(ctx);
+    protect(ctx, constants);
+    var keys: array<str, 4> = ["F_OK", "R_OK", "W_OK", "X_OK"];
+    var modes: array<f64, 4> = [0.0, 4.0, 2.0, 1.0];
+    for (var i: i64 = 0; i < 4; i++) {
+        define(ctx, constants, keys[i], number(ctx, modes[i]), ex, true);
+    }
+    define(ctx, fs, "constants", constants, ex, true);
+    unprotect(ctx, constants);
+    return deref ex == null;
+}
+
+pub fun shutdown_fs_sync(ctx: ptr<u8>) {
+    var s: ptr<FsState> = storage(ctx);
+    if (s == null) {
+        return;
+    }
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        if ((deref s.methods)[i] != null) {
+            unprotect(ctx, (deref s.methods)[i]);
+        }
+    }
+    if (deref s.dates != null) {
+        unprotect(ctx, deref s.dates);
+    }
+    if (deref s.keys != null) {
+        unprotect(ctx, deref s.keys);
+    }
+    if (deref s.modes != null) {
+        unprotect(ctx, deref s.modes);
+    }
+    release_context_slot(ctx, SLOT, size_of<FsState>() as i64);
+}

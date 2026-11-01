@@ -1,0 +1,631 @@
+// FileHandle policy and Promise ownership live on the JSC owner thread. Only one
+// native job per handle is submitted at a time; close follows all earlier jobs.
+import("./context_state")::{owned_context_slot, context_slot, release_context_slot};
+import("./config")::{FILE_HANDLE_LIMIT, JOB_LIMIT, FILE_LIMIT};
+import("./system")::{FileWork, free_file, copy_host_path, encode_host_text, file_option_keys};
+import("./fs_handle_jobs")::{HANDLE_OPEN, HANDLE_CLOSE, HANDLE_READ_FILE, HANDLE_WRITE_FILE,
+    HANDLE_STAT, HANDLE_TRUNCATE, HANDLE_SYNC, HANDLE_READ, HANDLE_WRITE};
+import("./async_fs")::{submit_file_work};
+import("./values")::{get, define, getter, plain, text, fail};
+import("./collections")::{weak_map, weak_get, weak_set};
+import("./buffer")::{buffer_integer};
+import("./buffer_core")::{copy_byte_view, byte_view_length, write_byte_view};
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::mem::ops")::{mem_zero};
+import("std::mem::ops")::{mem_copy};
+import("std::io::fd")::{io_close};
+import("std::sys::fs")::{FS_O_RDONLY, FS_O_WRONLY, FS_O_RDWR, FS_O_CREAT, FS_O_EXCL, FS_O_APPEND};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_to_number") fun numeric(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, value: ptr<u8>, parent: ptr<u8>);
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_promise") fun promise(ctx: ptr<u8>, resolve: ptr<ptr<u8>>, reject: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "jsrt_handle_callback") fun callback(code: i32) -> ptr<u8>;
+const SLOT: i64 = 36;
+const METHOD_COUNT: i64 = 10;
+const OPEN_METHOD: i64 = 0;
+const CLOSE_METHOD: i64 = 1;
+const FD_METHOD: i64 = 7;
+const READ_METHOD: i64 = 8;
+const WRITE_METHOD: i64 = 9;
+const PATH_CAP: i64 = 16385;
+
+struct Request {
+    work: ptr<FileWork>;
+    next: ptr<Request>;
+    resolve: ptr<u8>;
+    reject: ptr<u8>;
+    failure: ptr<u8>;
+    operation: i32;
+    ready: bool;
+    target: ptr<u8>;
+    start: i64;
+}
+
+struct Handle {
+    owner: ptr<u8>;
+    fd: i64;
+    head: ptr<Request>;
+    tail: ptr<Request>;
+    close_promise: ptr<u8>;
+    active: bool;
+    closing: bool;
+    reserved: bool;
+}
+
+struct State {
+    handles: array<Handle, 32>;
+    methods: array<ptr<u8>, 10>;
+    completion: ptr<u8>;
+    parent: ptr<u8>;
+    brands: ptr<u8>;
+    pending: i64;
+}
+
+fun storage(ctx: ptr<u8>) -> ptr<State> {
+    return owned_context_slot(ctx, SLOT, size_of<State>() as i64) as ptr<State>;
+}
+
+fun find(ctx: ptr<u8>, owner: ptr<u8>) -> ptr<Handle> {
+    var s: ptr<State> = storage(ctx);
+    for (var i: i64 = 0; i < FILE_HANDLE_LIMIT; i++) {
+        var h: ptr<Handle> = &(deref s.handles)[i];
+        if (deref h.owner == owner) {
+            return h;
+        }
+    }
+    return null;
+}
+
+fun free_request(ctx: ptr<u8>, r: ptr<Request>) {
+    free_file(deref r.work);
+    unprotect(ctx, deref r.resolve);
+    unprotect(ctx, deref r.reject);
+    if (deref r.failure != null) {
+        unprotect(ctx, deref r.failure);
+    }
+    if (deref r.target != null) {
+        unprotect(ctx, deref r.target);
+    }
+    mem_free(r as ptr<u8>, size_of<Request>() as i64);
+    var s: ptr<State> = storage(ctx);
+    deref s.pending -= 1;
+}
+
+fun discard(ctx: ptr<u8>, h: ptr<Handle>) {
+    if (deref h.fd >= 0) {
+        io_close(deref h.fd);
+    }
+    var r: ptr<Request> = deref h.head;
+    while (r != null) {
+        var next: ptr<Request> = deref r.next;
+        free_request(ctx, r);
+        r = next;
+    }
+    if (deref h.close_promise != null) {
+        unprotect(ctx, deref h.close_promise);
+    }
+    if (deref h.owner != null) {
+        unprotect(ctx, deref h.owner);
+    }
+    mem_zero(h as ptr<u8>, size_of<Handle>() as i64);
+    deref h.fd = -1;
+}
+
+fun settle(ctx: ptr<u8>, r: ptr<Request>, failure: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var fn: ptr<u8> = deref r.resolve;
+    if (failure != null) {
+        fn = deref r.reject;
+        value = failure;
+    }
+    var args: array<ptr<u8>, 1> = [value];
+    call(ctx, fn, null, 1, &args[0], ex);
+}
+
+fun dispatch(ctx: ptr<u8>, h: ptr<Handle>, ex: ptr<ptr<u8>>) {
+    var s: ptr<State> = storage(ctx);
+    while (!deref h.active && deref h.head != null && deref ex == null) {
+        var r: ptr<Request> = deref h.head;
+        if (!deref r.ready) {
+            return;
+        }
+        var failure: ptr<u8> = deref r.failure;
+        if (failure == null) {
+            deref r.work.fd = deref h.fd;
+            if (submit_file_work(ctx, deref r.work, deref h.owner, deref s.completion, &failure)) {
+                deref h.active = true;
+                if (deref r.operation == HANDLE_CLOSE) {
+                    deref h.fd = -1;
+                }
+                // The shared queue now owns FileWork, including shutdown cleanup.
+                deref r.work = null;
+                return;
+            }
+        }
+        protect(ctx, failure);
+        settle(ctx, r, failure, undefined(ctx), ex);
+        unprotect(ctx, failure);
+        deref h.head = deref r.next;
+        if (deref h.head == null) {
+            deref h.tail = null;
+        }
+        var terminal: bool = deref r.operation == HANDLE_OPEN;
+        // A rejected close was never submitted, so the handle still owns its fd.
+        if (deref r.work != null && deref r.operation == HANDLE_CLOSE) {
+            deref r.work.fd = -1;
+        }
+        if (deref r.operation == HANDLE_CLOSE) {
+            deref h.closing = false;
+            unprotect(ctx, deref h.close_promise);
+            deref h.close_promise = null;
+        }
+        free_request(ctx, r);
+        if (terminal) {
+            discard(ctx, h);
+            return;
+        }
+    }
+}
+
+fun encoding(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (kind(ctx, value) == 5) {
+        if (!file_option_keys(ctx, value, true, false, ex)) {
+            return true;
+        }
+        value = get(ctx, value, "encoding", ex);
+    }
+    if (deref ex != null || kind(ctx, value) == 0 || kind(ctx, value) == 1) {
+        return true;
+    }
+    if (kind(ctx, value) != 4 || !equal(ctx, value, text(ctx, "utf8"))) {
+        fail(ctx, ex, 1, "FileHandle supports only utf8 encoding");
+    }
+    return false;
+}
+
+fun operation(method: i64) -> i32 {
+    if (method == READ_METHOD) {
+        return HANDLE_READ;
+    }
+    if (method == WRITE_METHOD) {
+        return HANDLE_WRITE;
+    }
+    return HANDLE_OPEN + method as i32;
+}
+
+fun prepare(ctx: ptr<u8>, request: ptr<Request>, method: i64, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<FileWork> {
+    var work: ptr<FileWork> = mem_alloc_zeroed(size_of<FileWork>() as i64) as ptr<FileWork>;
+    if (work == null) {
+        fail(ctx, ex, 2, "cannot allocate FileHandle job");
+        return null;
+    }
+    deref work.fd = -1;
+    deref work.mode = operation(method);
+    deref work.path = mem_alloc(PATH_CAP);
+    if (deref work.path == null) {
+        fail(ctx, ex, 2, "cannot allocate FileHandle path");
+    } else {
+        (deref work.path)[0] = 0;
+    }
+    if (method == OPEN_METHOD && deref ex == null) {
+        if (count < 1) {
+            fail(ctx, ex, 1, "open requires a path");
+        } else {
+            copy_host_path(ctx, args[0], deref work.path, PATH_CAP, ex);
+        }
+        var flags: ptr<u8> = text(ctx, "r");
+        protect(ctx, flags);
+        if (count > 1 && kind(ctx, args[1]) != 0) {
+            unprotect(ctx, flags);
+            flags = args[1];
+            protect(ctx, flags);
+        }
+        var names: array<str, 10> = ["r", "r+", "w", "w+", "a", "a+", "wx", "wx+", "ax", "ax+"];
+        var matched: bool = false;
+        for (var i: i64 = 0; i < 10 && deref ex == null; i++) {
+            if (kind(ctx, flags) == 4 && equal(ctx, flags, text(ctx, names[i]))) {
+                matched = true;
+                var access: i32 = FS_O_WRONLY;
+                if (i == 0) {
+                    access = FS_O_RDONLY;
+                } else if (i == 1 || i == 3 || i == 5 || i == 7 || i == 9) {
+                    access = FS_O_RDWR;
+                }
+                if (i >= 2) {
+                    access = access | FS_O_CREAT;
+                }
+                if (i == 4 || i == 5 || i == 8 || i == 9) {
+                    access = access | FS_O_APPEND;
+                }
+                if (i >= 6) {
+                    access = access | FS_O_EXCL;
+                }
+                deref work.permissions = access;
+                deref work.recursive = i == 2 || i == 3 || i == 6 || i == 7;
+                break;
+            }
+        }
+        unprotect(ctx, flags);
+        if (!matched && deref ex == null) {
+            fail(ctx, ex, 1, "unsupported FileHandle open flags");
+        }
+        deref work.offset = 420;
+        if (count > 2 && kind(ctx, args[2]) != 0 && deref ex == null) {
+            deref work.offset = buffer_integer(ctx, args[2], 0, 4095, ex);
+        }
+        if (count > 3) {
+            fail(ctx, ex, 1, "open accepts path flags and mode");
+        }
+    } else if ((method == READ_METHOD || method == WRITE_METHOD) && deref ex == null) {
+        if (count == 0) {
+            fail(ctx, ex, 1, "FileHandle read/write requires a buffer or write string");
+        } else {
+            deref request.target = args[0];
+            protect(ctx, deref request.target);
+            deref work.offset = -1;
+            deref work.bytes = mem_alloc(FILE_LIMIT + 1);
+            if (deref work.bytes == null) {
+                fail(ctx, ex, 2, "cannot allocate FileHandle I/O bytes");
+            } else if (method == WRITE_METHOD && kind(ctx, args[0]) == 4) {
+                if (count > 1 && kind(ctx, args[1]) != 0 && kind(ctx, args[1]) != 1) {
+                    deref work.offset = buffer_integer(ctx, args[1], 0, 9007199254740991, ex);
+                }
+                if (count > 2) {
+                    encoding(ctx, args[2], ex);
+                }
+                if (count > 3) {
+                    fail(ctx, ex, 1, "write string accepts position and encoding");
+                }
+                if (deref ex == null) {
+                    deref work.length = encode_host_text(ctx, args[0], deref work.bytes, FILE_LIMIT + 1, ex);
+                }
+            } else {
+                var n: i64 = byte_view_length(ctx, args[0], ex);
+                var start: i64 = 0;
+                if (count > 1 && kind(ctx, args[1]) != 0 && deref ex == null) {
+                    start = buffer_integer(ctx, args[1], 0, n, ex);
+                }
+                var size: i64 = n - start;
+                if (count > 2 && kind(ctx, args[2]) != 0 && deref ex == null) {
+                    size = buffer_integer(ctx, args[2], 0, n - start, ex);
+                }
+                if (count > 3 && kind(ctx, args[3]) != 0 && kind(ctx, args[3]) != 1 && deref ex == null) {
+                    deref work.offset = buffer_integer(ctx, args[3], 0, 9007199254740991, ex);
+                }
+                if (size > FILE_LIMIT || count > 4) {
+                    fail(ctx, ex, 2, "FileHandle I/O range exceeds supported limits");
+                }
+                deref request.start = start;
+                deref work.length = size;
+                if (method == WRITE_METHOD && deref ex == null) {
+                    var copied: i64 = copy_byte_view(ctx, args[0], deref work.bytes, FILE_LIMIT, ex);
+                    if (copied >= 0 && deref ex == null && start > 0) {
+                        // mem_copy uses nonoverlapping storage; stage the selected
+                        // range separately before replacing the snapshot prefix.
+                        var slice: ptr<u8> = mem_alloc(size + 1);
+                        if (slice == null) {
+                            fail(ctx, ex, 2, "cannot allocate FileHandle write slice");
+                        } else {
+                            mem_copy(slice, deref work.bytes + start, size);
+                            mem_copy(deref work.bytes, slice, size);
+                            mem_free(slice, size + 1);
+                        }
+                    }
+                }
+            }
+        }
+    } else if ((deref work.mode == HANDLE_READ_FILE || deref work.mode == HANDLE_WRITE_FILE) && deref ex == null) {
+        var option: ptr<u8> = undefined(ctx);
+        var option_index: i64 = 0;
+        if (deref work.mode == HANDLE_WRITE_FILE) {
+            option_index = 1;
+            if (count == 0) {
+                fail(ctx, ex, 1, "writeFile requires data");
+            }
+        }
+        if (count > option_index) {
+            option = args[option_index];
+        }
+        deref work.binary = encoding(ctx, option, ex);
+        if (count > option_index + 1) {
+            fail(ctx, ex, 1, "unexpected FileHandle file arguments");
+        }
+        if (deref ex == null) {
+            deref work.bytes = mem_alloc(FILE_LIMIT + 1);
+            if (deref work.bytes == null) {
+                fail(ctx, ex, 2, "cannot allocate FileHandle bytes");
+            } else if (deref work.mode == HANDLE_WRITE_FILE) {
+                if (kind(ctx, args[0]) == 4) {
+                    deref work.length = encode_host_text(ctx, args[0], deref work.bytes, FILE_LIMIT + 1, ex);
+                } else {
+                    deref work.length = copy_byte_view(ctx, args[0], deref work.bytes, FILE_LIMIT, ex);
+                }
+            }
+        }
+    } else if (deref work.mode == HANDLE_TRUNCATE && deref ex == null) {
+        if (count > 0 && kind(ctx, args[0]) != 0) {
+            deref work.offset = buffer_integer(ctx, args[0], 0, 9007199254740991, ex);
+        }
+        if (count > 1) {
+            fail(ctx, ex, 1, "truncate accepts a length");
+        }
+    } else if (count > 0 && deref ex == null) {
+        fail(ctx, ex, 1, "options for this FileHandle method are not implemented");
+    }
+    if (deref ex != null) {
+        free_file(work);
+        return null;
+    }
+    return work;
+}
+
+export(c) fun jsrt_handle_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<State> = storage(ctx);
+    var method: i64 = -1;
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        if (equal(ctx, fn, (deref s.methods)[i])) {
+            method = i;
+            break;
+        }
+    }
+    var h: ptr<Handle> = null;
+    var failure: ptr<u8> = null;
+    if (method != OPEN_METHOD) {
+        if (kind(ctx, receiver) != 5 || kind(ctx, weak_get(ctx, deref s.brands, receiver, &failure)) == 0) {
+            fail(ctx, &failure, 1, "invalid FileHandle receiver");
+        } else {
+            h = find(ctx, receiver);
+        }
+    }
+    if (method == FD_METHOD) {
+        if (failure != null) {
+            deref ex = failure;
+            return undefined(ctx);
+        }
+        if (h == null) {
+            return number(ctx, -1.0);
+        }
+        return number(ctx, deref h.fd as f64);
+    }
+    if (failure == null && method == CLOSE_METHOD && h != null && deref h.close_promise != null) {
+        return deref h.close_promise;
+    }
+    var resolve: ptr<u8> = null;
+    var reject: ptr<u8> = null;
+    var result: ptr<u8> = promise(ctx, &resolve, &reject, ex);
+    if (deref ex != null || result == null) {
+        return undefined(ctx);
+    }
+    protect(ctx, result);
+    protect(ctx, resolve);
+    protect(ctx, reject);
+    if (failure == null && method == OPEN_METHOD) {
+        for (var i: i64 = 0; i < FILE_HANDLE_LIMIT; i++) {
+            var candidate: ptr<Handle> = &(deref s.handles)[i];
+            if (!deref candidate.reserved) {
+                h = candidate;
+                deref h.reserved = true;
+                deref h.fd = -1;
+                break;
+            }
+        }
+        if (h == null) {
+            fail(ctx, &failure, 2, "FileHandle resource limit exceeded");
+        } else {
+            deref h.owner = object(ctx, null, null);
+            protect(ctx, deref h.owner);
+            prototype(ctx, deref h.owner, deref s.parent);
+            weak_set(ctx, deref s.brands, deref h.owner, number(ctx, 1.0), &failure);
+        }
+    } else if (failure == null && (h == null || deref h.closing) && method != CLOSE_METHOD) {
+        fail(ctx, &failure, 0, "FileHandle is closed or closing");
+    }
+    if (failure == null && method == CLOSE_METHOD && h == null) {
+        var value: array<ptr<u8>, 1> = [undefined(ctx)];
+        call(ctx, resolve, null, 1, &value[0], ex);
+        unprotect(ctx, resolve);
+        unprotect(ctx, reject);
+        unprotect(ctx, result);
+        return result;
+    }
+    var request: ptr<Request> = null;
+    if (failure == null && deref s.pending >= JOB_LIMIT) {
+        fail(ctx, &failure, 2, "pending FileHandle job limit exceeded");
+    }
+    if (failure == null) {
+        request = mem_alloc_zeroed(size_of<Request>() as i64) as ptr<Request>;
+        if (request == null) {
+            fail(ctx, &failure, 2, "cannot allocate FileHandle request");
+        }
+    }
+    if (failure != null) {
+        protect(ctx, failure);
+        var value: array<ptr<u8>, 1> = [failure];
+        call(ctx, reject, null, 1, &value[0], ex);
+        unprotect(ctx, failure);
+        unprotect(ctx, resolve);
+        unprotect(ctx, reject);
+        if (method == OPEN_METHOD && h != null) {
+            discard(ctx, h);
+        }
+    } else {
+        deref s.pending += 1;
+        deref request.resolve = resolve;
+        deref request.reject = reject;
+        deref request.operation = operation(method);
+        if (deref h.tail == null) {
+            deref h.head = request;
+        } else {
+            deref h.tail.next = request;
+        }
+        deref h.tail = request;
+        if (method == CLOSE_METHOD) {
+            deref h.closing = true;
+            deref h.close_promise = result;
+            protect(ctx, result);
+        }
+        // The queue reservation precedes every user option getter. Reentrant
+        // operations append after this placeholder and cannot overtake it.
+        deref request.work = prepare(ctx, request, method, count, args, &failure);
+        deref request.failure = failure;
+        if (failure != null) {
+            protect(ctx, failure);
+        }
+        deref request.ready = true;
+        dispatch(ctx, h, ex);
+    }
+    unprotect(ctx, result);
+    return result;
+}
+
+export(c) fun jsrt_handle_complete(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var h: ptr<Handle> = find(ctx, receiver);
+    if (h == null || deref h.head == null || count != 2) {
+        fail(ctx, ex, 0, "invalid FileHandle completion");
+        return undefined(ctx);
+    }
+    var r: ptr<Request> = deref h.head;
+    var failure: ptr<u8> = null;
+    if (kind(ctx, args[0]) != 0) {
+        failure = args[0];
+    }
+    var value: ptr<u8> = args[1];
+    if ((deref r.operation == HANDLE_READ || deref r.operation == HANDLE_WRITE) && failure == null) {
+        var size: ptr<u8> = value;
+        protect(ctx, value);
+        if (deref r.operation == HANDLE_READ) {
+            var n: i64 = byte_view_length(ctx, value, &failure);
+            var bytes: ptr<u8> = null;
+            if (failure == null) {
+                bytes = mem_alloc(n + 1);
+                if (bytes == null) {
+                    fail(ctx, &failure, 2, "cannot copy FileHandle read result");
+                } else {
+                    copy_byte_view(ctx, value, bytes, n, &failure);
+                    if (failure == null) {
+                        write_byte_view(ctx, deref r.target, deref r.start, bytes, n, &failure);
+                    }
+                    mem_free(bytes, n + 1);
+                }
+            }
+            size = number(ctx, n as f64);
+        }
+        protect(ctx, size);
+        var result: ptr<u8> = plain(ctx);
+        protect(ctx, result);
+        var key: str = "bytesWritten";
+        if (deref r.operation == HANDLE_READ) {
+            key = "bytesRead";
+        }
+        define(ctx, result, key, size, &failure, true);
+        define(ctx, result, "buffer", deref r.target, &failure, true);
+        unprotect(ctx, size);
+        unprotect(ctx, value);
+        value = result;
+        // Hold the newly created result through Promise settlement below.
+        if (failure != null) {
+            protect(ctx, failure);
+        }
+    }
+    if (deref r.operation == HANDLE_OPEN && failure == null) {
+        deref h.fd = numeric(ctx, value, ex) as i64;
+        value = receiver;
+    }
+    deref h.active = false;
+    deref h.head = deref r.next;
+    if (deref h.head == null) {
+        deref h.tail = null;
+    }
+    var terminal: bool = deref r.operation == HANDLE_CLOSE || (deref r.operation == HANDLE_OPEN && failure != null);
+    settle(ctx, r, failure, value, ex);
+    if (deref r.operation == HANDLE_READ || deref r.operation == HANDLE_WRITE) {
+        // Only a successful native completion entered the conversion above.
+        if (kind(ctx, args[0]) == 0) {
+            unprotect(ctx, value);
+            if (failure != null) {
+                unprotect(ctx, failure);
+            }
+        }
+    }
+    free_request(ctx, r);
+    if (terminal) {
+        discard(ctx, h);
+    } else {
+        dispatch(ctx, h, ex);
+    }
+    return undefined(ctx);
+}
+
+pub fun install_file_handles(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var s: ptr<State> = storage(ctx);
+    deref s.parent = object(ctx, null, null);
+    protect(ctx, deref s.parent);
+    deref s.brands = weak_map(ctx, ex);
+    protect(ctx, deref s.brands);
+    var key: ptr<u8> = utf8("fileHandleComplete");
+    deref s.completion = function(ctx, key, callback(1));
+    release(key);
+    protect(ctx, deref s.completion);
+    var names: array<str, 10> = ["open", "close", "readFile", "writeFile", "stat", "truncate", "sync", "fd", "read", "write"];
+    var fs: ptr<u8> = get(ctx, global(ctx), "fs", ex);
+    var promises: ptr<u8> = get(ctx, fs, "promises", ex);
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        var name: ptr<u8> = utf8(names[i]);
+        (deref s.methods)[i] = function(ctx, name, callback(0));
+        release(name);
+        protect(ctx, (deref s.methods)[i]);
+        if (i == OPEN_METHOD) {
+            define(ctx, promises, names[i], (deref s.methods)[i], ex, false);
+        } else if (i == FD_METHOD) {
+            getter(ctx, deref s.parent, names[i], (deref s.methods)[i], ex);
+        } else {
+            define(ctx, deref s.parent, names[i], (deref s.methods)[i], ex, false);
+        }
+    }
+    return deref ex == null;
+}
+
+// Called only after shutdown_async_fs has joined workers and released queue jobs.
+pub fun shutdown_file_handles(ctx: ptr<u8>) {
+    var s: ptr<State> = context_slot(ctx, SLOT) as ptr<State>;
+    if (s == null) {
+        return;
+    }
+    for (var i: i64 = 0; i < FILE_HANDLE_LIMIT; i++) {
+        var h: ptr<Handle> = &(deref s.handles)[i];
+        if (deref h.reserved) {
+            discard(ctx, h);
+        }
+    }
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        if ((deref s.methods)[i] != null) {
+            unprotect(ctx, (deref s.methods)[i]);
+        }
+    }
+    if (deref s.parent != null) {
+        unprotect(ctx, deref s.parent);
+    }
+    if (deref s.brands != null) {
+        unprotect(ctx, deref s.brands);
+    }
+    if (deref s.completion != null) {
+        unprotect(ctx, deref s.completion);
+    }
+    release_context_slot(ctx, SLOT, size_of<State>() as i64);
+}

@@ -1,0 +1,224 @@
+// Tooling uses Wave's existing filesystem, process, environment and time APIs.
+import("std::env::environ")::{env_get, env_exists};
+import("std::env::cwd")::{env_getcwd};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::cstr")::{mem_len_cstr, mem_find_cstr_char};
+import("std::mem::ops")::{mem_copy};
+import("std::path::copy")::{path_join2};
+import("std::path::core")::{path_is_abs};
+import("std::fs::file")::{Metadata, metadata, remove};
+import("std::sys::fs")::{access, mkdir, rmdir};
+import("std::random::fill")::{RandomFillResult, random_fill};
+import("std::process::spawn")::{proc_spawn_exec_raw};
+import("std::process::wait")::{proc_wait, proc_wait_nohang, proc_status_exited, proc_status_exit_code,
+    proc_status_term_signal};
+import("std::process::core")::{proc_kill};
+import("std::time::clock")::{time_now_monotonic_ns};
+import("std::time::sleep")::{time_sleep_ms};
+
+extern(c, "jsrt_argc") fun jsrt_argc() -> i32;
+extern(c, "jsrt_argv") fun jsrt_argv(index: i32) -> str;
+extern(c, "jsrt_environment") fun jsrt_environment() -> ptr<ptr<i8>>;
+
+pub fun argc() -> i32 {
+    return jsrt_argc();
+}
+
+pub fun arg(index: i32) -> str {
+    return jsrt_argv(index);
+}
+
+// Returned strings have process lifetime in these short-lived tooling programs.
+pub fun env(name: str, fallback: str) -> ptr<u8> {
+    var buffer: ptr<u8> = mem_alloc(8192);
+    if (buffer == null) {
+        return null;
+    }
+    var count: i64 = env_get(name, buffer, 8192);
+    if (count >= 0) {
+        return buffer;
+    }
+    mem_free(buffer, 8192);
+    if (env_exists(name)) {
+        return null;
+    }
+    return fallback as ptr<u8>;
+}
+
+pub fun concat(left: str, right: str) -> ptr<u8> {
+    var a: i64 = mem_len_cstr(left);
+    var b: i64 = mem_len_cstr(right);
+    if (a + b >= 8192) {
+        return null;
+    }
+    var output: ptr<u8> = mem_alloc(a + b + 1);
+    if (output == null) {
+        return null;
+    }
+    mem_copy(output, left as ptr<u8>, a);
+    mem_copy(output + a, right as ptr<u8>, b + 1);
+    return output;
+}
+
+pub fun join(left: str, right: str) -> ptr<u8> {
+    var output: ptr<u8> = mem_alloc(8192);
+    if (output == null) {
+        return null;
+    }
+    if (path_join2(output, 8192, left, right) < 0) {
+        mem_free(output, 8192);
+        return null;
+    }
+    return output;
+}
+
+pub fun absolute(path: str) -> ptr<u8> {
+    if (path_is_abs(path)) {
+        return path as ptr<u8>;
+    }
+    var cwd: array<u8, 8192>;
+    if (env_getcwd(&cwd[0], 8192) < 0) {
+        return null;
+    }
+    return join(&cwd[0] as str, path);
+}
+
+pub fun ensure_directory(path: str) -> bool {
+    var info: Metadata;
+    if (metadata(path, &info) == 0) {
+        return info.is_directory;
+    }
+    return mkdir(path, 493) == 0;
+}
+
+pub fun private_directory(parent: str, prefix: str) -> ptr<u8> {
+    var random: array<u8, 16>;
+    var token: array<u8, 33>;
+    var alphabet: str = "0123456789abcdef";
+    for (var attempt: i32 = 0; attempt < 20; attempt++) {
+        var result: RandomFillResult = random_fill(&random[0], 16);
+        if (!result.ok) {
+            return null;
+        }
+        for (var i: i64 = 0; i < 16; i++) {
+            token[i * 2] = alphabet[(random[i] / 16) as i64];
+            token[i * 2 + 1] = alphabet[(random[i] % 16) as i64];
+        }
+        token[32] = 0;
+        var child: ptr<u8> = concat(prefix, &token[0] as str);
+        if (child == null) {
+            return null;
+        }
+        var path: ptr<u8> = join(parent, child as str);
+        if (path == null) {
+            return null;
+        }
+        if (mkdir(path as str, 448) == 0) {
+            return path;
+        }
+    }
+    return null;
+}
+
+pub fun cleanup(directory: str) -> bool {
+    // Delete only known tool-owned artifacts; never recurse over arbitrary paths.
+    var names: array<str, 29> = ["runtime.o", "bridge.o", "args.o", "tests.o", "jsrt", "tests", "source.js",
+        "stdout", "stderr", "probe.js", "engine.o", "http-api.o", "http-core.o", "http-parser.o", "http-abi.o",
+        "network-abi.o", "curl-abi.o", "filesystem-abi.o", "test-threads.o", "node-api.o", "addon.node",
+        "addon-version.node", "addon-init.node", "addon-symbol.node", "addon-api.node", "trace.so", "deploy.o", "jsrt-deploy", "deploy-abi.o"];
+    for (var i: i64 = 0; i < 29; i++) {
+        remove(join(directory, names[i]) as str);
+    }
+    return rmdir(directory) == 0;
+}
+
+pub fun executable(name: str) -> ptr<u8> {
+    if ((name as ptr<u8>) == null) {
+        return null;
+    }
+    if (mem_find_cstr_char(name, 47) >= 0) {
+        if (access(name, 1) == 0) {
+            return name as ptr<u8>;
+        }
+        return null;
+    }
+    var search_buffer: ptr<u8> = env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    if (search_buffer == null) {
+        return null;
+    }
+    var search: str = search_buffer as str;
+    var length: i64 = mem_len_cstr(search);
+    var start: i64 = 0;
+    for (var end: i64 = 0; end <= length; end++) {
+        if (end == length || search[end] == 58) {
+            var segment: array<u8, 8192>;
+            var size: i64 = end - start;
+            mem_copy(&segment[0], (search as ptr<u8>) + start, size);
+            segment[size] = 0;
+            var directory: str = &segment[0] as str;
+            if (size == 0) {
+                directory = ".";
+            }
+            var candidate: ptr<u8> = join(directory, name);
+            if (candidate != null && access(candidate as str, 1) == 0) {
+                return candidate;
+            }
+            start = end + 1;
+        }
+    }
+    return null;
+}
+
+pub fun spawn(arguments: ptr<str>, count: i64, output: i64, error_output: i64) -> i64 {
+    if (count < 1 || count > 63) {
+        return -1;
+    }
+    var path: ptr<u8> = executable(arguments[0]);
+    if (path == null) {
+        return -1;
+    }
+    var argv: array<ptr<i8>, 64>;
+    for (var i: i64 = 0; i < count; i++) {
+        argv[i] = arguments[i] as ptr<i8>;
+    }
+    argv[count] = null;
+    return proc_spawn_exec_raw(path as str, &argv[0], jsrt_environment(), -1, output, error_output);
+}
+
+pub fun wait(pid: i64, timeout_ms: i64) -> i32 {
+    if (pid < 0) {
+        return 127;
+    }
+    var status: i32 = 0;
+    if (timeout_ms <= 0) {
+        if (proc_wait(pid, &status) < 0) {
+            return 125;
+        }
+    } else {
+        var start: i64 = time_now_monotonic_ns();
+        while (true) {
+            var result: i64 = proc_wait_nohang(pid, &status);
+            if (result == pid) {
+                break;
+            }
+            if (result < 0) {
+                return 125;
+            }
+            var now: i64 = time_now_monotonic_ns();
+            if (start < 0 || now < 0 || (now - start) / 1000000 >= timeout_ms) {
+                proc_kill(pid, 9);
+                proc_wait(pid, &status);
+                return 124;
+            }
+            time_sleep_ms(2);
+        }
+    }
+    if (proc_status_exited(status)) {
+        return proc_status_exit_code(status);
+    }
+    return 128 + proc_status_term_signal(status);
+}
+
+pub fun run(arguments: ptr<str>, count: i64) -> i32 {
+    return wait(spawn(arguments, count, -1, -1), 0);
+}

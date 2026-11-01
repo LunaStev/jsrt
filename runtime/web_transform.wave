@@ -1,0 +1,207 @@
+// TransformStream coordinates two default streams through private backpressure.
+import("./web_stream_core")::{storage, WebStreamState, record, handle, capability, settle, resolved, job, follow,
+    field_number, error_readable, TRANSFORM, TRANSFORM_CONTROLLER, READABLE, WRITABLE, OPEN, JOB_TRANSFORM, JOB_FLUSH};
+import("./web_readable")::{create_readable, enqueue_readable, request_close};
+import("./web_writable")::{create_writable, error_writable};
+import("./values")::{get, put, plain, fail};
+import("./collections")::{integer, set_integer, flag, set_flag, length, bind_one};
+import("./web_support")::{apply};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+pub const TRANSFORM_WRITE: i64 = 43;
+pub const TRANSFORM_CLOSE: i64 = 44;
+pub const TRANSFORM_PULL: i64 = 45;
+pub const TRANSFORM_CANCEL: i64 = 46;
+pub const TRANSFORM_ABORT: i64 = 47;
+pub const TRANSFORM_START: i64 = 48;
+pub fun fail_transform(ctx: ptr<u8>, r: ptr<u8>, reason: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (!flag(ctx, r, "failed", ex)) {
+        set_flag(ctx, r, "failed", true, ex);
+        put(ctx, r, "error", reason, ex);
+    }
+    var readable: ptr<u8> = get(ctx, r, "readState", ex);
+    if (kind(ctx, readable) == 5) {
+        error_readable(ctx, readable, reason, ex);
+    }
+    var writable: ptr<u8> = get(ctx, r, "writeState", ex);
+    if (kind(ctx, writable) == 5) {
+        error_writable(ctx, writable, reason, ex);
+    }
+    settle(ctx, get(ctx, r, "pending", ex), reason, true, ex);
+    settle(ctx, get(ctx, r, "pullWait", ex), undefined(ctx), false, ex);
+    put(ctx, r, "pending", undefined(ctx), ex);
+    put(ctx, r, "pullWait", undefined(ctx), ex);
+}
+pub fun enqueue_transform(ctx: ptr<u8>, r: ptr<u8>, chunk: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var readable: ptr<u8> = get(ctx, r, "readState", ex);
+    enqueue_readable(ctx, readable, chunk, ex);
+    if (deref ex != null) {
+        var problem: ptr<u8> = deref ex;
+        var ignored: ptr<u8> = null;
+        fail_transform(ctx, r, problem, &ignored);
+        return;
+    }
+    var pressure: bool = field_number(ctx, readable, "high", ex) <= field_number(ctx, readable, "total", ex) &&
+        length(ctx, get(ctx, readable, "requests", ex), ex) == 0;
+    set_flag(ctx, r, "backpressure", pressure, ex);
+    if (pressure) {
+        settle(ctx, get(ctx, r, "pullWait", ex), undefined(ctx), false, ex);
+        put(ctx, r, "pullWait", undefined(ctx), ex);
+    }
+}
+fun process_pending(ctx: ptr<u8>, r: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var entry: ptr<u8> = get(ctx, r, "pending", ex);
+    if (kind(ctx, entry) != 5 || flag(ctx, r, "backpressure", ex) || flag(ctx, r, "failed", ex)) {
+        return;
+    }
+    protect(ctx, entry);
+    put(ctx, r, "pending", undefined(ctx), ex);
+    var problem: ptr<u8> = null;
+    var result: ptr<u8> = undefined(ctx);
+    var fn: ptr<u8> = get(ctx, r, "transform", ex);
+    if (kind(ctx, fn) != 0) {
+        var call_args: array<ptr<u8>, 2> = [get(ctx, entry, "chunk", ex), get(ctx, r, "controller", ex)];
+        result = apply(ctx, fn, get(ctx, r, "transformer", ex), 2, &call_args[0], &problem);
+    } else {
+        enqueue_transform(ctx, r, get(ctx, entry, "chunk", ex), &problem);
+    }
+    if (problem != null) {
+        fail_transform(ctx, r, problem, ex);
+        settle(ctx, entry, problem, true, ex);
+    } else {
+        follow(ctx, result, job(ctx, JOB_TRANSFORM, r, entry, ex), ex);
+    }
+    unprotect(ctx, entry);
+}
+pub fun transform_hook(ctx: ptr<u8>, mode: i64, r: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (mode == TRANSFORM_START) {
+        var fn: ptr<u8> = get(ctx, r, "start", ex);
+        if (kind(ctx, fn) != 0) {
+            var call_args: array<ptr<u8>, 1> = [get(ctx, r, "controller", ex)];
+            return apply(ctx, fn, get(ctx, r, "transformer", ex), 1, &call_args[0], ex);
+        }
+        return undefined(ctx);
+    }
+    if (mode == TRANSFORM_CANCEL || mode == TRANSFORM_ABORT) {
+        fail_transform(ctx, r, value, ex);
+        return undefined(ctx);
+    }
+    if (mode == TRANSFORM_PULL) {
+        set_flag(ctx, r, "backpressure", false, ex);
+        var deferred: ptr<u8> = capability(ctx, ex);
+        protect(ctx, deferred);
+        put(ctx, r, "pullWait", deferred, ex);
+        process_pending(ctx, r, ex);
+        var result: ptr<u8> = get(ctx, deferred, "promise", ex);
+        unprotect(ctx, deferred);
+        return result;
+    }
+    if (flag(ctx, r, "failed", ex)) {
+        return resolved(ctx, get(ctx, r, "error", ex), true, ex);
+    }
+    var entry: ptr<u8> = capability(ctx, ex);
+    protect(ctx, entry);
+    if (mode == TRANSFORM_WRITE) {
+        put(ctx, entry, "chunk", value, ex);
+        put(ctx, r, "pending", entry, ex);
+        process_pending(ctx, r, ex);
+    } else if (mode == TRANSFORM_CLOSE) {
+        var fn: ptr<u8> = get(ctx, r, "flush", ex);
+        var problem: ptr<u8> = null;
+        var result: ptr<u8> = undefined(ctx);
+        if (kind(ctx, fn) != 0) {
+            var call_args: array<ptr<u8>, 1> = [get(ctx, r, "controller", ex)];
+            result = apply(ctx, fn, get(ctx, r, "transformer", ex), 1, &call_args[0], &problem);
+        }
+        if (problem != null) {
+            fail_transform(ctx, r, problem, ex);
+            settle(ctx, entry, problem, true, ex);
+        } else {
+            follow(ctx, result, job(ctx, JOB_FLUSH, r, entry, ex), ex);
+        }
+    }
+    var result: ptr<u8> = get(ctx, entry, "promise", ex);
+    unprotect(ctx, entry);
+    return result;
+}
+pub fun transform_job(ctx: ptr<u8>, r: ptr<u8>, operation: i64, entry: ptr<u8>, value: ptr<u8>, failed: bool, ex: ptr<ptr<u8>>) {
+    if (failed) {
+        fail_transform(ctx, r, value, ex);
+    }
+    if (flag(ctx, r, "failed", ex)) {
+        settle(ctx, entry, get(ctx, r, "error", ex), true, ex);
+        return;
+    }
+    if (operation == JOB_FLUSH) {
+        var readable: ptr<u8> = get(ctx, r, "readState", ex);
+        if (integer(ctx, readable, "state", ex) == OPEN && !flag(ctx, readable, "closeRequested", ex)) {
+            request_close(ctx, readable, ex);
+        }
+        settle(ctx, get(ctx, r, "pullWait", ex), undefined(ctx), false, ex);
+        put(ctx, r, "pullWait", undefined(ctx), ex);
+    }
+    settle(ctx, entry, undefined(ctx), false, ex);
+}
+pub fun create_transform(ctx: ptr<u8>, transformer: ptr<u8>, writable_strategy: ptr<u8>, readable_strategy: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var r: ptr<u8> = plain(ctx);
+    protect(ctx, r);
+    set_integer(ctx, r, "kind", TRANSFORM, ex);
+    set_flag(ctx, r, "backpressure", true, ex);
+    put(ctx, r, "transformer", transformer, ex);
+    if (kind(ctx, transformer) == 5) {
+        if (kind(ctx, get(ctx, transformer, "readableType", ex)) != 0 || kind(ctx, get(ctx, transformer, "writableType", ex)) != 0) {
+            fail(ctx, ex, 2, "TransformStream byte types are not supported");
+        }
+        var names: array<str, 3> = ["start", "transform", "flush"];
+        for (var i: i64 = 0; i < 3 && deref ex == null; i++) {
+            var fn: ptr<u8> = get(ctx, transformer, names[i], ex);
+            if (kind(ctx, fn) != 0 && !callable(ctx, fn)) {
+                fail(ctx, ex, 1, "transform callbacks must be callable");
+            }
+            put(ctx, r, names[i], fn, ex);
+        }
+    } else if (kind(ctx, transformer) != 0 && kind(ctx, transformer) != 1) {
+        fail(ctx, ex, 1, "transformer must be an object");
+    }
+    var controller: ptr<u8> = plain(ctx);
+    protect(ctx, controller);
+    set_integer(ctx, controller, "kind", TRANSFORM_CONTROLLER, ex);
+    put(ctx, controller, "stream", r, ex);
+    put(ctx, r, "controller", handle(ctx, TRANSFORM_CONTROLLER, controller, ex), ex);
+    unprotect(ctx, controller);
+    var source: ptr<u8> = plain(ctx);
+    protect(ctx, source);
+    var sink: ptr<u8> = plain(ctx);
+    protect(ctx, sink);
+    var s: ptr<WebStreamState> = storage(ctx);
+    var names: array<str, 6> = ["write", "close", "pull", "cancel", "abort", "start"];
+    for (var i: i64 = 0; i < 6; i++) {
+        var target: ptr<u8> = sink;
+        if (i == 2 || i == 3) {
+            target = source;
+        }
+        var bound: ptr<u8> = bind_one(ctx, (deref s.methods)[TRANSFORM_WRITE + i], undefined(ctx), r, ex);
+        put(ctx, target, names[i], bound, ex);
+    }
+    var readable: ptr<u8> = undefined(ctx);
+    var writable: ptr<u8> = undefined(ctx);
+    if (deref ex == null) {
+        readable = create_readable(ctx, source, readable_strategy, 0.0, ex);
+        put(ctx, r, "readable", readable, ex);
+        put(ctx, r, "readState", record(ctx, readable, READABLE, ex), ex);
+        writable = create_writable(ctx, sink, writable_strategy, ex);
+        put(ctx, r, "writable", writable, ex);
+        put(ctx, r, "writeState", record(ctx, writable, WRITABLE, ex), ex);
+        if (flag(ctx, r, "failed", ex)) {
+            error_writable(ctx, get(ctx, r, "writeState", ex), get(ctx, r, "error", ex), ex);
+        }
+    }
+    var owner: ptr<u8> = handle(ctx, TRANSFORM, r, ex);
+    unprotect(ctx, sink);
+    unprotect(ctx, source);
+    unprotect(ctx, r);
+    return owner;
+}

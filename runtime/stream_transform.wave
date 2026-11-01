@@ -1,0 +1,153 @@
+// Transform hooks execute on the owner thread and retain the writable record until
+// both the callback and readable pressure allow the next input to be processed.
+import("./stream_state")::{stream_state, stream_state_storage, StreamHostState, stream_chunk};
+import("./stream_operations")::{release_pass_write, schedule, destroy_stream, push_chunk};
+import("./values")::{get, define, text, fail};
+import("./collections")::{flag, set_flag, bind_one};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+const TRANSFORM_DONE_METHOD: i64 = 25;
+const FLUSH_DONE_METHOD: i64 = 26;
+
+pub fun configure_transform(ctx: ptr<u8>, receiver: ptr<u8>, state: ptr<u8>, options: ptr<u8>,
+    ex: ptr<ptr<u8>>) {
+    set_flag(ctx, state, "transform", true, ex);
+    if (kind(ctx, options) != 5) {
+        return;
+    }
+    var names: array<str, 2> = ["transform", "flush"];
+    var hooks: array<str, 2> = ["_transform", "_flush"];
+    for (var i: i64 = 0; i < 2; i++) {
+        var hook: ptr<u8> = get(ctx, options, names[i], ex);
+        if (deref ex != null) {
+            return;
+        }
+        if (kind(ctx, hook) != 0) {
+            if (!callable(ctx, hook)) {
+                fail(ctx, ex, 1, "transform and flush hooks must be functions");
+                return;
+            }
+            define(ctx, receiver, hooks[i], hook, ex, false);
+        }
+    }
+}
+
+pub fun transform_write(ctx: ptr<u8>, receiver: ptr<u8>, state: ptr<u8>, record: ptr<u8>,
+    chunk: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var hook: ptr<u8> = get(ctx, receiver, "_transform", ex);
+    protect(ctx, hook);
+    if (deref ex == null && !callable(ctx, hook)) {
+        fail(ctx, ex, 0, "Transform requires a transform hook");
+    }
+    if (deref ex == null) {
+        var done: ptr<u8> = bind_one(ctx, (deref roots.stream_methods)[TRANSFORM_DONE_METHOD], receiver, record, ex);
+        protect(ctx, done);
+        var encoding: ptr<u8> = text(ctx, "buffer");
+        protect(ctx, encoding);
+        var args: array<ptr<u8>, 3> = [chunk, encoding, done];
+        if (deref ex == null && !flag(ctx, state, "destroyed", ex)) {
+            call(ctx, hook, receiver, 3, &args[0], ex);
+        }
+        unprotect(ctx, encoding);
+        unprotect(ctx, done);
+    }
+    unprotect(ctx, hook);
+}
+
+pub fun transform_flush(ctx: ptr<u8>, receiver: ptr<u8>, state: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (flag(ctx, state, "flushDone", ex)) {
+        return true;
+    }
+    if (flag(ctx, state, "flushStarted", ex)) {
+        return false;
+    }
+    set_flag(ctx, state, "flushStarted", true, ex);
+    var hook: ptr<u8> = get(ctx, receiver, "_flush", ex);
+    protect(ctx, hook);
+    if (deref ex == null && kind(ctx, hook) == 0) {
+        set_flag(ctx, state, "flushDone", true, ex);
+        unprotect(ctx, hook);
+        return true;
+    }
+    if (deref ex == null && !callable(ctx, hook)) {
+        fail(ctx, ex, 1, "flush hook must be a function");
+    }
+    var roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var done: ptr<u8> = bind_one(ctx, (deref roots.stream_methods)[FLUSH_DONE_METHOD], receiver, undefined(ctx), ex);
+    protect(ctx, done);
+    var args: array<ptr<u8>, 1> = [done];
+    if (deref ex == null) {
+        call(ctx, hook, receiver, 1, &args[0], ex);
+    }
+    unprotect(ctx, done);
+    unprotect(ctx, hook);
+    if (deref ex != null) {
+        var reason: ptr<u8> = deref ex;
+        protect(ctx, reason);
+        deref ex = null;
+        destroy_stream(ctx, receiver, state, reason, ex);
+        unprotect(ctx, reason);
+    }
+    return false;
+}
+
+export(c) fun jsrt_transform_done(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<u8> = stream_state(ctx, receiver, 3, ex);
+    if (state == null || count == 0 || flag(ctx, state, "destroyed", ex)) {
+        return undefined(ctx);
+    }
+    var flushing: bool = kind(ctx, args[0]) == 0;
+    var marker: ptr<u8> = args[0];
+    var key: str = "transformCalled";
+    if (flushing) {
+        marker = state;
+        key = "flushCalled";
+    }
+    if (flag(ctx, marker, key, ex)) {
+        fail(ctx, ex, 0, "transform callback called more than once");
+        return undefined(ctx);
+    }
+    set_flag(ctx, marker, key, true, ex);
+    if (count > 1 && kind(ctx, args[1]) != 0 && kind(ctx, args[1]) != 1) {
+        destroy_stream(ctx, receiver, state, args[1], ex);
+        return undefined(ctx);
+    }
+    if (count > 2 && kind(ctx, args[2]) != 0 && kind(ctx, args[2]) != 1) {
+        var chunk: ptr<u8> = args[2];
+        if (!flag(ctx, state, "readableObjectMode", ex)) {
+            chunk = stream_chunk(ctx, chunk, undefined(ctx), ex);
+        }
+        if (deref ex == null && chunk != null) {
+            protect(ctx, chunk);
+            if (flag(ctx, state, "ended", ex)) {
+                fail(ctx, ex, 0, "transform output after EOF");
+            } else {
+                push_chunk(ctx, receiver, state, chunk, ex);
+            }
+            unprotect(ctx, chunk);
+        }
+    }
+    if (deref ex != null) {
+        var reason: ptr<u8> = deref ex;
+        protect(ctx, reason);
+        deref ex = null;
+        destroy_stream(ctx, receiver, state, reason, ex);
+        unprotect(ctx, reason);
+        return undefined(ctx);
+    }
+    if (flushing) {
+        set_flag(ctx, state, "flushDone", true, ex);
+        schedule(ctx, receiver, state, true, ex);
+    } else {
+        set_flag(ctx, marker, "transformed", true, ex);
+        release_pass_write(ctx, receiver, state, ex);
+    }
+    return undefined(ctx);
+}

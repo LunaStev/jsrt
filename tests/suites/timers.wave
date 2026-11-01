@@ -1,0 +1,50 @@
+// Timer/microtask ordering, callback lifetime and failure propagation.
+import("./harness")::{test};
+
+pub fun timer_tests() {
+    test("timer keeps runtime alive", "console.log('sync'); setTimeout((message)=>console.log(message),1,'timeout'); console.log('end');",
+        "sync\nend\ntimeout\n", 0, "");
+    test("Promise and microtask checkpoints", "console.log('sync'); setTimeout(()=>{console.log('timer 1'); Promise.resolve().then(()=>console.log('promise in timer')); queueMicrotask(()=>console.log('microtask in timer'));},0); setTimeout(()=>console.log('timer 2'),0); Promise.resolve().then(()=>console.log('promise before timer')); queueMicrotask(()=>console.log('microtask before timer'));",
+        "sync\npromise before timer\nmicrotask before timer\ntimer 1\npromise in timer\nmicrotask in timer\ntimer 2\n",
+        0, "");
+    test("microtask intrinsics captured", "Promise.resolve=()=>{throw 1;}; Promise.prototype.then=()=>{throw 2;}; Reflect.apply=()=>{throw 3;}; queueMicrotask(()=>console.log('captured')); console.log(typeof globalThis.__jsrtMicrotaskError);",
+        "undefined\ncaptured\n", 0, "");
+    test("native microtask receiver, arguments and return value", "const result=queueMicrotask(function(){'use strict';console.log(this===undefined,arguments.length);});console.log(result===undefined,queueMicrotask.length,queueMicrotask.name);",
+        "true 1 queueMicrotask\ntrue 0\n", 0, "");
+    test("nested microtasks retain Promise FIFO order", "Promise.resolve().then(()=>{console.log('p1');queueMicrotask(()=>console.log('q from p'));});queueMicrotask(()=>{console.log('q1');Promise.resolve().then(()=>console.log('p from q'));queueMicrotask(()=>console.log('q from q'));});Promise.resolve().then(()=>console.log('p2'));",
+        "p1\nq1\np2\nq from p\np from q\nq from q\n", 0, "");
+    test("microtask scheduling resists Promise species and bind mutation", "const original=Promise;Function.prototype.bind=()=>{throw new Error('bind intercepted');};Object.defineProperty(original.prototype,'constructor',{get(){throw new Error('constructor intercepted');},configurable:true});Object.defineProperty(original,Symbol.species,{get(){throw new Error('species intercepted');},configurable:true});globalThis.Promise=null;Reflect.apply=()=>{throw new Error('apply intercepted');};queueMicrotask(()=>console.log('private scheduler'));",
+        "private scheduler\n", 0, "");
+    test("microtask return thenable is ignored", "queueMicrotask(()=>({get then(){throw new Error('must not assimilate');}}));queueMicrotask(()=>console.log('continued'));",
+        "continued\n", 0, "");
+    test("microtask callback stays alive under allocation pressure", "let total=0;for(let i=0;i<500;i++){const payload={value:i};queueMicrotask(()=>{total+=payload.value;});}for(let i=0;i<10;i++){const garbage=Array.from({length:10000},(_,j)=>({s:i+':'+j}));if(garbage.length!==10000)throw 1;}queueMicrotask(()=>console.log(total));",
+        "124750\n", 0, "");
+    test("deep microtask chain uses engine jobs", "let count=0;function next(){if(++count<10000)queueMicrotask(next);else console.log(count);}queueMicrotask(next);",
+        "10000\n", 0, "");
+    test("first microtask exception retained including undefined", "queueMicrotask(()=>{throw undefined;});queueMicrotask(()=>{console.log('later microtask');throw new Error('second failure');});setTimeout(()=>console.log('wrong'),1);",
+        "later microtask\n", 1, "<eval>: undefined");
+    test("revoked callback failure is reported by host", "const r=Proxy.revocable(function(){},{});r.revoke();queueMicrotask(r.proxy);setTimeout(()=>console.log('wrong'),1);",
+        "", 1, "TypeError");
+    test("cancellation and unknown handles", "const a=setTimeout(()=>console.log('wrong'),2147483647); const b=setInterval(()=>console.log('wrong'),1000); clearInterval(a); clearTimeout(b); clearTimeout(a); clearTimeout(); clearTimeout(NaN); clearTimeout(Infinity); clearInterval(-1); clearInterval(999999); console.log('cancelled');",
+        "cancelled\n", 0, "");
+    test("interval cancellation and nested timeout", "let n=0; const id=setInterval((v)=>{console.log('tick',++n,v.label); if(n===2){clearInterval(id);setTimeout(()=>console.log('nested'),0);}},1,{label:'retained'});",
+        "tick 1 retained\ntick 2 retained\nnested\n", 0, "");
+    test("closure and arguments under allocation pressure", "(()=>{const captured={label:'closure alive'};const payload={label:'argument alive'};setTimeout(v=>console.log(captured.label,v.label),1,payload);})(); for(let i=0;i<20;i++){const pressure=Array.from({length:10000},(_,j)=>({value:i+':'+j}));if(pressure.length!==10000)throw 1;}",
+        "closure alive argument alive\n", 0, "");
+    test("timer exception stops pending work", "setTimeout(()=>{throw new Error('timer failure');},0);setTimeout(()=>console.log('wrong'),10);",
+        "", 1, "timer failure");
+    test("top-level exception clears timers", "setTimeout(()=>console.log('wrong'),0);throw new Error('top level');",
+        "", 1, "top level");
+    test("microtask exception stops pending work", "setTimeout(()=>console.log('wrong'),0);queueMicrotask(()=>{throw new Error('microtask failure');});",
+        "", 1, "microtask failure");
+    test("microtask exception inside timer", "setTimeout(()=>queueMicrotask(()=>{throw new Error('inside timer');}),0);setTimeout(()=>console.log('wrong'),10);",
+        "", 1, "inside timer");
+    test("invalid callbacks throw TypeError", "for(const f of [()=>setTimeout('code',0),()=>setInterval(null),()=>queueMicrotask(7),()=>setTimeout(()=>{},Symbol())]){try{f();console.log('wrong');}catch(e){console.log(e instanceof TypeError);}}",
+        "true\ntrue\ntrue\ntrue\n", 0, "");
+    test("delay conversion reentrancy", "const old=setTimeout(()=>console.log('wrong'),1000);setTimeout(()=>console.log('outer'),{valueOf(){clearTimeout(old);setTimeout(()=>console.log('inner'),0);return 0;}});",
+        "inner\nouter\n", 0, "");
+    test("timer capacity and recovery", "const ids=[];try{for(let i=0;i<1024;i++)ids.push(setTimeout(()=>{},2147483647));try{setTimeout(()=>{},0);console.log('wrong');}catch(e){console.log(e instanceof RangeError);}}finally{ids.forEach(clearTimeout);}setTimeout(()=>console.log('recovered'),0);",
+        "true\nrecovered\n", 0, "");
+    test("timer argument limit and identity", "const values=Array.from({length:64},(_,value)=>({value}));setTimeout((...args)=>console.log(args.length,args[0]===values[0],args[63].value),0,...values);try{setTimeout(()=>{},0,...new Array(65));console.log('wrong');}catch(e){console.log(e instanceof RangeError);}",
+        "true\n64 true 63\n", 0, "");
+}

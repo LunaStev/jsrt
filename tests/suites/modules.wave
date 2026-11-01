@@ -1,0 +1,435 @@
+// CommonJS, ESM, interop and test-command regressions.
+import("jsrt::tools::support")::{join, concat};
+import("jsrt::runtime::esm")::{esm_available};
+import("std::fs::file")::{write, remove};
+import("std::mem::cstr")::{mem_len_cstr};
+import("std::sys::fs")::{Stat, stat, mkdir, rmdir};
+import("./harness")::{check, expect, test, TestState, test_state};
+extern(c, "symlink") fun symlink(target: str, link_path: str) -> i32;
+extern(c, "jsrt_esm_synthetic_available") fun synthetic_engine_available() -> bool;
+
+fun esm_case(root: str, name: str, source: str, expected: str, code: i32, error: str) {
+    var suite: ptr<TestState> = test_state();
+    var path: str = join(root, "entry.mjs") as str;
+    if (write(path, source as ptr<u8>, mem_len_cstr(source)) < 0) {
+        check(name, false);
+        return;
+    }
+    var command: array<str, 2> = [(deref suite.binary) as str, path];
+    expect(name, &command[0], 2, expected as ptr<u8>, mem_len_cstr(expected), code, error);
+}
+
+pub fun esm_tests() {
+    var suite: ptr<TestState> = test_state();
+    var root: str = join((deref suite.directory) as str, "esm") as str;
+    if (mkdir(root, 448) != 0) {
+        check("prepare isolated ESM fixture", false);
+        return;
+    }
+    if (!esm_available()) {
+        esm_case(root, "unextended JSC explicitly rejects ESM entry", "export const value=1;", "", 1,
+            "module-enabled build");
+        remove(join(root, "entry.mjs") as str);
+        check("unsupported ESM fixture removed", rmdir(root) == 0);
+        return;
+    }
+    var files: array<str, 7> = ["counter.mjs", "cycle-a.mjs", "cycle-b.mjs", "awaited.mjs", "broken.mjs",
+        "space 한글.mjs", "entry.mjs"];
+    var sources: array<str, 6> = [
+        "export let value=1;export function add(){value++;}globalThis.counterLoads=(globalThis.counterLoads||0)+1;export default 'counter';",
+        "import {b} from './cycle-b.mjs';export let a=4;export function read(){return b;}export function bump(){a++;}",
+        "import {a} from './cycle-a.mjs';export const b=7;export function read(){return a;}",
+        "globalThis.awaitTrace=['before'];await new Promise(r=>setTimeout(r,1));globalThis.awaitTrace.push('after');export const ready=42;",
+        "export const = ;",
+        "export const url=import.meta.url;export const filename=import.meta.filename;export const nullMeta=Object.getPrototypeOf(import.meta)===null;"
+    ];
+    var ready: bool = true;
+    for (var i: i64 = 0; i < 6; i++) {
+        ready = write(join(root, files[i]) as str, sources[i] as ptr<u8>, mem_len_cstr(sources[i])) >= 0 && ready;
+    }
+    check("prepare actual JSC ESM graph files", ready);
+    if (ready) {
+        module_case(root, "CommonJS relative dynamic import uses its file source origin",
+            "import('./counter.mjs').then(m=>console.log(m.value));", "1\n", 0, "");
+        var child: str = "module.exports=()=>import('./counter.mjs');";
+        var child_path: str = join(root, "sub % #한글.cjs") as str;
+        check("prepare CommonJS source origin with escaped path bytes", write(child_path,
+            child as ptr<u8>, mem_len_cstr(child)) > 0);
+        module_case(root, "CommonJS imported closure preserves Unicode space percent and fragment path bytes",
+            "const load=require('./sub % #한글.cjs');setTimeout(()=>load().then(m=>console.log(m.value)),1);",
+            "1\n", 0, "");
+        remove(child_path);
+        remove(join(root, "entry.js") as str);
+        esm_case(root, "ESM imports default namespace live bindings and caches execution",
+            "import label,{value,add} from './counter.mjs';import * as again from './counter.mjs';console.log(label,value,again.value,counterLoads);add();console.log(value,again.value);",
+            "counter 1 1 1\n2 2\n", 0, "");
+        esm_case(root, "ESM circular imports preserve engine live bindings",
+            "import{a,bump,read}from './cycle-a.mjs';import{read as other}from './cycle-b.mjs';console.log(a,read(),other());bump();console.log(other());",
+            "4 7 4\n5\n", 0, "");
+        esm_case(root, "ESM top-level await waits for host timer and dynamic imports",
+            "import{ready}from './awaited.mjs';console.log(ready,awaitTrace.join(','));const m=await import('./counter.mjs');m.add();console.log(m.value,counterLoads);",
+            "42 before,after\n2 1\n", 0, "");
+        esm_case(root, "ESM dynamic import missing source rejects normally",
+            "await import('./missing.mjs').catch(e=>console.log(e instanceof Error));console.log('done');",
+            "true\ndone\n", 0, "");
+        esm_case(root, "ESM import meta percent-encodes Unicode and space",
+            "import{url,filename,nullMeta}from './space 한글.mjs';console.log(url.startsWith('file:///'),url.endsWith('/space%20%ED%95%9C%EA%B8%80.mjs'),filename.endsWith('/space 한글.mjs'),nullMeta);",
+            "true true true true\n", 0, "");
+        esm_case(root, "ESM linking rejects missing named export before entry execution",
+            "import{absent}from './counter.mjs';console.log('must not run');", "", 1, "SyntaxError");
+        esm_case(root, "ESM dependency syntax error is reported",
+            "import './broken.mjs';console.log('must not run');", "", 1, "SyntaxError");
+        esm_case(root, "ESM rejected top-level await reports original reason",
+            "await Promise.reject(new Error('module rejection'));", "", 1, "module rejection");
+        esm_case(root, "ESM unresolved await with no host work fails explicitly",
+            "await new Promise(()=>{});", "", 1, "Top-level await remains pending");
+        esm_case(root, "ESM specifiers do not silently use CommonJS extension probing",
+            "await import('./counter').catch(e=>console.log(e instanceof Error));", "true\n", 0, "");
+        var manifest: str = "{\"name\":\"esm-self\",\"type\":\"module\",\"exports\":{\".\":{\"require\":\"./broken.mjs\",\"import\":\"./counter.mjs\"}},\"imports\":{\"#counter\":\"./counter.mjs\"}}";
+        check("prepare ESM package scope", write(join(root, "package.json") as str, manifest as ptr<u8>,
+            mem_len_cstr(manifest)) > 0);
+        esm_case(root, "ESM self references and package imports share module identity",
+            "import{value,add}from 'esm-self';import*as a from '#counter';add();console.log(value,a.value,counterLoads);",
+            "2 2 1\n", 0, "");
+        var modules: str = join(root, "node_modules") as str;
+        var package: str = join(modules, "esm-pkg") as str;
+        check("prepare ESM dependency directory", mkdir(modules, 448) == 0 && mkdir(package, 448) == 0);
+        manifest = "{\"type\":\"module\",\"exports\":{\".\":{\"require\":\"./absent.cjs\",\"import\":\"./value.js\"},\"./*\":\"./*.js\"}}";
+        var value: str = "export const answer=42;";
+        check("prepare ESM dependency export map", write(join(package, "package.json") as str,
+            manifest as ptr<u8>, mem_len_cstr(manifest)) > 0 && write(join(package, "value.js") as str,
+            value as ptr<u8>, mem_len_cstr(value)) > 0);
+        esm_case(root, "ESM bare dependency uses import condition and export patterns",
+            "import{answer}from 'esm-pkg';import*as a from 'esm-pkg/value';console.log(answer,a.answer);",
+            "42 42\n", 0, "");
+        esm_case(root, "ESM undefined package import preserves resolution error",
+            "await import('#missing').catch(e=>console.log(e.code));", "ERR_PACKAGE_IMPORT_NOT_DEFINED\n", 0, "");
+        test("eval dynamic imports reject missing file referrers without package traversal",
+            "import('absent-jsrt-package').catch(e=>console.log(e instanceof TypeError,e.message.includes('absolute file referrer')));",
+            "true true\n", 0, "");
+        remove(join(package, "value.js") as str);
+        remove(join(package, "package.json") as str);
+        check("ESM dependency directory removed", rmdir(package) == 0 && rmdir(modules) == 0);
+        remove(join(root, "package.json") as str);
+        var command: array<str, 3> = [(deref suite.binary) as str, "--check", join(root, "counter.mjs") as str];
+        expect("ESM syntax check uses JSC module parser without execution", &command[0], 3,
+            "" as ptr<u8>, 0, 0, "");
+        command[2] = join(root, "broken.mjs") as str;
+        expect("ESM syntax check rejects invalid export", &command[0], 3, "" as ptr<u8>, 0, 1, "SyntaxError");
+    }
+    for (var i: i64 = 0; i < 7; i++) {
+        remove(join(root, files[i]) as str);
+    }
+    check("ESM fixture files and directory removed", rmdir(root) == 0);
+}
+
+pub fun test_command_tests() {
+    var suite: ptr<TestState> = test_state();
+    var root: str = join((deref suite.directory) as str, "test-command") as str;
+    if (mkdir(root, 448) != 0) {
+        check("prepare test command fixture directory", false);
+        return;
+    }
+    var first: str = join(root, "first.js") as str;
+    var second: str = join(root, "second.js") as str;
+    var failed: str = join(root, "failed.js") as str;
+    var continued: str = join(root, "continued") as str;
+    var source: str = "globalThis.testPrivate=42;if(process.argv.length!==2)throw Error('test argv');setTimeout(()=>console.log('timer'),1);";
+    var ok: bool = write(first, source as ptr<u8>, mem_len_cstr(source)) > 0;
+    source = "if('testPrivate' in globalThis)throw Error('shared global');require('fs').writeFileSync(__dirname+'/continued','yes');";
+    ok = write(second, source as ptr<u8>, mem_len_cstr(source)) > 0 && ok;
+    source = "throw Error('test runner failure');";
+    ok = write(failed, source as ptr<u8>, mem_len_cstr(source)) > 0 && ok;
+    check("prepare isolated test command files", ok);
+    if (ok) {
+        var command: array<str, 6> = [(deref suite.binary) as str, "test", first, second, failed, ""];
+        var expected: str = concat(concat(concat("timer\nPASS ", first) as str, "\nPASS ") as str,
+            concat(second, "\n") as str) as str;
+        expect("test command drains asynchronous work and isolates argv and globals", &command[0], 4,
+            expected as ptr<u8>, mem_len_cstr(expected), 0, "");
+        remove(continued);
+        command[2] = failed;
+        command[3] = second;
+        expect("test command aggregates failure and continues with later files", &command[0], 4,
+            "" as ptr<u8>, -1, 1, "test runner failure");
+        var info: Stat;
+        check("test command executes the file after a failure", stat(continued, &info) == 0 && info.size == 3);
+        remove(continued);
+        command[2] = second;
+        command[3] = "--unsupported";
+        expect("test command validates every option before starting files", &command[0], 4,
+            "" as ptr<u8>, 0, 2, "unsupported test option");
+        check("invalid test command cannot execute an earlier file", stat(continued, &info) < 0);
+        expect("test command requires explicit files", &command[0], 2, "" as ptr<u8>, 0, 2,
+            "expected explicit test files");
+        command[2] = "--";
+        command[3] = second;
+        expected = concat(concat("PASS ", second) as str, "\n") as str;
+        expect("test command accepts an explicit option delimiter", &command[0], 4,
+            expected as ptr<u8>, mem_len_cstr(expected), 0, "");
+        remove(continued);
+    }
+    remove(first);
+    remove(second);
+    remove(failed);
+    check("test command fixture directory removed", rmdir(root) == 0);
+}
+
+pub fun module_case(root: str, name: str, source: str, expected: str, code: i32, error: str) {
+    var suite: ptr<TestState> = test_state();
+    var entry: str = join(root, "entry.js") as str;
+    if (write(entry, source as ptr<u8>, mem_len_cstr(source)) < 0) {
+        check(name, false);
+        return;
+    }
+    var command: array<str, 3> = [(deref suite.binary) as str, "run", entry];
+    expect(name, &command[0], 3, expected as ptr<u8>, mem_len_cstr(expected), code, error);
+}
+
+pub fun module_tests() {
+    var suite: ptr<TestState> = test_state();
+    var root: str = join((deref suite.directory) as str, "modules") as str;
+    var ok: bool = mkdir(root, 448) == 0;
+    var folders: array<str, 8> = ["folder", "sub", "node_modules", "node_modules/demo", "node_modules/demo/lib",
+        "node_modules/self", "node_modules/bad", "unused"];
+    for (var i: i64 = 0; i < 8; i++) {
+        ok = mkdir(join(root, folders[i]) as str, 448) == 0 && ok;
+    }
+    var names: array<str, 20> = ["shared.js", "a.js", "b.js", "retry.js", "bad.js", "value.cjs", "config.json",
+        "folder/index.js", "node_modules/demo/package.json", "node_modules/demo/lib/start.cjs", "node_modules/self/package.json",
+        "node_modules/self/index.js", "node_modules/bad/package.json", "delayed.js", "primitive.json",
+        "hashbang.js", "esm.mjs", "zero.json", "getter.js", "mutates.js"];
+    var sources: array<str, 20> = [ "globalThis.loads=(globalThis.loads||0)+1;exports.loads=globalThis.loads;exports.require=require;exports.filename=__filename;exports.dirname=__dirname;exports.loaded=()=>module.loaded;var isolated=99;",
+        "exports.name='a';const b=require('./b');exports.peer=b.name;exports.seen=b.seen;", "exports.name='b';exports.seen=require('./a').name;",
+        "globalThis.attempts=(globalThis.attempts||0)+1;globalThis.savedRequire=require;throw new Error('retry '+globalThis.attempts);",
+        "const = ;", "module.exports=n=>n+1;", "{\"name\":\"한글\",\"__proto__\":{\"value\":1},\"nul\":\"\\u0000\"}",
+        "module.exports={index:42};", "{\"main\":\"lib/start.cjs\"}", "module.exports=require('../../../shared');",
+        "{\"main\":\".\"}", "module.exports=17;", "{invalid}", "module.exports=()=>require('./shared');",
+        "7", "#!/usr/bin/env jsrt\nmodule.exports=23;", "export default 1;", "null", "globalThis.getterAttempts=(globalThis.getterAttempts||0)+1;Object.defineProperty(module,'exports',{get(){throw new Error('exports getter');},configurable:true});",
+        "module.exports={value:1};setTimeout(()=>{module.exports={value:2};},1);"];
+    for (var i: i64 = 0; i < 20; i++) {
+        ok = write(join(root, names[i]) as str, sources[i] as ptr<u8>, mem_len_cstr(sources[i])) >= 0 && ok;
+    }
+    var bom: array<u8, 4> = [239, 187, 191, 55];
+    ok = write(join(root, "primitive.json") as str, &bom[0], 4) == 4 && ok;
+    var extra_names: array<str, 3> = ["unused/package.json", "unused/index.js", "unused/value.cjs"];
+    var extra_sources: array<str, 3> = ["{\"type\":\"module\"}", "module.exports=1;", "module.exports=9;"];
+    for (var i: i64 = 0; i < 3; i++) {
+        ok = write(join(root, extra_names[i]) as str, extra_sources[i] as ptr<u8>, mem_len_cstr(extra_sources[i])) >= 0 && ok;
+    }
+    var alias: str = join(root, "alias.js") as str;
+    ok = symlink("shared.js", alias) == 0 && ok;
+    check("prepare private CommonJS fixtures", ok);
+    if (ok) {
+        module_case(root, "CommonJS entry scope and loaded checkpoint", "console.log(this===exports,exports===module.exports,require.main===module,module.loaded,__filename.endsWith('/entry.js'),__dirname===module.path);queueMicrotask(()=>console.log(module.loaded,require.main.loaded));",
+            "true true true false true true\ntrue true\n", 0, "");
+        module_case(root, "module cache uses canonical paths and symlinks", "const a=require('./shared');console.log(a===require('./shared.js'),a===require('./sub/../shared'),a===require('./alias'),a.loads,a.loaded(),globalThis.isolated===undefined);",
+            "true true true 1 true true\n", 0, "");
+        module_case(root, "circular modules expose partial exports", "const a=require('./a');console.log(a.name,a.peer,a.seen);",
+            "a b a\n", 0, "");
+        module_case(root, "module.exports may be a function", "console.log(require('./value')(41));",
+            "42\n", 0, "");
+        module_case(root, "directory index and node_modules package main", "console.log(require('./folder').index,require('demo')===require('./shared'),require('self'));",
+            "42 true 17\n", 0, "");
+        module_case(root, "require.resolve locates without executing", "const p=require.resolve('./shared');console.log(p.endsWith('/shared.js'),globalThis.loads===undefined,p===require.resolve('./alias'),'node:fs'===require.resolve('node:fs'));",
+            "true true true true\n", 0, "");
+        module_case(root, "JSON modules use captured Wave wjson parser", "JSON.parse=()=>{throw new Error('hijacked');};const a=require('./config');console.log(a.name,a.nul.length,a.__proto__.value,Object.getPrototypeOf(a)===Object.prototype,a===require('./config.json'),require('./primitive.json'),require('./zero.json'));",
+            "한글 1 1 true true 7 null\n", 0, "");
+        module_case(root, "built-ins retain identity after global mutation", "const f=require('node:fs'),p=process,c=console;globalThis.fs=null;globalThis.process=null;globalThis.console=null;c.log(require('fs')===f,require('node:fs')===f,require('process')===p,require('console')===c,require('timers')===require('node:timers'));",
+            "true true true true true\n", 0, "");
+        module_case(root, "delayed require retains its parent directory", "const later=require('./delayed');setTimeout(()=>console.log(later().loads,later()===require('./shared')),1);",
+            "1 true\n", 0, "");
+        module_case(root, "failed modules are retried and escaped require stays valid", "for(let i=0;i<2;i++){try{require('./retry');}catch(e){console.log(e.message);}}console.log(globalThis.savedRequire('./shared').loads);",
+            "retry 1\nretry 2\n1\n", 0, "");
+        module_case(root, "module export getters preserve original exceptions", "for(let i=0;i<2;i++){try{require('./getter');}catch(e){console.log(e.message);}}console.log(globalThis.getterAttempts);",
+            "exports getter\nexports getter\n2\n", 0, "");
+        module_case(root, "cached module reads current replacement exports", "const initial=require('./mutates');setTimeout(()=>console.log(initial.value,require('./mutates').value),3);",
+            "1 2\n", 0, "");
+        module_case(root, "CommonJS hashbangs and top-level return", "console.log(require('./hashbang'));return;console.log('wrong');",
+            "23\n", 0, "");
+        module_case(root, "missing module and unknown builtin error codes", "for(const name of ['./absent','not-installed','node:absent']){try{require(name);}catch(e){console.log(e.code);}}",
+            "MODULE_NOT_FOUND\nMODULE_NOT_FOUND\nERR_UNKNOWN_BUILTIN_MODULE\n", 0, "");
+        module_case(root, "require rejects coercion, NUL and invalid arguments", "for(const value of [undefined,null,42,{toString(){throw 1;}},'./shared\\0extra','./\\ud800']){try{require(value);}catch(e){console.log(e instanceof TypeError);}}",
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\n", 0, "");
+        module_case(root, "syntax failures identify dependency file", "require('./bad');", "", 1, "bad.js");
+        module_case(root, "invalid package JSON fails through wjson", "try{require('bad');}catch(e){console.log(e instanceof SyntaxError);}",
+            "true\n", 0, "");
+        module_case(root, "CommonJS require explicitly rejects ES modules", "try{require('./esm.mjs');}catch(e){console.log(e.code);}",
+            "ERR_REQUIRE_ESM\n", 0, "");
+        module_case(root, "package type module cannot execute as CommonJS", "for(const name of ['./unused','./unused/index.js']){try{require(name);}catch(e){console.log(e.code);}}console.log(require('./unused/value.cjs'));",
+            "ERR_REQUIRE_ESM\nERR_REQUIRE_ESM\n9\n", 0, "");
+        module_case(root, "module intrinsics resist global mutation", "Reflect.defineProperty=Reflect.getOwnPropertyDescriptor=null;globalThis.Error=null;Object.defineProperty(Object.prototype,'exports',{set(){throw new Error('intercepted');},configurable:true});console.log(require('./shared').loads,require('demo').loads);",
+            "1 1\n", 0, "");
+        module_case(root, "failed module records have a bounded lifetime budget", "let limited=false;for(let i=0;i<1100;i++){try{require('./retry');}catch(e){if(e.code==='ERR_MODULE_LIMIT'){limited=e instanceof RangeError;break;}}}console.log(limited,globalThis.attempts);",
+            "true 1023\n", 0, "");
+        module_case(root, "deep module chains stop at the host depth limit", "const fs=require('node:fs');for(let i=0;i<130;i++){const n=String(i).padStart(3,'0'),next=String(i+1).padStart(3,'0');fs.writeFileSync(__dirname+'/depth'+n+'.js','module.exports=require('+JSON.stringify('./depth'+next+'.js')+');');}try{require('./depth000');}catch(e){console.log(e instanceof RangeError,e.code);}",
+            "true ERR_MODULE_LIMIT\n", 0, "");
+        var zero_source: array<u8, 1> = [0];
+        write(join(root, "bad.js") as str, &zero_source[0], 1);
+        module_case(root, "dependency source preserves NUL rejection", "try{require('./bad');}catch(e){console.log(e instanceof SyntaxError,e.code);}",
+            "true ERR_INVALID_MODULE_SOURCE\n", 0, "");
+        var self_path: str = join(root, "node_modules/self/package.json") as str;
+        var cycle: str = "{\"main\":\"././\"}";
+        write(self_path, cycle as ptr<u8>, mem_len_cstr(cycle));
+        module_case(root, "recursive package main resolution is bounded", "try{require('self');}catch(e){console.log(e instanceof RangeError,e.code);}",
+            "true ERR_MODULE_LIMIT\n", 0, "");
+        var mapped_path: str = join(root, "node_modules/demo/package.json") as str;
+        var mapped_source: str = "{\"main\":\"missing.js\",\"exports\":{\".\":{\"import\":\"./missing.mjs\",\"require\":{\"node\":\"./lib/start.cjs\"},\"default\":\"./missing.js\"},\"./value\":\"./lib/start.cjs\",\"./private\":null}}";
+        write(mapped_path, mapped_source as ptr<u8>, mem_len_cstr(mapped_source));
+        module_case(root, "package exports choose require conditions and exact subpaths before main",
+            "console.log(require('demo')===require('./shared'),require('demo/value')===require('demo'),require.resolve('demo').endsWith('/lib/start.cjs'));for(const n of ['demo/private','demo/lib/start.cjs']){try{require(n)}catch(e){console.log(e.code)}}",
+            "true true true\nERR_PACKAGE_PATH_NOT_EXPORTED\nERR_PACKAGE_PATH_NOT_EXPORTED\n", 0, "");
+        mapped_source = "{\"exports\":{\"default\":\"./lib/start.cjs\",\"require\":\"./missing.cjs\"}}";
+        write(mapped_path, mapped_source as ptr<u8>, mem_len_cstr(mapped_source));
+        module_case(root, "package condition selection preserves JSON property order", "Object.keys=Reflect.getOwnPropertyDescriptor=null;console.log(require('demo')===require('./shared'));",
+            "true\n", 0, "");
+        var bad_maps: array<str, 6> = ["{\"exports\":\"../shared.js\"}", "{\"exports\":\"./../shared.js\"}",
+            "{\"exports\":\"./node_modules/x.js\"}", "{\"exports\":\"./%2e%2e/shared.js\"}", "{\"exports\":[7]}",
+            "{\"exports\":{\".\":\"./lib/start.cjs\",\"default\":\"./lib/start.cjs\"}}"];
+        for (var i: i64 = 0; i < 6; i++) {
+            write(mapped_path, bad_maps[i] as ptr<u8>, mem_len_cstr(bad_maps[i]));
+            module_case(root, "invalid package target or mixed condition configuration is rejected",
+                "try{require('demo')}catch(e){console.log(e.code==='ERR_INVALID_PACKAGE_TARGET'||e.code==='ERR_INVALID_PACKAGE_CONFIG')}",
+                "true\n", 0, "");
+        }
+        var import_path: str = join(root, "package.json") as str;
+        var import_source: str = "{\"imports\":{\"#shared\":{\"require\":\"./shared.js\"},\"#blocked\":null,\"#missing-extension\":\"./shared\"}}";
+        write(import_path, import_source as ptr<u8>, mem_len_cstr(import_source));
+        module_case(root, "package imports resolve exact local targets and conditional mappings", "console.log(require('#shared')===require('./shared'));for(const n of ['#unknown','#blocked','#','#/bad','#missing-extension']){try{require(n)}catch(e){console.log(e.code)}}",
+            "true\nERR_PACKAGE_IMPORT_NOT_DEFINED\nERR_PACKAGE_IMPORT_NOT_DEFINED\nERR_INVALID_MODULE_SPECIFIER\nERR_INVALID_MODULE_SPECIFIER\nMODULE_NOT_FOUND\n",
+            0, "");
+        mapped_source = "{\"exports\":{\".\":[\"../invalid\",7,{\"browser\":\"./missing.cjs\"},\"./lib/start.cjs\"],\"./feature/*\":\"./lib/*.cjs\",\"./feature/*.cjs\":\"./lib/*.cjs\",\"./feature/exact\":\"./lib/start.cjs\",\"./blocked/*\":null}}";
+        write(mapped_path, mapped_source as ptr<u8>, mem_len_cstr(mapped_source));
+        module_case(root, "package arrays skip invalid targets and unmatched conditions", "console.log(require('demo')===require('./shared'));",
+            "true\n", 0, "");
+        module_case(root, "package pattern matching chooses exact keys then longest suffix", "console.log(require('demo/feature/start')===require('demo'),require('demo/feature/start.cjs')===require('demo'),require('demo/feature/exact')===require('demo'));try{require('demo/blocked/start')}catch(e){console.log(e.code)}",
+            "true true true\nERR_PACKAGE_PATH_NOT_EXPORTED\n", 0, "");
+        module_case(root, "package pattern captures cannot traverse or escape package targets", "for(const n of ['demo/feature/../start','demo/feature/node_modules/start','demo/feature/%2e%2e/start']){try{require(n)}catch(e){console.log(e.code)}}",
+            "ERR_INVALID_PACKAGE_TARGET\nERR_INVALID_PACKAGE_TARGET\nERR_INVALID_PACKAGE_TARGET\n", 0,
+            "");
+        mapped_source = "{\"exports\":[\"./missing.cjs\",\"./lib/start.cjs\"]}";
+        write(mapped_path, mapped_source as ptr<u8>, mem_len_cstr(mapped_source));
+        module_case(root, "package fallback does not mask a missing first valid file", "try{require('demo')}catch(e){console.log(e.code)}",
+            "MODULE_NOT_FOUND\n", 0, "");
+        mapped_source = "{\"exports\":[null,\"./lib/start.cjs\"]}";
+        write(mapped_path, mapped_source as ptr<u8>, mem_len_cstr(mapped_source));
+        module_case(root, "package null target stops array fallback", "try{require('demo')}catch(e){console.log(e.code)}",
+            "ERR_PACKAGE_PATH_NOT_EXPORTED\n", 0, "");
+        mapped_source = "{\"exports\":\"./lib/start.cjs\"}";
+        write(mapped_path, mapped_source as ptr<u8>, mem_len_cstr(mapped_source));
+        import_source = "{\"name\":\"localapp\",\"exports\":{\".\":\"./shared.js\",\"./shared\":\"./shared.js\"},\"imports\":{\"#src/*\":\"./*.js\",\"#dep\":\"demo\",\"#crypto\":\"node:crypto\",\"#fallback\":[\"../invalid\",\"./shared.js\"]}}";
+        write(import_path, import_source as ptr<u8>, mem_len_cstr(import_source));
+        module_case(root, "package self references resolve nearest declared exports", "console.log(require('localapp')===require('./shared'),require('localapp/shared')===require('localapp'));try{require('localapp/private')}catch(e){console.log(e.code)}",
+            "true true\nERR_PACKAGE_PATH_NOT_EXPORTED\n", 0, "");
+        module_case(root, "package imports support patterns external dependencies and builtins", "console.log(require('#src/shared')===require('./shared'),require('#dep')===require('demo'),require('#crypto')===require('crypto'),require('#fallback')===require('./shared'),require.resolve('#crypto'));",
+            "true true true true node:crypto\n", 0, "");
+        remove(import_path);
+        var entry: str = join(root, "entry.js") as str;
+        var source: str = "#!/usr/bin/env jsrt\nreturn;throw new Error('not executed');";
+        write(entry, source as ptr<u8>, mem_len_cstr(source));
+        var check_command: array<str, 3> = [(deref suite.binary) as str, "--check", entry];
+        expect("syntax check uses CommonJS function scope and hashbang", &check_command[0], 3, "" as ptr<u8>,
+            0, 0, "");
+    }
+    for (var i: i64 = 0; i < 130; i++) {
+        var name: array<u8, 12> = [100, 101, 112, 116, 104, 48, 48, 48, 46, 106, 115, 0];
+        name[5] = (48 + i / 100) as u8;
+        name[6] = (48 + (i / 10) % 10) as u8;
+        name[7] = (48 + i % 10) as u8;
+        remove(join(root, &name[0] as str) as str);
+    }
+    remove(join(root, "entry.js") as str);
+    remove(alias);
+    for (var i: i64 = 0; i < 3; i++) {
+        remove(join(root, extra_names[i]) as str);
+    }
+    for (var i: i64 = 0; i < 20; i++) {
+        remove(join(root, names[i]) as str);
+    }
+    for (var i: i64 = 8; i > 0; i--) {
+        rmdir(join(root, folders[i - 1]) as str);
+    }
+    check("CommonJS fixture cleanup", rmdir(root) == 0);
+    test("eval exposes require relative to working directory", "console.log(typeof require,require.main===undefined,typeof globalThis.fs==='undefined',typeof __dirname);",
+        "function true true string\n", 0, "");
+    test("JSON methods remain writable and non-enumerable", "for(const key of ['parse','stringify']){const d=Object.getOwnPropertyDescriptor(JSON,key);console.log(d.writable,d.configurable,d.enumerable);}",
+        "true true false\ntrue true false\n", 0, "");
+}
+
+pub fun esm_interop_tests() {
+    var suite: ptr<TestState> = test_state();
+    if (!synthetic_engine_available()) {
+        println("SKIP ESM synthetic interop suite: matching engine ABI is unavailable");
+        return;
+    }
+    var root: str = join((deref suite.directory) as str, "esm-interop") as str;
+    if (mkdir(root, 448) != 0) {
+        check("prepare synthetic ESM fixture directory", false);
+        return;
+    }
+    var names: array<str, 17> = ["value.cjs", "primitive.cjs", "callable.cjs", "failure.cjs", "data.json",
+        "json-helper.cjs", "side-effect.cjs", "worker.mjs", "space 한글.mjs", "broken.json", "empty.cjs",
+        "cycle-a.cjs", "cycle-b.cjs", "bad-link.mjs", "entry.mjs", "es-importer.cjs", "thenable.cjs"];
+    var sources: array<str, 17> = [
+        "globalThis.cjsInteropLoads=(globalThis.cjsInteropLoads||0)+1;module.exports={value:41};module.exports.update=()=>module.exports.value++;",
+        "module.exports=7;",
+        "module.exports=n=>n+1;",
+        "globalThis.cjsFailureCount=(globalThis.cjsFailureCount||0)+1;throw(globalThis.cjsFailureReason||(globalThis.cjsFailureReason=new Error('cjs synthetic failure')));",
+        "{\"message\":\"한글\",\"value\":42}",
+        "module.exports=require('./data.json');",
+        "globalThis.cjsBadLinkRan=true;module.exports=1;",
+        "import{parentPort,workerData,isMainThread,threadId}from'node:worker_threads';import{readFile}from'node:fs/promises';const b=await readFile(workerData.path);parentPort.postMessage({size:b.length,main:isMainThread,id:threadId});",
+        "export const value=99;",
+        "{broken JSON}",
+        "module.exports={};",
+        "exports.a=1;exports.b=require('./cycle-b.cjs').b;",
+        "exports.b=2;exports.a=require('./cycle-a.cjs').a;",
+        "import{missing}from'./side-effect.cjs';console.log('wrong');",
+        "",
+        "module.exports=require('./entry.mjs');",
+        "module.exports={value:13,then(){throw Error('must not assimilate CJS exports')}};"
+    ];
+    var ready: bool = true;
+    for (var i: i64 = 0; i < 17; i++) {
+        ready = write(join(root, names[i]) as str, sources[i] as ptr<u8>, mem_len_cstr(sources[i])) >= 0 && ready;
+    }
+    check("prepare real CommonJS JSON and ESM Worker inputs", ready);
+    if (ready) {
+        esm_case(root, "ESM builtin default named exports and aliases share one namespace", "import fs,{readFileSync}from'node:fs';import*as alias from'fs';import path from'path/posix';import p from'node:path';console.log(fs.readFileSync===readFileSync,alias.default===fs,alias.readFileSync===readFileSync,path===p);",
+            "true true true true\n", 0, "");
+        esm_case(root, "ESM fs promises exports perform actual asynchronous I/O", "import f,{stat}from'node:fs/promises';import*as a from'fs/promises';console.log(f===a.default,stat===a.stat,(await stat(import.meta.filename)).isFile());",
+            "true true true\n", 0, "");
+        esm_case(root, "ESM CommonJS defaults preserve primitives functions cache and aliases", "import a,*as n from'./value.cjs';import b from'./value.cjs';import count from'./primitive.cjs';import fn from'./callable.cjs';console.log(a===b,n.default===a,n['module.exports']===a,cjsInteropLoads,a.value,count,fn(4));a.update();console.log(b.value);",
+            "true true true 1 41 7 5\n42\n", 0, "");
+        esm_case(root, "ESM deferred CommonJS uses the existing cycle cache", "import a from'./cycle-a.cjs';import b from'./cycle-b.cjs';console.log(a.a,a.b,b.a,b.b);",
+            "1 2 1 2\n", 0, "");
+        esm_case(root, "ESM link failures do not execute deferred CommonJS bodies", "await import('./bad-link.mjs').catch(e=>console.log(e instanceof SyntaxError,globalThis.cjsBadLinkRan===undefined));",
+            "true true\n", 0, "");
+        esm_case(root, "ESM CommonJS evaluation failures keep identity and run only once", "let first;await import('./failure.cjs').catch(e=>first=e);await import('./failure.cjs').catch(e=>console.log(e===first,e.message.includes('cjs synthetic failure'),cjsFailureCount));",
+            "true true 1\n", 0, "");
+        esm_case(root, "ESM CommonJS exports are not assimilated as a Promise", "import value from'./thenable.cjs';console.log(value.value,typeof value.then);",
+            "13 function\n", 0, "");
+        esm_case(root, "ESM JSON attributes use wjson and share the CommonJS JSON cache", "import data from'./data.json'with{type:'json'};import same from'./json-helper.cjs';console.log(data===same,data.message,data.value);",
+            "true 한글 42\n", 0, "");
+        esm_case(root, "ESM JSON does not fall back to replaced engine JSON globals", "JSON.parse=()=>{throw Error('poison')};const n=await import('./data.json',{with:{type:'json'}});console.log(n.default.value);",
+            "42\n", 0, "");
+        esm_case(root, "ESM JSON rejects missing wrong attributes and malformed input", "const checks=[()=>import('./data.json'),()=>import('./counter.mjs',{with:{type:'json'}}),()=>import('./broken.json',{with:{type:'json'}})];const values=await Promise.all(checks.map(run=>run().then(()=>false,e=>e instanceof Error)));console.log(values.length,values.every(Boolean));",
+            "3 true\n", 0, "");
+        esm_case(root, "ESM refuses synthetic names that were not declared", "import{value}from'./empty.cjs';console.log('wrong');",
+            "", 1, "SyntaxError");
+        esm_case(root, "ESM CommonJS cannot require the active ESM main as an empty cache entry", "await import('./es-importer.cjs').catch(e=>console.log(e.code));",
+            "ERR_REQUIRE_ESM\n", 0, "");
+        esm_case(root, "ESM file URLs decode UTF8 and localhost while preserving identity", "const a=await import('./space 한글.mjs');const u=import.meta.url.replace(/entry.mjs$/,'space%20%ED%95%9C%EA%B8%80.mjs');const b=await import(u),c=await import(u.replace('file:///','file://localhost/'));console.log(a===b,b===c,c.value);",
+            "true true 99\n", 0, "");
+        esm_case(root, "ESM file URLs reject foreign hosts malformed bytes separators and suffixes", "const paths=['file://remote/tmp/a.mjs','file:///tmp/%2fa.mjs','file:///tmp/%00a.mjs','file:///tmp/%zz.mjs','file:///tmp/%ff.mjs','file:///tmp/a.mjs?x','file:///tmp/a.mjs#x'];const v=await Promise.all(paths.map(p=>import(p).then(()=>false,e=>e instanceof TypeError)));console.log(v.length,v.every(Boolean));",
+            "7 true\n", 0, "");
+        esm_case(root, "ESM Worker imports builtins and completes top-level asynchronous files", "import{Worker}from'node:worker_threads';const path=import.meta.filename.replace(/entry.mjs$/,'worker.mjs');const w=new Worker(path,{workerData:{path:import.meta.filename}});w.on('message',v=>console.log(v.size>0,v.main,v.id===w.threadId));w.on('exit',c=>console.log(c));",
+            "true false true\n0\n", 0, "");
+        test("eval dynamic imports can load builtins without a file referrer", "import('node:fs').then(n=>console.log(n.default===require('fs'),n.readFileSync===require('fs').readFileSync));",
+            "true true\n", 0, "");
+    }
+    for (var i: i64 = 0; i < 17; i++) {
+        remove(join(root, names[i]) as str);
+    }
+    check("synthetic ESM fixture directory removed", rmdir(root) == 0);
+}

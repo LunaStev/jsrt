@@ -1,0 +1,458 @@
+// wjson serialization, replacer policy and cycle handling.
+import("./json_support")::{intrinsic, get, callable, error, call, is_array, length_of, own_keys, data_property,
+    DEPTH_LIMIT, ITEM_LIMIT};
+import("./json_format")::{format_json};
+import("wjson")::{JsonDoc, JsonWriter, JSON_STRICT, json_parse_bytes, json_ok, json_root, json_free,
+    json_write_value, json_writer_new, json_writer_free, json_writer_finish, json_writer_len, json_str_is_null,
+    json_begin_array, json_end_array, json_begin_object, json_end_object, json_write_null, json_write_bool,
+    json_write_str_bytes, json_key_bytes, json_write_raw_bytes};
+import("./wjson_text")::{JsonText, JSON_TEXT_LIMIT, encode_json_text, free_json_text, decode_json_text};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::math::float")::{float_to_bits_f64};
+extern(c, "wr_type") fun wr_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_undefined") fun wr_undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun wr_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_boolean") fun wr_boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_number") fun wr_number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_string_value") fun wr_string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_to_boolean") fun wr_to_boolean(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_to_number") fun wr_to_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_to_object") fun wr_to_object(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_to_string") fun wr_to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun wr_protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_equal") fun wr_equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_utf16") fun wr_string_utf16(text: ptr<u16>, length: i64) -> ptr<u8>;
+extern(c, "wr_string_characters") fun wr_string_characters(text: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_length") fun wr_string_length(text: ptr<u8>) -> i64;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_object") fun wr_object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun wr_set_prototype(ctx: ptr<u8>, object: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_get") fun wr_get(ctx: ptr<u8>, obj: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set") fun wr_set(ctx: ptr<u8>, obj: ptr<u8>, key: ptr<u8>, value: ptr<u8>, flags: u32,
+    ex: ptr<ptr<u8>>);
+extern(c, "wr_has") fun wr_has(ctx: ptr<u8>, obj: ptr<u8>, key: ptr<u8>) -> bool;
+extern(c, "wr_get_index") fun wr_get_index(ctx: ptr<u8>, obj: ptr<u8>, index: u32, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_call") fun wr_call(ctx: ptr<u8>, fn: ptr<u8>, this_value: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+// Brand probes invoke captured intrinsics; a failed probe does not run user
+// conversion hooks and its TypeError is deliberately discarded.
+pub fun boxed_kind(ctx: ptr<u8>, value: ptr<u8>, primitive: ptr<ptr<u8>>) -> i32 {
+    var methods: array<ptr<u8>, 4> = [deref intrinsic(ctx, 8), deref intrinsic(ctx, 9), deref intrinsic(ctx,
+        10), deref intrinsic(ctx, 11)];
+    var kinds: array<i32, 4> = [3, 4, 2, 7];
+    for (var i: i64 = 0; i < 4; i++) {
+        var ignored: ptr<u8> = null;
+        var result: ptr<u8> = wr_call(ctx, methods[i], value, 0, null, &ignored);
+        if (ignored == null) {
+            deref primitive = result;
+            return kinds[i];
+        }
+    }
+    return 5;
+}
+
+pub struct Serializer {
+    ctx: ptr<u8>;
+    writer: JsonWriter;
+    replacer: ptr<u8>;
+    properties: ptr<ptr<u8>>;
+    property_count: i64;
+    property_capacity: i64;
+    has_properties: bool;
+    stack: ptr<ptr<u8>>;
+    depth: i64;
+    remaining: i64;
+    ex: ptr<ptr<u8>>;
+}
+
+pub fun write_string(s: ptr<Serializer>, value: ptr<u8>, key: bool) -> bool {
+    var text: JsonText = encode_json_text(deref s.ctx, value, false, deref s.ex);
+    if (text.data == null) {
+        error(deref s.ctx, deref s.ex, 2, "cannot represent wjson string (4 Mi unit limit)");
+        return false;
+    }
+    var ok: bool = false;
+    if (key) {
+        ok = json_key_bytes(&deref s.writer, text.data, text.len);
+    } else {
+        ok = json_write_str_bytes(&deref s.writer, text.data, text.len);
+    }
+    free_json_text(text);
+    return ok;
+}
+
+// Returns 0 for an omitted value, 1 for written data, -1 on failure.
+pub fun serialize(s: ptr<Serializer>, holder: ptr<u8>, key: ptr<u8>, member: bool, array_item: bool) -> i32 {
+    var ctx: ptr<u8> = deref s.ctx;
+    var ex: ptr<ptr<u8>> = deref s.ex;
+    if (deref s.remaining <= 0) {
+        error(ctx, ex, 2, "wjson traversal limit exceeded");
+        return -1;
+    }
+    deref s.remaining = deref s.remaining - 1;
+    var value: ptr<u8> = wr_get(ctx, holder, key, ex);
+    if (deref ex != null) {
+        return -1;
+    }
+    wr_protect(ctx, value);
+    var kind: i32 = wr_type(ctx, value);
+    if (kind == 5 || kind == 7) {
+        var object: ptr<u8> = wr_to_object(ctx, value, ex);
+        if (deref ex == null) {
+            wr_protect(ctx, object);
+            var method: ptr<u8> = get(ctx, object, "toJSON", ex);
+            if (deref ex == null && callable(ctx, method)) {
+                var args: array<ptr<u8>, 1> = [wr_string_value(ctx, key)];
+                var next: ptr<u8> = call(ctx, method, value, &args[0], 1, ex);
+                if (deref ex == null) {
+                    wr_protect(ctx, next);
+                    wr_unprotect(ctx, value);
+                    value = next;
+                }
+            }
+            wr_unprotect(ctx, object);
+        }
+    }
+    if (deref ex == null && deref s.replacer != null) {
+        var args: array<ptr<u8>, 2> = [wr_string_value(ctx, key), value];
+        var next: ptr<u8> = call(ctx, deref s.replacer, holder, &args[0], 2, ex);
+        if (deref ex == null) {
+            wr_protect(ctx, next);
+            wr_unprotect(ctx, value);
+            value = next;
+        }
+    }
+    kind = wr_type(ctx, value);
+    if (deref ex == null && kind == 5) {
+        var unboxed: ptr<u8> = null;
+        var box: i32 = boxed_kind(ctx, value, &unboxed);
+        if (box == 3) {
+            unboxed = wr_number(ctx, wr_to_number(ctx, value, ex));
+        } else if (box == 4) {
+            var text: ptr<u8> = wr_to_string(ctx, value, ex);
+            if (text != null) {
+                unboxed = wr_string_value(ctx, text);
+                wr_string_release(text);
+            }
+        }
+        if (box != 5 && deref ex == null) {
+            wr_protect(ctx, unboxed);
+            wr_unprotect(ctx, value);
+            value = unboxed;
+            kind = box;
+        }
+    }
+    var status: i32 = -1;
+    if (deref ex == null) {
+        if (kind == 7) {
+            error(ctx, ex, 0, "cannot serialize a BigInt with wjson");
+        } else if (kind == 0 || kind == 6 || callable(ctx, value)) {
+            status = 0;
+            if (array_item) {
+                if (json_write_null(&deref s.writer)) {
+                    status = 1;
+                } else {
+                    status = -1;
+                }
+            }
+        } else {
+            var ok: bool = true;
+            if (member) {
+                ok = write_string(s, wr_string_value(ctx, key), true);
+            }
+            if (ok && kind == 1) {
+                ok = json_write_null(&deref s.writer);
+            } else if (ok && kind == 2) {
+                ok = json_write_bool(&deref s.writer, wr_to_boolean(ctx, value));
+            } else if (ok && kind == 3) {
+                var n: f64 = wr_to_number(ctx, value, ex);
+                if (((float_to_bits_f64(n) >> 52) & 2047) == 2047) {
+                    ok = json_write_null(&deref s.writer);
+                } else {
+                    // Engine ToString provides ECMAScript's number spelling;
+                    // wjson retains the valid numeric lexeme in its writer.
+                    var number: JsonText = encode_json_text(ctx, value, false, ex);
+                    ok = number.data != null && json_write_raw_bytes(&deref s.writer, number.data, number.len);
+                    free_json_text(number);
+                }
+            } else if (ok && kind == 4) {
+                ok = write_string(s, value, false);
+            } else if (ok && kind == 5) {
+                ok = serialize_object(s, value);
+            }
+            if (ok) {
+                status = 1;
+            }
+        }
+    }
+    wr_unprotect(ctx, value);
+    if (json_writer_len(&deref s.writer) > JSON_TEXT_LIMIT) {
+        error(ctx, ex, 2, "wjson output limit exceeded (4 MiB)");
+        status = -1;
+    }
+    if (deref ex != null) {
+        return -1;
+    }
+    return status;
+}
+
+pub fun serialize_object(s: ptr<Serializer>, value: ptr<u8>) -> bool {
+    var ctx: ptr<u8> = deref s.ctx;
+    var ex: ptr<ptr<u8>> = deref s.ex;
+    var ancestors: ptr<ptr<u8>> = deref s.stack;
+    if (deref s.depth >= DEPTH_LIMIT) {
+        error(ctx, ex, 2, "wjson depth limit exceeded (128)");
+        return false;
+    }
+    for (var i: i64 = 0; i < deref s.depth; i++) {
+        if (wr_equal(ctx, ancestors[i], value)) {
+            error(ctx, ex, 0, "cyclic object cannot be serialized by wjson");
+            return false;
+        }
+    }
+    if (deref intrinsic(ctx, 4) != null) {
+        var raw_args: array<ptr<u8>, 1> = [value];
+        var raw: ptr<u8> = call(ctx, deref intrinsic(ctx, 4), wr_undefined(ctx), &raw_args[0], 1, ex);
+        if (deref ex != null) {
+            return false;
+        }
+        if (wr_to_boolean(ctx, raw)) {
+            var input_value: ptr<u8> = get(ctx, value, "rawJSON", ex);
+            if (deref ex != null) {
+                return false;
+            }
+            var text: JsonText = encode_json_text(ctx, input_value, true, ex);
+            if (text.data == null) {
+                return false;
+            }
+            var doc: JsonDoc = json_parse_bytes(text.data, text.len, DEPTH_LIMIT as i32, JSON_STRICT);
+            free_json_text(text);
+            var ok: bool = json_ok(doc) && json_write_value(&deref s.writer, json_root(doc));
+            json_free(&doc);
+            return ok;
+        }
+    }
+    var array: bool = is_array(ctx, value, ex);
+    if (deref ex != null) {
+        return false;
+    }
+    deref ancestors[deref s.depth] = value;
+    deref s.depth = deref s.depth + 1;
+    var keys: ptr<u8> = null;
+    var count: i64 = 0;
+    var ok: bool = false;
+    if (array) {
+        ok = json_begin_array(&deref s.writer);
+        count = length_of(ctx, value, ex);
+    } else {
+        ok = json_begin_object(&deref s.writer);
+        if (deref s.has_properties) {
+            count = deref s.property_count;
+        } else {
+            keys = own_keys(ctx, value, ex);
+            if (deref ex == null) {
+                wr_protect(ctx, keys);
+                count = length_of(ctx, keys, ex);
+            }
+        }
+    }
+    for (var i: i64 = 0; i < count && ok && deref ex == null; i++) {
+        var name: ptr<u8> = null;
+        if (array) {
+            name = wr_to_string(ctx, wr_number(ctx, i as f64), ex);
+        } else if (deref s.has_properties) {
+            var properties: ptr<ptr<u8>> = deref s.properties;
+            name = properties[i];
+        } else {
+            name = wr_to_string(ctx, wr_get_index(ctx, keys, i as u32, ex), ex);
+        }
+        if (deref ex == null) {
+            ok = serialize(s, value, name, !array, array) >= 0;
+        }
+        if (array || !deref s.has_properties) {
+            if (name != null) {
+                wr_string_release(name);
+            }
+        }
+    }
+    if (keys != null) {
+        wr_unprotect(ctx, keys);
+    }
+    if (ok && deref ex == null) {
+        if (array) {
+            ok = json_end_array(&deref s.writer);
+        } else {
+            ok = json_end_object(&deref s.writer);
+        }
+    }
+    deref s.depth = deref s.depth - 1;
+    return ok && deref ex == null;
+}
+
+pub fun property_list(s: ptr<Serializer>, replacer: ptr<u8>) -> bool {
+    var ctx: ptr<u8> = deref s.ctx;
+    var ex: ptr<ptr<u8>> = deref s.ex;
+    var count: i64 = length_of(ctx, replacer, ex);
+    if (deref ex != null) {
+        return false;
+    }
+    var properties: ptr<ptr<u8>> = mem_alloc((count + 1) * 8) as ptr<ptr<u8>>;
+    if (properties == null) {
+        error(ctx, ex, 2, "cannot allocate wjson property list");
+        return false;
+    }
+    deref s.properties = properties;
+    deref s.property_capacity = count;
+    deref s.has_properties = true;
+    var seen: ptr<u8> = wr_object(ctx, null, null);
+    wr_protect(ctx, seen);
+    wr_set_prototype(ctx, seen, wr_null(ctx));
+    for (var i: i64 = 0; i < count && deref ex == null; i++) {
+        var item: ptr<u8> = wr_get_index(ctx, replacer, i as u32, ex);
+        if (deref ex != null) {
+            break;
+        }
+        wr_protect(ctx, item);
+        var kind: i32 = wr_type(ctx, item);
+        if (kind == 5) {
+            var ignored: ptr<u8> = null;
+            kind = boxed_kind(ctx, item, &ignored);
+        }
+        if (kind == 3 || kind == 4) {
+            var key: ptr<u8> = wr_to_string(ctx, item, ex);
+            if (deref ex == null) {
+                var found: bool = wr_has(ctx, seen, key);
+                if (found) {
+                    wr_string_release(key);
+                } else {
+                    wr_set(ctx, seen, key, wr_boolean(ctx, true), 0, ex);
+                    deref properties[deref s.property_count] = key;
+                    deref s.property_count = deref s.property_count + 1;
+                }
+            }
+        }
+        wr_unprotect(ctx, item);
+    }
+    wr_unprotect(ctx, seen);
+    return deref ex == null;
+}
+
+pub fun gap_string(ctx: ptr<u8>, space: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    wr_protect(ctx, space);
+    var kind: i32 = wr_type(ctx, space);
+    if (kind == 5) {
+        var primitive: ptr<u8> = null;
+        kind = boxed_kind(ctx, space, &primitive);
+    }
+    var units: array<u16, 10>;
+    var count: i64 = 0;
+    if (kind == 3) {
+        var n: f64 = wr_to_number(ctx, space, ex);
+        if (n >= 10.0) {
+            count = 10;
+        } else if (n > 0.0) {
+            count = n as i64;
+        }
+        for (var i: i64 = 0; i < count; i++) {
+            units[i] = 32;
+        }
+    } else if (kind == 4) {
+        var text: ptr<u8> = wr_to_string(ctx, space, ex);
+        if (text != null) {
+            count = wr_string_length(text);
+            if (count > 10) {
+                count = 10;
+            }
+            var data: ptr<u16> = wr_string_characters(text);
+            for (var i: i64 = 0; i < count; i++) {
+                units[i] = data[i];
+            }
+            wr_string_release(text);
+        }
+    }
+    wr_unprotect(ctx, space);
+    if (deref ex != null) {
+        return null;
+    }
+    return wr_string_utf16(&units[0], count);
+}
+
+pub fun stringify_json(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var ancestors: array<ptr<u8>, 128>;
+    var s: Serializer = Serializer {
+        ctx: ctx,
+        writer: json_writer_new(0),
+        replacer: null,
+        properties: null,
+        property_count: 0,
+        property_capacity: 0,
+        has_properties: false,
+        stack: &ancestors[0],
+        depth: 0,
+        remaining: ITEM_LIMIT,
+        ex: ex
+    };
+    if (count > 1 && callable(ctx, args[1])) {
+        s.replacer = args[1];
+    } else if (count > 1 && is_array(ctx, args[1], ex)) {
+        property_list(&s, args[1]);
+    }
+    var space: ptr<u8> = wr_undefined(ctx);
+    if (count > 2) {
+        space = args[2];
+    }
+    var gap: ptr<u8> = null;
+    if (deref ex == null) {
+        gap = gap_string(ctx, space, ex);
+    }
+    var result: ptr<u8> = wr_undefined(ctx);
+    var holder: ptr<u8> = wr_object(ctx, null, null);
+    wr_protect(ctx, holder);
+    var key: ptr<u8> = wr_string_utf8("");
+    var input_value: ptr<u8> = wr_undefined(ctx);
+    if (count > 0) {
+        input_value = args[0];
+    }
+    if (deref ex == null) {
+        data_property(ctx, holder, key, input_value, ex);
+    }
+    var status: i32 = -1;
+    if (deref ex == null) {
+        status = serialize(&s, holder, key, false, false);
+    }
+    if (status > 0 && deref ex == null) {
+        var output: str = json_writer_finish(&s.writer);
+        if (!json_str_is_null(output)) {
+            var text: ptr<u8> = decode_json_text(output as ptr<u8>, json_writer_len(&s.writer), true);
+            if (text != null) {
+                result = format_json(ctx, text, gap, ex);
+                wr_string_release(text);
+            } else {
+                error(ctx, ex, 2, "cannot allocate wjson result");
+            }
+        } else {
+            error(ctx, ex, 2, "wjson writer failed");
+        }
+    } else if (status < 0 && deref ex == null) {
+        error(ctx, ex, 2, "wjson writer failed");
+    }
+    wr_string_release(key);
+    wr_unprotect(ctx, holder);
+    if (gap != null) {
+        wr_string_release(gap);
+    }
+    if (s.properties != null) {
+        for (var i: i64 = 0; i < s.property_count; i++) {
+            wr_string_release(s.properties[i]);
+        }
+        mem_free(s.properties as ptr<u8>, (s.property_capacity + 1) * 8);
+    }
+    json_writer_free(&s.writer);
+    if (deref ex != null) {
+        return wr_undefined(ctx);
+    }
+    return result;
+}

@@ -1,0 +1,542 @@
+// Worker lifecycle and JS policy live in Wave. Only native snapshots cross threads.
+import("./worker_state")::{WorkerLink, WorkerSlot, WorkerState, Message, SLOT, PATH_CAP, worker_state,
+    new_link, free_link, stopped, stop_link, lock, unlock, reserve_message, publish_message, pop_message};
+import("./clone")::{snapshot_clone, restore_clone, free_clone, clone_failure, CloneGraph};
+import("./config")::{WORKER_LIMIT};
+import("./context_state")::{allocate_context_slot, release_context_slot};
+import("./values")::{get, define, capture, plain, text, fail};
+import("./collections")::{weak_map, weak_get, weak_set, length, at};
+import("./events")::{event_parent, emit_named, has_named_listeners};
+import("./system")::{copy_host_path};
+import("std::mem::alloc")::{mem_alloc_zeroed, mem_alloc, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::mem::cstr")::{mem_eq_cstr};
+import("std::env::cwd")::{env_getcwd};
+import("std::path::copy")::{path_join2};
+extern(c, "pthread_create") fun create_thread(thread: ptr<u64>, attr: ptr<u8>, callback: ptr<u8>, data: ptr<u8>) -> i32;
+extern(c, "pthread_join") fun join_thread(thread: u64, result: ptr<ptr<u8>>) -> i32;
+extern(c, "jsrt_runtime_worker_callback") fun thread_callback() -> ptr<u8>;
+extern(c, "jsrt_worker_api_callback") fun callback(code: i32) -> ptr<u8>;
+extern(c, "jsrt_worker_engine_available") fun engine_available() -> bool;
+extern(c, "jsrt_prepare_worker_termination") fun prepare_entry(group: ptr<u8>) -> bool;
+extern(c, "JSContextGetGroup") fun context_group(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, value: ptr<u8>, parent: ptr<u8>);
+extern(c, "jsrt_create_callable_constructor") fun callable_constructor(ctx: ptr<u8>, call: ptr<u8>, construct: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_utf16") fun utf16(value: ptr<u16>, count: i64) -> ptr<u8>;
+extern(c, "wr_string_value") fun string_value(ctx: ptr<u8>, value: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_promise") fun promise(ctx: ptr<u8>, resolve: ptr<ptr<u8>>, reject: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+const CONSTRUCT: i32 = 0;
+const POST: i32 = 1;
+const TERMINATE: i32 = 2;
+const CLOSE: i32 = 3;
+const CALL: i32 = 4;
+
+fun method(ctx: ptr<u8>, name: str, code: i32) -> ptr<u8> {
+    var key: ptr<u8> = utf8(name);
+    var fn: ptr<u8> = function(ctx, key, callback(code));
+    release(key);
+    protect(ctx, fn);
+    return fn;
+}
+pub fun install_workers(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (!allocate_context_slot(ctx, SLOT, size_of<WorkerState>() as i64)) {
+        return false;
+    }
+    var state: ptr<WorkerState> = worker_state(ctx);
+    deref state.slots = mem_alloc_zeroed(WORKER_LIMIT * (size_of<WorkerSlot>() as i64)) as ptr<WorkerSlot>;
+    if (deref state.slots == null) {
+        return false;
+    }
+    deref state.next_id = 1;
+    deref state.api = object(ctx, null, null);
+    protect(ctx, deref state.api);
+    deref state.records = weak_map(ctx, ex);
+    protect(ctx, deref state.records);
+    var ctor: ptr<u8> = callable_constructor(ctx, callback(CALL), callback(CONSTRUCT));
+    if (ctor == null) {
+        fail(ctx, ex, 1, "matching callable-constructor engine ABI is unavailable");
+        return false;
+    }
+    protect(ctx, ctor);
+    deref state.prototype = get(ctx, ctor, "prototype", ex);
+    protect(ctx, deref state.prototype);
+    prototype(ctx, deref state.prototype, event_parent(ctx));
+    deref state.post = method(ctx, "postMessage", POST);
+    deref state.terminate = method(ctx, "terminate", TERMINATE);
+    deref state.close = method(ctx, "close", CLOSE);
+    var obj: ptr<u8> = get(ctx, global(ctx), "Object", ex);
+    deref state.keys = capture(ctx, obj, "keys", ex);
+    define(ctx, deref state.prototype, "postMessage", deref state.post, ex, true);
+    define(ctx, deref state.prototype, "terminate", deref state.terminate, ex, true);
+    define(ctx, deref state.prototype, "constructor", ctor, ex, true);
+    define(ctx, deref state.api, "Worker", ctor, ex, true);
+    define(ctx, ctor, "name", text(ctx, "Worker"), ex, false);
+    unprotect(ctx, ctor);
+    define(ctx, deref state.api, "isMainThread", boolean(ctx, true), ex, true);
+    define(ctx, deref state.api, "threadId", number(ctx, 0.0), ex, true);
+    define(ctx, deref state.api, "parentPort", js_null(ctx), ex, true);
+    define(ctx, deref state.api, "workerData", undefined(ctx), ex, true);
+    return deref ex == null;
+}
+export(c) fun jsrt_worker_call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    fail(ctx, ex, 1, "Worker must be called with new");
+    return undefined(ctx);
+}
+pub fun worker_module(ctx: ptr<u8>) -> ptr<u8> {
+    var state: ptr<WorkerState> = worker_state(ctx);
+    return deref state.api;
+}
+fun options(ctx: ptr<u8>, value: ptr<u8>, eval: ptr<bool>, data: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) {
+    if (kind(ctx, value) == 0) {
+        return;
+    }
+    if (kind(ctx, value) != 5) {
+        fail(ctx, ex, 1, "Worker options must be an object");
+        return;
+    }
+    var state: ptr<WorkerState> = worker_state(ctx);
+    var arg: array<ptr<u8>, 1> = [value];
+    var keys: ptr<u8> = call(ctx, deref state.keys, null, 1, &arg[0], ex);
+    if (deref ex != null) {
+        return;
+    }
+    protect(ctx, keys);
+    for (var i: i64 = 0; i < length(ctx, keys, ex) && deref ex == null; i++) {
+        var key: ptr<u8> = at(ctx, keys, i, ex);
+        if (!equal(ctx, key, text(ctx, "eval")) && !equal(ctx, key, text(ctx, "workerData"))) {
+            fail(ctx, ex, 1, "unsupported Worker option");
+        }
+    }
+    unprotect(ctx, keys);
+    if (deref ex != null) {
+        return;
+    }
+    var flag: ptr<u8> = get(ctx, value, "eval", ex);
+    if (deref ex != null) {
+        return;
+    }
+    if (kind(ctx, flag) != 0 && kind(ctx, flag) != 2) {
+        fail(ctx, ex, 1, "Worker eval must be a boolean");
+        return;
+    }
+    deref eval = truth(ctx, flag);
+    deref data = get(ctx, value, "workerData", ex);
+}
+fun entry_path(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var entry_bytes: array<u8, 8192>;
+    if (copy_host_path(ctx, value, &entry_bytes[0], PATH_CAP, ex) < 0) {
+        return null;
+    }
+    var result: ptr<u8> = mem_alloc(PATH_CAP);
+    if (result == null) {
+        fail(ctx, ex, 0, "cannot allocate Worker entry path");
+        return null;
+    }
+    var base: array<u8, 8192>;
+    var status: i64 = env_getcwd(&base[0], PATH_CAP);
+    if (status >= 0) {
+        if (entry_bytes[0] == 47) {
+            status = path_join2(result, PATH_CAP as i32, "/", &entry_bytes[0] as str) as i64;
+        } else {
+            status = path_join2(result, PATH_CAP as i32, &base[0] as str, &entry_bytes[0] as str) as i64;
+        }
+    }
+    if (status < 0) {
+        mem_free(result, PATH_CAP);
+        fail(ctx, ex, 0, "cannot resolve Worker entry path");
+        return null;
+    }
+    return result;
+}
+export(c) fun jsrt_worker_construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<WorkerState> = worker_state(ctx);
+    if (deref state.parent != null) {
+        fail(ctx, ex, 0, "nested Workers are not implemented");
+        return null;
+    }
+    if (!engine_available()) {
+        fail(ctx, ex, 0, "Worker requires the matching engine termination ABI");
+        return null;
+    }
+    var slot: ptr<WorkerSlot> = null;
+    for (var i: i64 = 0; i < WORKER_LIMIT; i++) {
+        var candidate: ptr<WorkerSlot> = deref state.slots + i;
+        if (!deref candidate.reserved && deref candidate.link == null) {
+            slot = candidate;
+            deref slot.reserved = true;
+            break;
+        }
+    }
+    if (slot == null) {
+        fail(ctx, ex, 2, "Worker limit exceeded");
+        return null;
+    }
+    var link: ptr<WorkerLink> = new_link();
+    var eval: bool = false;
+    var data: ptr<u8> = undefined(ctx);
+    if (link == null) {
+        fail(ctx, ex, 0, "cannot allocate Worker state");
+    } else {
+        deref link.id = deref state.next_id;
+        deref state.next_id += 1;
+        if (count < 1 || kind(ctx, args[0]) != 4) {
+            fail(ctx, ex, 1, "Worker entry must be a string");
+        } else if (count > 1) {
+            options(ctx, args[1], &eval, &data, ex);
+        }
+        if (deref ex == null) {
+            deref link.data = snapshot_clone(ctx, data, ex);
+        }
+        if (deref ex == null) {
+            if (eval) {
+                deref link.source = snapshot_clone(ctx, args[0], ex);
+            } else {
+                deref link.path = entry_path(ctx, args[0], ex);
+            }
+        }
+    }
+    var owner: ptr<u8> = null;
+    if (deref ex == null) {
+        owner = object(ctx, null, null);
+        protect(ctx, owner);
+        prototype(ctx, owner, deref state.prototype);
+        var record: ptr<u8> = plain(ctx);
+        protect(ctx, record);
+        define(ctx, record, "exitCode", undefined(ctx), ex, true);
+        define(ctx, record, "termination", undefined(ctx), ex, true);
+        weak_set(ctx, deref state.records, owner, record, ex);
+        unprotect(ctx, record);
+        define(ctx, owner, "threadId", number(ctx, deref link.id as f64), ex, true);
+    }
+    if (deref ex == null && create_thread(&(deref link.thread), null, thread_callback(), link as ptr<u8>) != 0) {
+        fail(ctx, ex, 0, "cannot start Worker thread");
+    }
+    if (deref ex != null) {
+        if (owner != null) {
+            unprotect(ctx, owner);
+        }
+        free_link(link);
+        deref slot.reserved = false;
+        return null;
+    }
+    deref link.started = true;
+    deref slot.link = link;
+    deref slot.owner = owner;
+    deref slot.online = false;
+    deref slot.reserved = false;
+    return owner;
+}
+fun find_slot(ctx: ptr<u8>, receiver: ptr<u8>) -> ptr<WorkerSlot> {
+    var state: ptr<WorkerState> = worker_state(ctx);
+    for (var i: i64 = 0; i < WORKER_LIMIT; i++) {
+        var slot: ptr<WorkerSlot> = deref state.slots + i;
+        if (deref slot.owner != null && equal(ctx, deref slot.owner, receiver)) {
+            return slot;
+        }
+    }
+    return null;
+}
+export(c) fun jsrt_worker_post(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<WorkerState> = worker_state(ctx);
+    var outgoing: bool = deref state.parent != null && equal(ctx, receiver, deref state.port);
+    var link: ptr<WorkerLink> = null;
+    if (outgoing) {
+        link = deref state.parent;
+    } else {
+        var slot: ptr<WorkerSlot> = find_slot(ctx, receiver);
+        if (slot != null) {
+            link = deref slot.link;
+        } else if (kind(ctx, receiver) == 5) {
+            var record: ptr<u8> = weak_get(ctx, deref state.records, receiver, ex);
+            if (deref ex == null && kind(ctx, record) == 5) {
+                return undefined(ctx);
+            }
+        }
+    }
+    if (link == null) {
+        fail(ctx, ex, 1, "invalid Worker or parentPort receiver");
+        return undefined(ctx);
+    }
+    if (count < 1 || (count > 1 && kind(ctx, args[1]) != 0)) {
+        clone_failure(ctx, ex, "postMessage requires a value; transfer lists are not implemented");
+        return undefined(ctx);
+    }
+    var entry: ptr<Message> = reserve_message(link, outgoing);
+    if (entry == null) {
+        lock(deref link.mutex);
+        var closed: bool = deref link.stop || deref link.done || deref link.port_closed;
+        unlock(deref link.mutex);
+        if (!closed) {
+            fail(ctx, ex, 2, "Worker message queue limit exceeded");
+        }
+        return undefined(ctx);
+    }
+    var graph: ptr<CloneGraph> = snapshot_clone(ctx, args[0], ex);
+    if (!publish_message(link, entry, graph)) {
+        free_clone(graph);
+    }
+    return undefined(ctx);
+}
+export(c) fun jsrt_worker_terminate(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<WorkerState> = worker_state(ctx);
+    if (kind(ctx, receiver) != 5) {
+        fail(ctx, ex, 1, "invalid Worker receiver");
+        return undefined(ctx);
+    }
+    var record: ptr<u8> = weak_get(ctx, deref state.records, receiver, ex);
+    if (deref ex != null || kind(ctx, record) != 5) {
+        fail(ctx, ex, 1, "invalid Worker receiver");
+        return undefined(ctx);
+    }
+    var cached: ptr<u8> = get(ctx, record, "termination", ex);
+    if (kind(ctx, cached) != 0 || deref ex != null) {
+        return cached;
+    }
+    var resolve: ptr<u8> = null;
+    var reject: ptr<u8> = null;
+    var result: ptr<u8> = promise(ctx, &resolve, &reject, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    protect(ctx, result);
+    protect(ctx, resolve);
+    define(ctx, record, "termination", result, ex, true);
+    var slot: ptr<WorkerSlot> = find_slot(ctx, receiver);
+    if (slot != null) {
+        deref slot.resolve = resolve;
+        stop_link(deref slot.link);
+    } else {
+        var value: array<ptr<u8>, 1> = [get(ctx, record, "exitCode", ex)];
+        if (deref ex == null) {
+            call(ctx, resolve, null, 1, &value[0], ex);
+        }
+        unprotect(ctx, resolve);
+    }
+    unprotect(ctx, result);
+    return result;
+}
+export(c) fun jsrt_worker_close(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<WorkerState> = worker_state(ctx);
+    if (deref state.parent == null || !equal(ctx, receiver, deref state.port)) {
+        fail(ctx, ex, 1, "invalid parentPort receiver");
+        return undefined(ctx);
+    }
+    var link: ptr<WorkerLink> = deref state.parent;
+    deref state.port_closed = true;
+    lock(deref link.mutex);
+    deref link.port_closed = true;
+    unlock(deref link.mutex);
+    return undefined(ctx);
+}
+pub fun bind_worker(ctx: ptr<u8>, link: ptr<WorkerLink>, ex: ptr<ptr<u8>>) -> bool {
+    var state: ptr<WorkerState> = worker_state(ctx);
+    deref state.parent = link;
+    deref state.port = object(ctx, null, null);
+    protect(ctx, deref state.port);
+    prototype(ctx, deref state.port, event_parent(ctx));
+    define(ctx, deref state.port, "postMessage", deref state.post, ex, true);
+    define(ctx, deref state.port, "close", deref state.close, ex, true);
+    define(ctx, deref state.api, "isMainThread", boolean(ctx, false), ex, true);
+    define(ctx, deref state.api, "threadId", number(ctx, deref link.id as f64), ex, true);
+    define(ctx, deref state.api, "parentPort", deref state.port, ex, true);
+    if (deref ex == null) {
+        var data: ptr<u8> = restore_clone(ctx, deref link.data, ex);
+        define(ctx, deref state.api, "workerData", data, ex, true);
+    }
+    return deref ex == null;
+}
+pub fun worker_stopping(ctx: ptr<u8>) -> bool {
+    var state: ptr<WorkerState> = worker_state(ctx);
+    if (state == null || deref state.parent == null) {
+        return false;
+    }
+    return stopped(deref state.parent) || !prepare_entry(context_group(ctx));
+}
+pub fun workers_pending(ctx: ptr<u8>) -> bool {
+    var state: ptr<WorkerState> = worker_state(ctx);
+    if (state == null) {
+        return false;
+    }
+    for (var i: i64 = 0; i < WORKER_LIMIT; i++) {
+        if (deref state.slots != null && (deref state.slots)[i].link != null) {
+            return true;
+        }
+    }
+    return deref state.parent != null && !deref state.port_closed && has_named_listeners(ctx,
+        deref state.port, "message");
+}
+fun deliver(ctx: ptr<u8>, owner: ptr<u8>, graph: ptr<CloneGraph>, ex: ptr<ptr<u8>>) {
+    var value: ptr<u8> = restore_clone(ctx, graph, ex);
+    free_clone(graph);
+    if (deref ex == null) {
+        protect(ctx, value);
+        var arg: array<ptr<u8>, 1> = [value];
+        emit_named(ctx, owner, "message", 1, &arg[0], ex);
+        unprotect(ctx, value);
+    }
+}
+fun finish(ctx: ptr<u8>, slot: ptr<WorkerSlot>, ex: ptr<ptr<u8>>) -> bool {
+    var state: ptr<WorkerState> = worker_state(ctx);
+    var link: ptr<WorkerLink> = deref slot.link;
+    if (join_thread(deref link.thread, null) != 0) {
+        fail(ctx, ex, 0, "cannot join Worker thread");
+        return false;
+    }
+    var owner: ptr<u8> = deref slot.owner;
+    var resolve: ptr<u8> = deref slot.resolve;
+    var code: ptr<u8> = number(ctx, deref link.code as f64);
+    protect(ctx, code);
+    var error: ptr<u8> = null;
+    var failed: bool = deref link.failed;
+    if (deref link.error_length > 0) {
+        var content: ptr<u8> = utf16(deref link.error, deref link.error_length);
+        error = string_value(ctx, content);
+        release(content);
+        protect(ctx, error);
+    }
+    var record: ptr<u8> = weak_get(ctx, deref state.records, owner, ex);
+    define(ctx, record, "exitCode", code, ex, true);
+    define(ctx, owner, "threadId", number(ctx, -1.0), ex, true);
+    deref slot.link = null;
+    deref slot.owner = null;
+    deref slot.resolve = null;
+    deref slot.online = false;
+    free_link(link);
+    // Release the native slot before invoking listeners, which can create Workers.
+    if (failed && deref ex == null) {
+        var failure: ptr<u8> = null;
+        fail(ctx, &failure, 0, "Worker execution failed");
+        protect(ctx, failure);
+        if (error != null) {
+            define(ctx, failure, "message", error, ex, true);
+        }
+        var arg: array<ptr<u8>, 1> = [failure];
+        emit_named(ctx, owner, "error", 1, &arg[0], ex);
+        unprotect(ctx, failure);
+    }
+    var arg: array<ptr<u8>, 1> = [code];
+    if (deref ex == null) {
+        emit_named(ctx, owner, "exit", 1, &arg[0], ex);
+    }
+    if (resolve != null) {
+        if (deref ex == null) {
+            call(ctx, resolve, null, 1, &arg[0], ex);
+        }
+        unprotect(ctx, resolve);
+    }
+    if (error != null) {
+        unprotect(ctx, error);
+    }
+    unprotect(ctx, code);
+    unprotect(ctx, owner);
+    return deref ex == null;
+}
+pub fun poll_workers(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> i32 {
+    var state: ptr<WorkerState> = worker_state(ctx);
+    if (state == null) {
+        return 0;
+    }
+    var work: i32 = 0;
+    if (deref state.parent != null && !deref state.port_closed) {
+        var incoming: ptr<CloneGraph> = pop_message(deref state.parent, false);
+        if (incoming != null) {
+            deliver(ctx, deref state.port, incoming, ex);
+            work = 1;
+        }
+    }
+    for (var i: i64 = 0; i < WORKER_LIMIT && deref ex == null; i++) {
+        var slot: ptr<WorkerSlot> = deref state.slots + i;
+        var link: ptr<WorkerLink> = deref slot.link;
+        if (link == null) {
+            continue;
+        }
+        lock(deref link.mutex);
+        var online: bool = deref link.online;
+        var done: bool = deref link.done;
+        unlock(deref link.mutex);
+        if (online && !deref slot.online) {
+            deref slot.online = true;
+            emit_named(ctx, deref slot.owner, "online", 0, null, ex);
+            work = 1;
+        }
+        if (deref ex != null) {
+            break;
+        }
+        var outgoing: ptr<CloneGraph> = pop_message(link, true);
+        if (outgoing != null) {
+            deliver(ctx, deref slot.owner, outgoing, ex);
+            work = 1;
+        } else if (done) {
+            if (!finish(ctx, slot, ex)) {
+                return -1;
+            }
+            work = 1;
+        }
+    }
+    if (deref ex != null) {
+        return -1;
+    }
+    return work;
+}
+pub fun shutdown_workers(ctx: ptr<u8>) -> bool {
+    var state: ptr<WorkerState> = worker_state(ctx);
+    if (state == null) {
+        return true;
+    }
+    if (deref state.slots != null) {
+        for (var i: i64 = 0; i < WORKER_LIMIT; i++) {
+            var link: ptr<WorkerLink> = (deref state.slots)[i].link;
+            if (link != null) {
+                stop_link(link);
+            }
+        }
+        for (var i: i64 = 0; i < WORKER_LIMIT; i++) {
+            var slot: ptr<WorkerSlot> = deref state.slots + i;
+            var link: ptr<WorkerLink> = deref slot.link;
+            if (link != null) {
+                if (join_thread(deref link.thread, null) != 0) {
+                    return false;
+                }
+                free_link(deref slot.link);
+            }
+            if (deref slot.owner != null) {
+                unprotect(ctx, deref slot.owner);
+            }
+            if (deref slot.resolve != null) {
+                unprotect(ctx, deref slot.resolve);
+            }
+        }
+        mem_free(deref state.slots as ptr<u8>, WORKER_LIMIT * (size_of<WorkerSlot>() as i64));
+    }
+    var roots: array<ptr<u8>, 8> = [deref state.api, deref state.prototype, deref state.records,
+        deref state.port, deref state.keys, deref state.post, deref state.terminate, deref state.close];
+    for (var i: i64 = 0; i < 8; i++) {
+        if (roots[i] != null) {
+            unprotect(ctx, roots[i]);
+        }
+    }
+    release_context_slot(ctx, SLOT, size_of<WorkerState>() as i64);
+    return true;
+}

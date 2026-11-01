@@ -1,0 +1,6 @@
+self-hosted-runner:
+  labels:
+    - jsrt-wave-jsc
+    # The installed actionlint predates this GitHub-hosted image label.
+    # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+    - ubuntu-26.04

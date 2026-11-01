@@ -1,0 +1,61 @@
+// Bounded default querystring.parse policy, sharing Wave's form decoder.
+import("./url_params")::{parse_pairs};
+import("./values")::{plain, text, define_key, define, fail};
+import("./collections")::{length, at};
+import("./http_values")::{http_native};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_is_array") fun is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, values: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_get") fun get_key(ctx: ptr<u8>, owner: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_to_string") fun to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_release") fun release_string(value: ptr<u8>);
+extern(c, "wr_set_index") fun set_index(ctx: ptr<u8>, owner: ptr<u8>, index: u32, value: ptr<u8>, ex: ptr<ptr<u8>>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+
+export(c) fun jsrt_query_parse(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var result: ptr<u8> = plain(ctx);
+    if (count == 0 || kind(ctx, args[0]) != 4) {
+        return result;
+    }
+    if (count > 1) {
+        fail(ctx, ex, 1, "querystring.parse supports the default separators and bounded decoding only");
+        return undefined(ctx);
+    }
+    protect(ctx, result);
+    var pairs: ptr<u8> = parse_pairs(ctx, args[0], false, ex);
+    protect(ctx, pairs);
+    for (var i: i64 = 0; i < length(ctx, pairs, ex) && deref ex == null; i++) {
+        var pair: ptr<u8> = at(ctx, pairs, i, ex);
+        var name: ptr<u8> = at(ctx, pair, 0, ex);
+        var value: ptr<u8> = at(ctx, pair, 1, ex);
+        var key: ptr<u8> = to_string(ctx, name, ex);
+        if (key == null || deref ex != null) {
+            break;
+        }
+        var previous: ptr<u8> = get_key(ctx, result, key, ex);
+        release_string(key);
+        if (kind(ctx, previous) == 0) {
+            define_key(ctx, result, name, value, ex, true);
+        } else if (is_array(ctx, previous)) {
+            set_index(ctx, previous, length(ctx, previous, ex) as u32, value, ex);
+        } else {
+            var items: array<ptr<u8>, 2> = [previous, value];
+            define_key(ctx, result, name, array(ctx, 2, &items[0], ex), ex, true);
+        }
+    }
+    unprotect(ctx, pairs);
+    unprotect(ctx, result);
+    return result;
+}
+
+pub fun querystring_module(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var result: ptr<u8> = plain(ctx);
+    protect(ctx, result);
+    define(ctx, result, "parse", http_native(ctx, "parse", 17), ex, true);
+    define(ctx, result, "decode", http_native(ctx, "decode", 17), ex, true);
+    unprotect(ctx, result);
+    return result;
+}

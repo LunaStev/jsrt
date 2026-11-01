@@ -1,0 +1,256 @@
+// Installer graph snapshots own their strings independently of parsed manifests.
+// Defer lock output until optional subtrees have committed or rolled back.
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::ops")::{mem_copy};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("./config")::{PACKAGE_COUNT_LIMIT};
+import("./package_io")::{package_path, package_fail};
+import("wjson")::{JsonWriter, json_key, json_begin_object, json_end_object, json_field_str};
+pub struct Package {
+    name: str;
+    version: str;
+    location: str;
+    source: str;
+    integrity: str;
+}
+pub struct Peer {
+    name: str;
+    range: str;
+    scope: str;
+    optional: bool;
+}
+struct Skip {
+    location: str;
+    name: str;
+    range: str;
+}
+pub struct GraphCheckpoint {
+    packages: i64;
+    peers: i64;
+    skips: i64;
+}
+static nodes: array<Package, 256>;
+static edges: array<Peer, 256>;
+static skips: array<Skip, 256>;
+static node_count: i64 = 0;
+static edge_count: i64 = 0;
+static skip_count: i64 = 0;
+
+fun copy(value: str) -> str {
+    var n: i64 = mem_len_cstr(value);
+    var bytes: ptr<u8> = mem_alloc(n + 1);
+    if (bytes != null) {
+        mem_copy(bytes, value as ptr<u8>, n + 1);
+    }
+    return bytes as str;
+}
+
+fun drop(value: str) {
+    if ((value as ptr<u8>) != null) {
+        mem_free(value as ptr<u8>, mem_len_cstr(value) + 1);
+    }
+}
+
+pub fun graph_checkpoint() -> GraphCheckpoint {
+    return GraphCheckpoint {packages: node_count, peers: edge_count, skips: skip_count};
+}
+
+pub fun graph_rollback(point: GraphCheckpoint) {
+    while (node_count > point.packages) {
+        node_count -= 1;
+        var p: ptr<Package> = &nodes[node_count];
+        drop(deref p.name);
+        drop(deref p.version);
+        drop(deref p.location);
+        drop(deref p.source);
+        drop(deref p.integrity);
+    }
+    while (edge_count > point.peers) {
+        edge_count -= 1;
+        var p: ptr<Peer> = &edges[edge_count];
+        drop(deref p.name);
+        drop(deref p.range);
+        drop(deref p.scope);
+    }
+    while (skip_count > point.skips) {
+        skip_count -= 1;
+        var p: ptr<Skip> = &skips[skip_count];
+        drop(deref p.location);
+        drop(deref p.name);
+        drop(deref p.range);
+    }
+}
+
+pub fun graph_clear() {
+    graph_rollback(GraphCheckpoint {packages: 0, peers: 0, skips: 0});
+}
+
+pub fun record_package(name: str, version: str, location: str, source: str, integrity: str) -> bool {
+    if (node_count >= PACKAGE_COUNT_LIMIT) {
+        return package_fail("package graph limit exceeded");
+    }
+    var p: ptr<Package> = &nodes[node_count];
+    deref p.name = copy(name);
+    deref p.version = copy(version);
+    deref p.location = copy(location);
+    deref p.source = copy(source);
+    deref p.integrity = copy(integrity);
+    node_count += 1;
+    if ((deref p.name as ptr<u8>) == null || (deref p.version as ptr<u8>) == null ||
+        (deref p.location as ptr<u8>) == null || (deref p.source as ptr<u8>) == null ||
+        (deref p.integrity as ptr<u8>) == null) {
+        return package_fail("cannot allocate package graph identity");
+    }
+    return true;
+}
+
+pub fun parent_scope(location: str, output: ptr<u8>) {
+    var last: i64 = 0;
+    var n: i64 = mem_len_cstr(location);
+    var component: str = "node_modules/";
+    for (var i: i64 = 0; i + 13 <= n; i++) {
+        if (i != 0 && location[i - 1] != 47) {
+            continue;
+        }
+        var same: bool = true;
+        for (var j: i64 = 0; j < 13; j++) {
+            if (location[i + j] != component[j]) {
+                same = false;
+            }
+        }
+        if (same) {
+            last = i;
+        }
+    }
+    if (last > 0) {
+        last -= 1;
+    }
+    mem_copy(output, location as ptr<u8>, last);
+    output[last] = 0;
+}
+
+pub fun visible_package(scope: str, name: str) -> ptr<Package> {
+    var current: array<u8, 8192>;
+    mem_copy(&current[0], scope as ptr<u8>, mem_len_cstr(scope) + 1);
+    while (true) {
+        var parent: array<u8, 8192>;
+        var path: array<u8, 8192>;
+        if (!package_path(&parent[0], &current[0] as str, "node_modules") ||
+            !package_path(&path[0], &parent[0] as str, name)) {
+            return null;
+        }
+        for (var i: i64 = 0; i < node_count; i++) {
+            if (mem_eq_cstr(nodes[i].location, &path[0] as str)) {
+                return &nodes[i];
+            }
+        }
+        if (current[0] == 0) {
+            return null;
+        }
+        parent_scope(&current[0] as str, &parent[0]);
+        mem_copy(&current[0], &parent[0], mem_len_cstr(&parent[0] as str) + 1);
+    }
+    return null;
+}
+
+pub fun record_peer(name: str, range: str, scope: str, optional: bool) -> bool {
+    if (edge_count >= PACKAGE_COUNT_LIMIT) {
+        return package_fail("peer dependency edge limit exceeded");
+    }
+    var p: ptr<Peer> = &edges[edge_count];
+    deref p.name = copy(name);
+    deref p.range = copy(range);
+    deref p.scope = copy(scope);
+    deref p.optional = optional;
+    edge_count += 1;
+    if ((deref p.name as ptr<u8>) == null || (deref p.range as ptr<u8>) == null ||
+        (deref p.scope as ptr<u8>) == null) {
+        return package_fail("cannot allocate peer dependency");
+    }
+    return true;
+}
+
+pub fun peer_at(index: i64) -> ptr<Peer> {
+    if (index < 0 || index >= edge_count) {
+        return null;
+    }
+    return &edges[index];
+}
+
+pub fun record_skip(location: str, name: str, range: str) -> bool {
+    if (skip_count >= PACKAGE_COUNT_LIMIT) {
+        return package_fail("optional dependency skip limit exceeded");
+    }
+    var p: ptr<Skip> = &skips[skip_count];
+    deref p.location = copy(location);
+    deref p.name = copy(name);
+    deref p.range = copy(range);
+    skip_count += 1;
+    if ((deref p.location as ptr<u8>) == null || (deref p.name as ptr<u8>) == null ||
+        (deref p.range as ptr<u8>) == null) {
+        return package_fail("cannot allocate optional dependency skip");
+    }
+    return true;
+}
+
+pub fun graph_has_skip(location: str) -> bool {
+    for (var i: i64 = 0; i < skip_count; i++) {
+        if (mem_eq_cstr(skips[i].location, location)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fun write_graph_packages(writer: ptr<JsonWriter>) -> bool {
+    for (var i: i64 = 0; i < node_count; i++) {
+        var p: ptr<Package> = &nodes[i];
+        if (!json_key(writer, deref p.location) || !json_begin_object(writer) ||
+            !json_field_str(writer, "name", deref p.name) || !json_field_str(writer, "version", deref p.version) ||
+            !json_field_str(writer, "resolved", deref p.source) || !json_field_str(writer, "integrity", deref p.integrity) ||
+            !json_end_object(writer)) {
+            return package_fail("cannot serialize package graph");
+        }
+    }
+    return true;
+}
+
+pub fun write_graph_skips(writer: ptr<JsonWriter>) -> bool {
+    if (!json_key(writer, "optionalSkips") || !json_begin_object(writer)) {
+        return false;
+    }
+    for (var i: i64 = 0; i < skip_count; i++) {
+        var p: ptr<Skip> = &skips[i];
+        if (!json_key(writer, deref p.location) || !json_begin_object(writer) ||
+            !json_field_str(writer, "name", deref p.name) || !json_field_str(writer, "range", deref p.range) ||
+            !json_end_object(writer)) {
+            return false;
+        }
+    }
+    return json_end_object(writer);
+}
+
+pub fun valid_name(name: str) -> bool {
+    if ((name as ptr<u8>) == null) {
+        return false;
+    }
+    var n: i64 = mem_len_cstr(name);
+    if (n == 0 || n > 214) {
+        return false;
+    }
+    var slashes: i64 = 0;
+    for (var i: i64 = 0; i < n; i++) {
+        var c: u8 = name[i];
+        if (c == 47) {
+            slashes += 1;
+            if (name[0] != 64 || i < 2 || i + 1 == n || name[i-1] == 46 || name[i+1] == 46) {
+                return false;
+            }
+        } else if (!(c >= 97 && c <= 122) && !(c >= 48 && c <= 57) && c != 45 && c != 95 && c != 46 && !(i == 0 && c == 64)) {
+            return false;
+        }
+    }
+    return(name[0] == 64 && slashes == 1) || (name[0] != 64 && slashes == 0 && name[0] != 46 && name[0] != 95 && !mem_eq_cstr(name,
+        "node_modules"));
+}
+

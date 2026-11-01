@@ -1,0 +1,68 @@
+// Explicit maintainer command. Compatibility runs consume the reviewed lock;
+// they never rewrite source fixtures or silently choose new transitive versions.
+import("./support")::{argc, arg, absolute, join, private_directory, ensure_directory, run};
+import("./private_files")::{copy_regular, clean_private_directory};
+import("std::mem::cstr")::{mem_eq_cstr};
+
+pub fun compatibility_probe() -> i32 {
+    var root: ptr<u8> = private_directory("target", "compat-probe-");
+    if (root == null) {
+        return 1;
+    }
+    var ok: bool = copy_regular("tests/npm_compat.package.json", join(root as str, "package.json") as str, 384) &&
+        copy_regular("tests/npm_compat.lock.wjson", join(root as str, "jsrt.lock.wjson") as str, 384);
+    var binary: str = absolute("target/native/jsrt") as str;
+    var install: array<str, 5> = [binary, "install", "--project", absolute(root as str) as str, "--frozen-lockfile"];
+    if (ok) {
+        ok = run(&install[0], 5) == 0;
+    }
+    var command: array<str, 13> = ["/usr/bin/gdb", "-batch", "-ex", "handle SIGUSR1 nostop noprint pass",
+        "-ex", "run", "-ex", "bt", "--args", binary, "tests/npm_compat.js", absolute(root as str) as str, "polka"];
+    if (ok) {
+        ok = run(&command[0], 13) == 0;
+    }
+    ok = clean_private_directory(root as str) && ok;
+    if (!ok) {
+        return 1;
+    }
+    return 0;
+}
+
+pub fun compatibility_lock() -> i32 {
+    var binary: str = "target/native/jsrt";
+    var destination: str = "tests/npm_compat.lock.wjson";
+    for (var i: i32 = 2; i < argc(); i++) {
+        if (mem_eq_cstr(arg(i), "--binary") && i + 1 < argc()) {
+            i += 1;
+            binary = arg(i);
+        } else if (mem_eq_cstr(arg(i), "--output") && i + 1 < argc()) {
+            i += 1;
+            destination = arg(i);
+        } else {
+            println("compat-lock accepts --binary <path> --output <new-file>");
+            return 2;
+        }
+    }
+    if (!ensure_directory("target")) {
+        return 1;
+    }
+    var root: ptr<u8> = private_directory("target", "compat-lock-");
+    if (root == null) {
+        return 1;
+    }
+    var ok: bool = copy_regular("tests/npm_compat.package.json", join(root as str, "package.json") as str, 384);
+    var command: array<str, 4> = [absolute(binary) as str, "install", "--project", absolute(root as str) as str];
+    if (ok) {
+        ok = run(&command[0], 4) == 0;
+    }
+    if (ok) {
+        ok = copy_regular(join(root as str, "jsrt.lock.wjson") as str, destination, 420);
+    }
+    ok = clean_private_directory(root as str) && ok;
+    if (!ok) {
+        println("Could not write a new compatibility lock; existing output is never overwritten");
+        return 1;
+    }
+    println("Review and retain compatibility lock: {}", destination);
+    return 0;
+}

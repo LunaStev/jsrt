@@ -1,0 +1,592 @@
+// Buffer's public API. Parsing/GC/JIT and byte storage stay in JavaScriptCore.
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::mem::ops")::{mem_cmp};
+import("./config")::{BUFFER_LIMIT, BUFFER_PART_LIMIT};
+import("./values")::{text, get, put, plain, define, define_key, fail};
+import("./byte_codec")::{encoding, encode_bytes, decode_bytes};
+import("./buffer_numbers")::{install_buffer_numbers, shutdown_buffer_numbers};
+import("./buffer_search")::{install_buffer_search, shutdown_buffer_search};
+import("./buffer_core")::{buffer_root, initialize_buffer_brand, is_buffer, is_byte_view, byte_view_length,
+    copy_byte_view, write_byte_view, allocate_buffer, buffer_from_bytes, buffer_view, buffer_subview,
+    shutdown_buffer_core};
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_to_number") fun to_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_is_array") fun is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_get_index") fun index(ctx: ptr<u8>, value: ptr<u8>, at: u32, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set_index") fun set_index(ctx: ptr<u8>, value: ptr<u8>, at: u32, element: ptr<u8>, ex: ptr<ptr<u8>>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_typed_type") fun typed_type(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i32;
+extern(c, "wr_array_buffer_length") fun backing_length(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_constructor") fun constructor(ctx: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun set_prototype(ctx: ptr<u8>, value: ptr<u8>, parent: ptr<u8>);
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, elements: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "jsrt_buffer_callback") fun callback(code: i32) -> ptr<u8>;
+extern(c, "jsrt_buffer_constructor_callback") fun constructor_callback() -> ptr<u8>;
+
+fun native(ctx: ptr<u8>, name: str, code: i32) -> ptr<u8> {
+    var key: ptr<u8> = utf8(name);
+    var result: ptr<u8> = function(ctx, key, callback(code));
+    release(key);
+    return result;
+}
+
+pub fun buffer_integer(ctx: ptr<u8>, value: ptr<u8>, minimum: i64, maximum: i64, ex: ptr<ptr<u8>>) -> i64 {
+    if (kind(ctx, value) != 3) {
+        fail(ctx, ex, 1, "expected an integer number");
+        return -1;
+    }
+    var n: f64 = to_number(ctx, value, ex);
+    if (n != n || n < minimum as f64 || n > maximum as f64 || (n as i64) as f64 != n) {
+        fail(ctx, ex, 2, "integer is outside the supported range");
+        return -1;
+    }
+    return n as i64;
+}
+
+fun argument(count: i64, args: ptr<ptr<u8>>, at: i64) -> ptr<u8> {
+    if (at < count) {
+        return args[at];
+    }
+    return null;
+}
+
+fun optional_index(ctx: ptr<u8>, value: ptr<u8>, length: i64, fallback: i64, relative: bool, ex: ptr<ptr<u8>>) -> i64 {
+    if (value == null || kind(ctx, value) == 0) {
+        return fallback;
+    }
+    var n: i64 = buffer_integer(ctx, value, -9007199254740991, 9007199254740991, ex);
+    if (deref ex != null) {
+        return 0;
+    }
+    if (relative && n < 0) {
+        n += length;
+    }
+    if (n < 0) {
+        n = 0;
+    }
+    if (n > length) {
+        n = length;
+    }
+    return n;
+}
+
+fun scratch(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var bytes: ptr<u8> = mem_alloc(BUFFER_LIMIT + 1);
+    if (bytes == null) {
+        fail(ctx, ex, 2, "cannot allocate buffer scratch space");
+    }
+    return bytes;
+}
+
+export(c) fun jsrt_buffer_construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    fail(ctx, ex, 1, "use Buffer.from or Buffer.alloc");
+    return null;
+}
+
+export(c) fun jsrt_buffer_from(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0) {
+        fail(ctx, ex, 1, "Buffer.from requires a value");
+        return undefined(ctx);
+    }
+    var value: ptr<u8> = args[0];
+    if (typed_type(ctx, value, ex) == 9) {
+        var length: i64 = backing_length(ctx, value, ex);
+        var start: i64 = 0;
+        if (count > 1 && kind(ctx, args[1]) != 0) {
+            start = buffer_integer(ctx, args[1], 0, length, ex);
+        }
+        var size: i64 = length - start;
+        if (count > 2 && kind(ctx, args[2]) != 0 && deref ex == null) {
+            size = buffer_integer(ctx, args[2], 0, size, ex);
+        }
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        return buffer_view(ctx, value, start, size, ex);
+    }
+    if (is_array(ctx, value)) {
+        var length: i64 = buffer_integer(ctx, get(ctx, value, "length", ex), 0, BUFFER_LIMIT, ex);
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        var result: ptr<u8> = allocate_buffer(ctx, length, ex);
+        if (result == null) {
+            return undefined(ctx);
+        }
+        protect(ctx, result);
+        for (var i: i64 = 0; i < length && deref ex == null; i++) {
+            var element: ptr<u8> = index(ctx, value, i as u32, ex);
+            if (deref ex == null) {
+                protect(ctx, element);
+                set_index(ctx, result, i as u32, element, ex);
+                unprotect(ctx, element);
+            }
+        }
+        unprotect(ctx, result);
+        return result;
+    }
+    var code: i32 = 0;
+    if (kind(ctx, value) == 4) {
+        code = encoding(ctx, argument(count, args, 1), ex, false);
+    } else if (!is_byte_view(ctx, value, ex)) {
+        fail(ctx, ex, 1, "Buffer.from accepts a string, array, ArrayBuffer or Uint8Array");
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var bytes: ptr<u8> = scratch(ctx, ex);
+    if (bytes == null) {
+        return undefined(ctx);
+    }
+    var length: i64 = -1;
+    if (kind(ctx, value) == 4) {
+        length = encode_bytes(ctx, value, code, bytes, BUFFER_LIMIT + 1, ex);
+    } else {
+        length = copy_byte_view(ctx, value, bytes, BUFFER_LIMIT, ex);
+    }
+    var result: ptr<u8> = undefined(ctx);
+    if (length >= 0 && deref ex == null) {
+        result = buffer_from_bytes(ctx, bytes, length, ex);
+    }
+    mem_free(bytes, BUFFER_LIMIT + 1);
+    return result;
+}
+
+fun pattern(ctx: ptr<u8>, value: ptr<u8>, code: i32, bytes: ptr<u8>, ex: ptr<ptr<u8>>) -> i64 {
+    if (kind(ctx, value) == 4) {
+        return encode_bytes(ctx, value, code, bytes, BUFFER_LIMIT + 1, ex);
+    }
+    if (is_byte_view(ctx, value, ex)) {
+        return copy_byte_view(ctx, value, bytes, BUFFER_LIMIT, ex);
+    }
+    if (kind(ctx, value) == 3) {
+        var temp: ptr<u8> = allocate_buffer(ctx, 1, ex);
+        if (temp == null) {
+            return -1;
+        }
+        protect(ctx, temp);
+        set_index(ctx, temp, 0, value, ex);
+        var size: i64 = -1;
+        if (deref ex == null) {
+            size = copy_byte_view(ctx, temp, bytes, 1, ex);
+        }
+        unprotect(ctx, temp);
+        return size;
+    }
+    fail(ctx, ex, 1, "fill must be a number, string or Uint8Array");
+    return -1;
+}
+
+fun fill_range(ctx: ptr<u8>, result: ptr<u8>, value: ptr<u8>, start: i64, end: i64, code: i32, ex: ptr<ptr<u8>>) {
+    var bytes: ptr<u8> = scratch(ctx, ex);
+    if (bytes == null) {
+        return;
+    }
+    var size: i64 = pattern(ctx, value, code, bytes, ex);
+    var length: i64 = end - start;
+    if (size == 0 && kind(ctx, value) != 4) {
+        fail(ctx, ex, 1, "fill pattern must not be empty");
+    }
+    if (size >= 0 && deref ex == null && length > 0) {
+        if (size == 0) {
+            bytes[0] = 0;
+            size = 1;
+        }
+        var source: ptr<u8> = bytes;
+        var expanded: ptr<u8> = mem_alloc(length);
+        if (expanded == null) {
+            fail(ctx, ex, 2, "cannot allocate filled buffer");
+        } else {
+            for (var i: i64 = 0; i < length; i++) {
+                expanded[i] = source[i % size];
+            }
+            write_byte_view(ctx, result, start, expanded, length, ex);
+            mem_free(expanded, length);
+        }
+    }
+    mem_free(bytes, BUFFER_LIMIT + 1);
+}
+
+export(c) fun jsrt_buffer_alloc(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0) {
+        fail(ctx, ex, 1, "Buffer.alloc requires a size");
+        return undefined(ctx);
+    }
+    var size: i64 = buffer_integer(ctx, args[0], 0, BUFFER_LIMIT, ex);
+    var code: i32 = encoding(ctx, argument(count, args, 2), ex, false);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var result: ptr<u8> = allocate_buffer(ctx, size, ex);
+    if (result == null) {
+        return undefined(ctx);
+    }
+    protect(ctx, result);
+    if (count > 1 && kind(ctx, args[1]) != 0) {
+        fill_range(ctx, result, args[1], 0, size, code, ex);
+    }
+    unprotect(ctx, result);
+    return result;
+}
+
+export(c) fun jsrt_buffer_is_buffer(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return boolean(ctx, count > 0 && is_buffer(ctx, args[0], ex));
+}
+
+export(c) fun jsrt_buffer_is_encoding(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return boolean(ctx, count > 0 && kind(ctx, args[0]) == 4 && encoding(ctx, args[0], ex, true) >= 0);
+}
+
+export(c) fun jsrt_buffer_byte_length(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0) {
+        fail(ctx, ex, 1, "byteLength requires a value");
+        return undefined(ctx);
+    }
+    if (is_byte_view(ctx, args[0], ex)) {
+        return number(ctx, byte_view_length(ctx, args[0], ex) as f64);
+    }
+    var code: i32 = encoding(ctx, argument(count, args, 1), ex, false);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var bytes: ptr<u8> = scratch(ctx, ex);
+    if (bytes == null) {
+        return undefined(ctx);
+    }
+    var size: i64 = encode_bytes(ctx, args[0], code, bytes, BUFFER_LIMIT + 1, ex);
+    mem_free(bytes, BUFFER_LIMIT + 1);
+    return number(ctx, size as f64);
+}
+
+export(c) fun jsrt_buffer_to_string(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var length: i64 = byte_view_length(ctx, receiver, ex);
+    var code: i32 = encoding(ctx, argument(count, args, 0), ex, false);
+    var start: i64 = optional_index(ctx, argument(count, args, 1), length, 0, false, ex);
+    var end: i64 = optional_index(ctx, argument(count, args, 2), length, length, false, ex);
+    if (end < start) {
+        end = start;
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var bytes: ptr<u8> = scratch(ctx, ex);
+    if (bytes == null) {
+        return undefined(ctx);
+    }
+    var result: ptr<u8> = undefined(ctx);
+    if (copy_byte_view(ctx, receiver, bytes, BUFFER_LIMIT, ex) >= 0) {
+        result = decode_bytes(ctx, bytes + start, end - start, code, ex);
+    }
+    mem_free(bytes, BUFFER_LIMIT + 1);
+    return result;
+}
+
+export(c) fun jsrt_buffer_subarray(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var length: i64 = byte_view_length(ctx, receiver, ex);
+    var start: i64 = optional_index(ctx, argument(count, args, 0), length, 0, true, ex);
+    var end: i64 = optional_index(ctx, argument(count, args, 1), length, length, true, ex);
+    if (end < start) {
+        end = start;
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    return buffer_subview(ctx, receiver, start, end - start, ex);
+}
+
+export(c) fun jsrt_buffer_fill(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var length: i64 = byte_view_length(ctx, receiver, ex);
+    if (count == 0) {
+        fail(ctx, ex, 1, "fill requires a value");
+        return undefined(ctx);
+    }
+    var start: i64 = 0;
+    var end: i64 = length;
+    var enc: ptr<u8> = null;
+    if (count > 1 && kind(ctx, args[1]) == 4) {
+        enc = args[1];
+    } else {
+        if (count > 1 && kind(ctx, args[1]) != 0) {
+            start = buffer_integer(ctx, args[1], 0, length, ex);
+        }
+        if (count > 2 && kind(ctx, args[2]) == 4) {
+            enc = args[2];
+        } else {
+            if (count > 2 && kind(ctx, args[2]) != 0) {
+                end = buffer_integer(ctx, args[2], 0, length, ex);
+            }
+            enc = argument(count, args, 3);
+        }
+    }
+    var code: i32 = encoding(ctx, enc, ex, false);
+    if (deref ex == null && end > start) {
+        fill_range(ctx, receiver, args[0], start, end, code, ex);
+    }
+    return receiver;
+}
+
+export(c) fun jsrt_buffer_copy(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var length: i64 = byte_view_length(ctx, receiver, ex);
+    if (count == 0) {
+        fail(ctx, ex, 1, "copy requires a destination");
+        return undefined(ctx);
+    }
+    var target_length: i64 = byte_view_length(ctx, args[0], ex);
+    var target_start: i64 = 0;
+    var start: i64 = 0;
+    var end: i64 = length;
+    if (count > 1 && kind(ctx, args[1]) != 0) {
+        target_start = buffer_integer(ctx, args[1], 0, 9007199254740991, ex);
+    }
+    if (count > 2 && kind(ctx, args[2]) != 0) {
+        start = buffer_integer(ctx, args[2], 0, length, ex);
+    }
+    if (count > 3 && kind(ctx, args[3]) != 0) {
+        end = buffer_integer(ctx, args[3], 0, length, ex);
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var size: i64 = end - start;
+    if (size < 0 || target_start >= target_length) {
+        size = 0;
+    } else if (size > target_length - target_start) {
+        size = target_length - target_start;
+    }
+    var bytes: ptr<u8> = scratch(ctx, ex);
+    if (bytes == null) {
+        return undefined(ctx);
+    }
+    if (copy_byte_view(ctx, receiver, bytes, BUFFER_LIMIT, ex) >= 0 && size > 0) {
+        write_byte_view(ctx, args[0], target_start, bytes + start, size, ex);
+    }
+    mem_free(bytes, BUFFER_LIMIT + 1);
+    return number(ctx, size as f64);
+}
+
+fun compare(ctx: ptr<u8>, left: ptr<u8>, right: ptr<u8>, ex: ptr<ptr<u8>>) -> i32 {
+    var a: ptr<u8> = scratch(ctx, ex);
+    var b: ptr<u8> = scratch(ctx, ex);
+    var result: i32 = 0;
+    if (a != null && b != null) {
+        var x: i64 = copy_byte_view(ctx, left, a, BUFFER_LIMIT, ex);
+        var y: i64 = -1;
+        if (deref ex == null) {
+            y = copy_byte_view(ctx, right, b, BUFFER_LIMIT, ex);
+        }
+        if (x >= 0 && y >= 0) {
+            var size: i64 = x;
+            if (y < size) {
+                size = y;
+            }
+            var order: i32 = mem_cmp(a, b, size);
+            if (order < 0 || (order == 0 && x < y)) {
+                result = -1;
+            } else if (order > 0 || (order == 0 && x > y)) {
+                result = 1;
+            }
+        }
+    }
+    if (a != null) {
+        mem_free(a, BUFFER_LIMIT + 1);
+    }
+    if (b != null) {
+        mem_free(b, BUFFER_LIMIT + 1);
+    }
+    return result;
+}
+
+export(c) fun jsrt_buffer_equals(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0) {
+        fail(ctx, ex, 1, "equals requires a byte view");
+        return undefined(ctx);
+    }
+    return boolean(ctx, compare(ctx, receiver, args[0], ex) == 0);
+}
+
+export(c) fun jsrt_buffer_compare(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count != 1) {
+        fail(ctx, ex, 1, "compare accepts one byte view");
+        return undefined(ctx);
+    }
+    return number(ctx, compare(ctx, receiver, args[0], ex) as f64);
+}
+
+export(c) fun jsrt_buffer_compare_static(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count != 2) {
+        fail(ctx, ex, 1, "Buffer.compare accepts two byte views");
+        return undefined(ctx);
+    }
+    return number(ctx, compare(ctx, args[0], args[1], ex) as f64);
+}
+
+export(c) fun jsrt_buffer_concat(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0 || !is_array(ctx, args[0])) {
+        fail(ctx, ex, 1, "concat requires an array of byte views");
+        return undefined(ctx);
+    }
+    var entries: i64 = buffer_integer(ctx, get(ctx, args[0], "length", ex), 0, BUFFER_PART_LIMIT, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var list: ptr<ptr<u8>> = mem_alloc((entries + 1) * (size_of<ptr<u8>>() as i64)) as ptr<ptr<u8>>;
+    if (list == null) {
+        fail(ctx, ex, 2, "cannot allocate concat list");
+        return undefined(ctx);
+    }
+    var rooted: i64 = 0;
+    var total: i64 = 0;
+    for (var i: i64 = 0; i < entries && deref ex == null; i++) {
+        list[i] = index(ctx, args[0], i as u32, ex);
+        if (deref ex == null) {
+            protect(ctx, list[i]);
+            rooted += 1;
+        }
+    }
+    for (var i: i64 = 0; i < rooted && deref ex == null; i++) {
+        var size: i64 = byte_view_length(ctx, list[i], ex);
+        if (size >= 0) {
+            total += size;
+        }
+        if (total > BUFFER_LIMIT) {
+            fail(ctx, ex, 2, "concat byte limit exceeded");
+        }
+    }
+    var output_size: i64 = total;
+    if (count > 1 && kind(ctx, args[1]) != 0 && deref ex == null) {
+        output_size = buffer_integer(ctx, args[1], 0, BUFFER_LIMIT, ex);
+    }
+    var bytes: ptr<u8> = null;
+    var result: ptr<u8> = undefined(ctx);
+    if (deref ex == null) {
+        bytes = scratch(ctx, ex);
+    }
+    if (bytes != null) {
+        result = allocate_buffer(ctx, output_size, ex);
+        if (result != null && deref ex == null) {
+            protect(ctx, result);
+            var used: i64 = 0;
+            for (var i: i64 = 0; i < rooted && deref ex == null; i++) {
+                var size: i64 = copy_byte_view(ctx, list[i], bytes, BUFFER_LIMIT, ex);
+                if (size > output_size - used) {
+                    size = output_size - used;
+                }
+                if (size > 0) {
+                    write_byte_view(ctx, result, used, bytes, size, ex);
+                    used += size;
+                }
+            }
+            unprotect(ctx, result);
+        }
+        mem_free(bytes, BUFFER_LIMIT + 1);
+    }
+    for (var i: i64 = 0; i < rooted; i++) {
+        unprotect(ctx, list[i]);
+    }
+    mem_free(list as ptr<u8>, (entries + 1) * (size_of<ptr<u8>>() as i64));
+    return result;
+}
+
+export(c) fun jsrt_buffer_to_json(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var bytes: ptr<u8> = scratch(ctx, ex);
+    if (bytes == null) {
+        return undefined(ctx);
+    }
+    var length: i64 = copy_byte_view(ctx, receiver, bytes, BUFFER_LIMIT, ex);
+    var result: ptr<u8> = plain(ctx);
+    protect(ctx, result);
+    if (length >= 0) {
+        var data: ptr<u8> = array(ctx, 0, null, ex);
+        protect(ctx, data);
+        // Define own elements through captured Reflect to bypass inherited setters.
+        for (var i: i64 = 0; i < length && deref ex == null; i++) {
+            var key: ptr<u8> = number(ctx, i as f64);
+            define_key(ctx, data, key, number(ctx, bytes[i] as f64), ex, true);
+        }
+        put(ctx, result, "type", text(ctx, "Buffer"), ex);
+        put(ctx, result, "data", data, ex);
+        unprotect(ctx, data);
+    }
+    mem_free(bytes, BUFFER_LIMIT + 1);
+    unprotect(ctx, result);
+    return result;
+}
+
+pub fun install_buffer(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (!initialize_buffer_brand(ctx, ex)) {
+        return false;
+    }
+    deref buffer_root(ctx, 1) = constructor(ctx, constructor_callback());
+    protect(ctx, deref buffer_root(ctx, 1));
+    deref buffer_root(ctx, 0) = get(ctx, deref buffer_root(ctx, 1), "prototype", ex);
+    protect(ctx, deref buffer_root(ctx, 0));
+    var byte_constructor: ptr<u8> = get(ctx, global(ctx), "Uint8Array", ex);
+    set_prototype(ctx, deref buffer_root(ctx, 0), get(ctx, byte_constructor, "prototype", ex));
+    set_prototype(ctx, deref buffer_root(ctx, 1), byte_constructor);
+    define(ctx, deref buffer_root(ctx, 0), "constructor", deref buffer_root(ctx, 1), ex, false);
+    var symbol: ptr<u8> = get(ctx, global(ctx), "Symbol", ex);
+    define_key(ctx, deref buffer_root(ctx, 1), get(ctx, symbol, "species", ex), byte_constructor, ex,
+        false);
+    var statics: array<str, 8> = ["from", "alloc", "isBuffer", "isEncoding", "byteLength", "concat",
+        "allocUnsafe", "compare"];
+    var static_codes: array<i32, 8> = [0, 1, 2, 3, 4, 5, 1, 13];
+    for (var i: i64 = 0; i < 8; i++) {
+        define(ctx, deref buffer_root(ctx, 1), statics[i], native(ctx, statics[i], static_codes[i]),
+            ex, false);
+    }
+    var methods: array<str, 8> = ["toString", "subarray", "slice", "fill", "copy", "equals", "compare",
+        "toJSON"];
+    var codes: array<i32, 8> = [6, 7, 7, 8, 9, 10, 11, 12];
+    for (var i: i64 = 0; i < 8; i++) {
+        define(ctx, deref buffer_root(ctx, 0), methods[i], native(ctx, methods[i], codes[i]), ex, false);
+    }
+    deref buffer_root(ctx, 2) = plain(ctx);
+    protect(ctx, deref buffer_root(ctx, 2));
+    put(ctx, deref buffer_root(ctx, 2), "Buffer", deref buffer_root(ctx, 1), ex);
+    define(ctx, global(ctx), "Buffer", deref buffer_root(ctx, 1), ex, false);
+    if (deref ex == null && !install_buffer_numbers(ctx, deref buffer_root(ctx, 0), ex)) {
+        return false;
+    }
+    if (deref ex == null && !install_buffer_search(ctx, deref buffer_root(ctx, 0), ex)) {
+        return false;
+    }
+    return deref ex == null;
+}
+
+pub fun buffer_module(ctx: ptr<u8>) -> ptr<u8> {
+    return deref buffer_root(ctx, 2);
+}
+
+pub fun copy_buffer_input(ctx: ptr<u8>, value: ptr<u8>, enc: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var args: array<ptr<u8>, 2> = [value, enc];
+    return jsrt_buffer_from(ctx, null, null, 2, &args[0], ex);
+}
+
+pub fun shutdown_buffer(ctx: ptr<u8>) {
+    shutdown_buffer_search(ctx);
+    shutdown_buffer_numbers(ctx);
+    shutdown_buffer_core(ctx);
+}

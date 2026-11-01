@@ -1,0 +1,122 @@
+// Cleanup is restricted to a caller-created private directory. Every descent is
+// descriptor-relative and refuses symlinks; never use this on an arbitrary prefix.
+import("std::sys::fs")::{open, fstat, Stat, fsync};
+import("std::io::fd")::{io_close, io_read, io_write_all};
+import("std::mem::cstr")::{mem_eq_cstr};
+extern(c, "openat") fun open_at(fd: i32, path: str, flags: i32, mode: i32) -> i32;
+extern(c, "unlinkat") fun unlink_at(fd: i32, path: str, flags: i32) -> i32;
+extern(c, "fdopendir") fun directory_open(fd: i32) -> ptr<u8>;
+extern(c, "closedir") fun directory_close(directory: ptr<u8>) -> i32;
+extern(c, "jsrt_directory_next") fun directory_next(directory: ptr<u8>, name: ptr<u8>, capacity: i64) -> i32;
+extern(c, "getuid") fun user_id() -> i32;
+extern(c, "rmdir") fun remove_directory(path: str) -> i32;
+extern(c, "unlink") fun remove_file(path: str) -> i32;
+const DIRECTORY_FLAGS: i32 = 720896;
+const READ_FLAGS: i32 = 526336;
+const CREATE_FLAGS: i32 = 655553;
+const DIRECTORY_REMOVE: i32 = 512;
+const ENTRY_LIMIT: i64 = 32768;
+
+fun remove_contents(fd: i32, depth: i64, count: ptr<i64>) -> bool {
+    if (depth > 64) {
+        return false;
+    }
+    var scan: i32 = open_at(fd, ".", DIRECTORY_FLAGS, 0);
+    if (scan < 0) {
+        return false;
+    }
+    var directory: ptr<u8> = directory_open(scan);
+    if (directory == null) {
+        io_close(scan as i64);
+        return false;
+    }
+    var ok: bool = true;
+    var name: array<u8, 256>;
+    while (ok) {
+        var status: i32 = directory_next(directory, &name[0], 256);
+        if (status == 0) {
+            break;
+        }
+        if (status < 0) {
+            ok = false;
+            break;
+        }
+        if (mem_eq_cstr(&name[0] as str, ".") || mem_eq_cstr(&name[0] as str, "..")) {
+            continue;
+        }
+        deref count += 1;
+        if (deref count > ENTRY_LIMIT) {
+            ok = false;
+            break;
+        }
+        var child: i32 = open_at(fd, &name[0] as str, DIRECTORY_FLAGS, 0);
+        var flags: i32 = 0;
+        if (child >= 0) {
+            ok = remove_contents(child, depth + 1, count);
+            io_close(child as i64);
+            flags = DIRECTORY_REMOVE;
+        }
+        if (ok) {
+            ok = unlink_at(fd, &name[0] as str, flags) == 0;
+        }
+    }
+    directory_close(directory);
+    return ok;
+}
+
+pub fun clean_private_directory(path: str) -> bool {
+    var fd: i64 = open(path, DIRECTORY_FLAGS, 0);
+    var info: Stat;
+    var ok: bool = fd >= 0 && fstat(fd, &info) == 0;
+    if (ok) {
+        ok = (info.mode & 511) == 448 && info.uid == user_id();
+    }
+    var count: i64 = 0;
+    if (ok) {
+        ok = remove_contents(fd as i32, 0, &count);
+    }
+    if (fd >= 0) {
+        io_close(fd);
+    }
+    return ok && remove_directory(path) == 0;
+}
+
+pub fun copy_regular(source: str, destination: str, mode: i32) -> bool {
+    var source_fd: i64 = open(source, READ_FLAGS, 0);
+    var info: Stat;
+    if (source_fd < 0) {
+        return false;
+    }
+    if (fstat(source_fd, &info) < 0 || (info.mode & 61440) != 32768 || info.size > 536870912) {
+        io_close(source_fd);
+        return false;
+    }
+    var destination_fd: i64 = open(destination, CREATE_FLAGS, mode);
+    if (destination_fd < 0) {
+        io_close(source_fd);
+        return false;
+    }
+    var bytes: array<u8, 65536>;
+    var total: i64 = 0;
+    var ok: bool = true;
+    while (ok) {
+        var n: i64 = io_read(source_fd, &bytes[0], 65536);
+        if (n < 0) {
+            ok = false;
+        } else if (n == 0) {
+            break;
+        } else {
+            total += n;
+            ok = total <= 536870912 && io_write_all(destination_fd, &bytes[0], n) == n;
+        }
+    }
+    ok = ok && total == info.size && fsync(destination_fd) == 0;
+    io_close(source_fd);
+    if (io_close(destination_fd) < 0) {
+        ok = false;
+    }
+    if (!ok) {
+        remove_file(destination);
+    }
+    return ok;
+}

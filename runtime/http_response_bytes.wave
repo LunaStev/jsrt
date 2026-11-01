@@ -1,0 +1,148 @@
+// Length-delimited response encoding; Content-Length always counts UTF-8 bytes.
+import("std::mem::alloc")::{mem_alloc};
+import("std::mem::ops")::{mem_copy};
+import("std::mem::cstr")::{mem_len_cstr};
+pub struct HttpOutput {
+    bytes: ptr<u8>;
+    length: i64;
+    capacity: i64;
+}
+
+pub fun encode_head(status: i32, headers: ptr<u8>, header_length: i64, body_length: i64, chunked: bool) -> HttpOutput {
+    return encode_head_connection(status, headers, header_length, body_length, chunked, false);
+}
+
+pub fun encode_head_connection(status: i32, headers: ptr<u8>, header_length: i64, body_length: i64, chunked: bool,
+    keep_alive: bool) -> HttpOutput {
+    var result: HttpOutput = HttpOutput {
+        bytes: null, length: 0, capacity: header_length + 192
+    }
+    ;
+    result.bytes = mem_alloc(result.capacity);
+    if (result.bytes == null) {
+        return result;
+    }
+    text(&result, "HTTP/1.1 ");
+    number(&result, status as i64);
+    text(&result, " Response\r\n");
+    if (keep_alive) {
+        text(&result, "Connection: keep-alive\r\n");
+    } else {
+        text(&result, "Connection: close\r\n");
+    }
+    if (status == 205) {
+        text(&result, "Content-Length: 0\r\n");
+    } else if (status != 204 && status != 304) {
+        if (chunked) {
+            text(&result, "Transfer-Encoding: chunked\r\n");
+        } else if (body_length >= 0) {
+            text(&result, "Content-Length: ");
+            number(&result, body_length);
+            text(&result, "\r\n");
+        }
+    }
+    if (header_length > 0) {
+        append(&result, headers, header_length);
+    }
+    text(&result, "\r\n");
+    return result;
+}
+
+pub fun encode_frame(head: ptr<u8>, head_length: i64, bytes: ptr<u8>, length: i64, chunked: bool, last: bool) -> HttpOutput {
+    var result: HttpOutput = HttpOutput {
+        bytes: null, length: 0, capacity: head_length + length + 64
+    }
+    ;
+    result.bytes = mem_alloc(result.capacity);
+    if (result.bytes == null) {
+        return result;
+    }
+    if (head_length > 0) {
+        append(&result, head, head_length);
+    }
+    if (length > 0) {
+        if (chunked) {
+            var digits: array<u8, 24>;
+            var at: i64 = 24;
+            var size: i64 = length;
+            var hex: str = "0123456789abcdef";
+            while (size > 0) {
+                at -= 1;
+                digits[at] = hex[size % 16];
+                size /= 16;
+            }
+            append(&result, &digits[at], 24 - at);
+            text(&result, "\r\n");
+        }
+        append(&result, bytes, length);
+        if (chunked) {
+            text(&result, "\r\n");
+        }
+    }
+    if (last && chunked) {
+        text(&result, "0\r\n\r\n");
+    }
+    return result;
+}
+
+fun append(result: ptr<HttpOutput>, bytes: ptr<u8>, length: i64) {
+    mem_copy(deref result.bytes + deref result.length, bytes, length);
+    deref result.length += length;
+}
+
+fun text(result: ptr<HttpOutput>, value: str) {
+    append(result, value as ptr<u8>, mem_len_cstr(value));
+}
+
+fun number(result: ptr<HttpOutput>, value: i64) {
+    var digits: array<u8, 24>;
+    var at: i64 = 24;
+    while (true) {
+        at -= 1;
+        digits[at] = (48 + value % 10) as u8;
+        value /= 10;
+        if (value == 0) {
+            break;
+        }
+    }
+    append(result, &digits[at], 24 - at);
+}
+
+pub fun encode_response(status: i32, headers: ptr<u8>, header_length: i64, body: ptr<u8>, body_length: i64,
+    head: bool) -> HttpOutput {
+    var result: HttpOutput = HttpOutput {
+        bytes: null, length: 0, capacity: 0
+    }
+    ;
+    var empty: bool = status == 204 || status == 304 || status == 205;
+    var payload: i64 = body_length;
+    if (empty || head) {
+        payload = 0;
+    }
+    result.capacity = payload + header_length + 192;
+    result.bytes = mem_alloc(result.capacity);
+    if (result.bytes == null) {
+        return result;
+    }
+    text(&result, "HTTP/1.1 ");
+    number(&result, status as i64);
+    text(&result, " Response\r\n");
+    text(&result, "Connection: close\r\n");
+    if (status != 204 && status != 304) {
+        text(&result, "Content-Length: ");
+        var content_length: i64 = body_length;
+        if (empty) {
+            content_length = 0;
+        }
+        number(&result, content_length);
+        text(&result, "\r\n");
+    }
+    if (header_length > 0) {
+        append(&result, headers, header_length);
+    }
+    text(&result, "\r\n");
+    if (payload > 0) {
+        append(&result, body, payload);
+    }
+    return result;
+}

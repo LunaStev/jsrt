@@ -1,0 +1,126 @@
+// Detached Ed25519 signatures cover the archive SHA-256, not untrusted filenames.
+// Verification requires an independently trusted public key supplied by the caller.
+import("./support")::{argc, arg, absolute, join, private_directory, ensure_directory, run};
+import("./private_files")::{copy_regular, clean_private_directory};
+import("./release_files")::{digest};
+import("std::fs::file")::{write, fs_read_all};
+import("std::sys::fs")::{mkdir};
+import("std::mem::cstr")::{mem_eq_cstr, mem_len_cstr};
+import("std::mem::ops")::{mem_eq, mem_copy};
+
+fun ed25519_public(path: str) -> bool {
+    var bytes: array<u8, 128>;
+    var n: i64 = fs_read_all(path, &bytes[0], 128);
+    var prefix: str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA";
+    return n == 113 && mem_eq(&bytes[0], prefix as ptr<u8>, mem_len_cstr(prefix));
+}
+
+fun manifest(archive: str, scratch: str) -> bool {
+    var hash: ptr<u8> = digest(archive, scratch);
+    if (hash == null) {
+        return false;
+    }
+    var bytes: array<u8, 65>;
+    mem_copy(&bytes[0], hash, 64);
+    bytes[64] = 10;
+    return write(join(scratch, "archive.sha256") as str, &bytes[0], 65) == 65;
+}
+
+pub fun sign_archive(archive: str, key: str, output: str, scratch: str) -> bool {
+    if (!manifest(archive, scratch)) {
+        return false;
+    }
+    var public_key: str = join(scratch, "public-key.pem") as str;
+    var export_key: array<str, 9> = ["/usr/bin/openssl", "pkey", "-in", key, "-passin", "pass:", "-pubout", "-out", public_key];
+    if (run(&export_key[0], 9) != 0 || !ed25519_public(public_key)) {
+        println("An Ed25519 signing key is required");
+        return false;
+    }
+    var signature: str = join(scratch, "archive.sig") as str;
+    var command: array<str, 10> = ["/usr/bin/openssl", "pkeyutl", "-sign", "-rawin", "-inkey", key,
+        "-in", join(scratch, "archive.sha256") as str, "-out", signature];
+    var bytes: array<u8, 65>;
+    if (run(&command[0], 10) != 0 || fs_read_all(signature, &bytes[0], 65) != 64) {
+        return false;
+    }
+    // Refuse existing outputs. Only this newly-created directory may be cleaned.
+    if (mkdir(output, 448) != 0) {
+        return false;
+    }
+    var ok: bool = copy_regular(join(scratch, "archive.sha256") as str, join(output, "archive.sha256") as str, 420) &&
+        copy_regular(signature, join(output, "archive.sig") as str, 420) &&
+        copy_regular(public_key, join(output, "public-key.pem") as str, 420);
+    if (!ok) {
+        clean_private_directory(output);
+    }
+    return ok;
+}
+
+pub fun verify_archive(archive: str, key: str, signatures: str, scratch: str) -> bool {
+    var trusted: str = join(scratch, "trusted.pem") as str;
+    if (!copy_regular(key, trusted, 384) || !ed25519_public(trusted) || !manifest(archive, scratch)) {
+        return false;
+    }
+    var supplied: str = join(scratch, "supplied.sha256") as str;
+    var signature: str = join(scratch, "supplied.sig") as str;
+    if (!copy_regular(join(signatures, "archive.sha256") as str, supplied, 384) ||
+        !copy_regular(join(signatures, "archive.sig") as str, signature, 384)) {
+        return false;
+    }
+    var a: array<u8, 66>;
+    var b: array<u8, 66>;
+    var sig: array<u8, 65>;
+    if (fs_read_all(supplied, &a[0], 66) != 65 ||
+        fs_read_all(join(scratch, "archive.sha256") as str, &b[0], 66) != 65 || !mem_eq(&a[0], &b[0], 65) ||
+        fs_read_all(signature, &sig[0], 65) != 64) {
+        return false;
+    }
+    var command: array<str, 11> = ["/usr/bin/openssl", "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", trusted,
+        "-in", supplied, "-sigfile", signature];
+    return run(&command[0], 11) == 0;
+}
+
+pub fun signature_cli(signing: bool) -> i32 {
+    var archive: str = "";
+    var key: str = "";
+    var output: str = "";
+    for (var i: i32 = 2; i < argc(); i++) {
+        var option: str = arg(i);
+        if (i + 1 >= argc()) {
+            return 2;
+        }
+        i += 1;
+        if (mem_eq_cstr(option, "--archive")) {
+            archive = absolute(arg(i)) as str;
+        } else if (mem_eq_cstr(option, "--key") && signing) {
+            key = absolute(arg(i)) as str;
+        } else if (mem_eq_cstr(option, "--public-key") && !signing) {
+            key = absolute(arg(i)) as str;
+        } else if (mem_eq_cstr(option, "--signature-directory") && !signing) {
+            output = absolute(arg(i)) as str;
+        } else if (mem_eq_cstr(option, "--output") && signing) {
+            output = absolute(arg(i)) as str;
+        } else {
+            return 2;
+        }
+    }
+    if (archive[0] == 0 || key[0] == 0 || output[0] == 0 || !ensure_directory("target")) {
+        return 2;
+    }
+    var scratch: ptr<u8> = private_directory("target", "signature-");
+    if (scratch == null) {
+        return 1;
+    }
+    var ok: bool = false;
+    if (signing) {
+        ok = sign_archive(archive, key, output, scratch as str);
+    } else {
+        ok = verify_archive(archive, key, output, scratch as str);
+    }
+    ok = clean_private_directory(scratch as str) && ok;
+    println("Archive signature operation succeeded: {}", ok);
+    if (!ok) {
+        return 1;
+    }
+    return 0;
+}

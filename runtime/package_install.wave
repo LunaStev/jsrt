@@ -1,0 +1,763 @@
+// Production dependency installation. Metadata and locks use Wave wjson.
+import("./package_version")::{Version, parse_version};
+import("./package_semver")::{satisfies};
+import("./package_versions")::{select_version, registry_exact_version, select_peer_version, peer_version_matches};
+import("./package_cache")::{read_cached_archive, store_cached_archive};
+import("./package_workspaces")::{Workspace, workspace_prepare, workspace_clear, workspace_count, workspace_at,
+    workspace_find, workspace_range, workspace_matches, workspace_copy};
+import("./package_transaction")::{replace_transaction, transaction_error};
+import("./package_graph")::{Package, Peer, GraphCheckpoint, graph_checkpoint, graph_rollback, graph_clear,
+    valid_name, record_package, record_peer, peer_at, parent_scope, visible_package, record_skip,
+    write_graph_packages, write_graph_skips, graph_has_skip};
+import("wjson")::{JsonDoc, Json, JsonWriter, json_parse_bytes, json_ok, json_root, json_free, json_get,
+    json_len, json_key_at, json_is_valid, json_is_object, json_is_string, json_str_has_nul, json_as_str,
+    json_str_eq, json_i64_or, json_null_str, json_writer_new, json_writer_free, json_writer_finish, json_writer_len,
+    json_begin_object, json_end_object, json_key, json_field_i64, json_field_str, json_field_bool,
+    json_bool_or, json_is_bool, json_is_array, json_at, JSON_STRICT};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("std::fs::file")::{Metadata, metadata};
+import("./config")::{PACKAGE_ARCHIVE_LIMIT, PACKAGE_COUNT_LIMIT, PACKAGE_DEPTH_LIMIT, FILE_LIMIT};
+import("./package_io")::{Blob, package_fail, install_error, package_path, read_blob, download_blob, free_blob,
+    integrity, verify_integrity, prepare_install, begin_install, ensure_directory, extract_package, staged_path,
+    publish_install, end_install, require_https, install_checkpoint, rollback_install};
+import("./output")::{write_text};
+extern(c, "jsrt_argc") fun argc() -> i32;
+extern(c, "jsrt_argv") fun arg(index: i32) -> str;
+extern(c, "uv_os_uname") fun uname(bytes: ptr<u8>) -> i32;
+static root_path: str = ".";
+static offline: bool = false;
+static locked: bool = false;
+static include_dev: bool = false;
+static packages: Json;
+static locked_skips: Json;
+static used_skips: i64 = 0;
+static writer: JsonWriter;
+static installed: i64 = 0;
+static attempted: i64 = 0;
+static ancestor_names: array<str, 32>;
+static ancestor_versions: array<str, 32>;
+fun checked_string(value: Json) -> str {
+    if (!json_is_string(value) || json_str_has_nul(value)) {
+        return json_null_str();
+    }
+    return json_as_str(value);
+}
+
+fun exact_version(version: str) -> bool {
+    var parsed: Version = parse_version(version);
+    return parsed.valid;
+}
+
+fun validate_manifest(value: Json, root: bool) -> bool {
+    if (!json_is_object(value)) {
+        return package_fail("package manifest must be an object");
+    }
+    if (!root && json_len(json_get(value, "workspaces")) > 0) {
+        return package_fail("nested workspace declarations are not supported");
+    }
+    if (!validate_dependencies(json_get(value, "dependencies")) ||
+        !validate_dependencies(json_get(value, "optionalDependencies")) ||
+        !validate_dependencies(json_get(value, "peerDependencies"))) {
+        return false;
+    }
+    var meta: Json = json_get(value, "peerDependenciesMeta");
+    if (json_is_valid(meta) && !json_is_object(meta)) {
+        return package_fail("peerDependenciesMeta must be an object");
+    }
+    for (var i: i64 = 0; i < json_len(meta); i++) {
+        var name: str = json_key_at(meta, i);
+        var entry: Json = json_get(meta, name);
+        var optional: Json = json_get(entry, "optional");
+        if (!valid_name(name) || !json_is_object(entry) ||
+            (json_is_valid(optional) && !json_is_bool(optional))) {
+            return package_fail("invalid peerDependenciesMeta optional declaration");
+        }
+    }
+    return platform_compatible(value);
+}
+
+fun platform_list(value: Json, identity: str) -> bool {
+    if (!json_is_valid(value)) {
+        return true;
+    }
+    if (!json_is_array(value) || json_len(value) > PACKAGE_COUNT_LIMIT) {
+        return package_fail("os and cpu constraints must be bounded string arrays");
+    }
+    var positive: bool = false;
+    var matched: bool = false;
+    var excluded: bool = false;
+    for (var i: i64 = 0; i < json_len(value); i++) {
+        var item: str = checked_string(json_at(value, i));
+        if ((item as ptr<u8>) == null || item[0] == 0) {
+            return package_fail("invalid os or cpu constraint");
+        }
+        if (item[0] == 33) {
+            if (mem_eq_cstr((item as ptr<u8> + 1) as str, identity)) {
+                excluded = true;
+            }
+        } else {
+            positive = true;
+            if (mem_eq_cstr(item, identity) || mem_eq_cstr(item, "any")) {
+                matched = true;
+            }
+        }
+    }
+    if (excluded || (positive && !matched)) {
+        return package_fail("package os or cpu is incompatible with this installation host");
+    }
+    return true;
+}
+
+fun platform_compatible(value: Json) -> bool {
+    var bytes: array<u8, 1024>;
+    if (uname(&bytes[0]) < 0) {
+        return package_fail("cannot identify installation host");
+    }
+    var machine: str = &bytes[768] as str;
+    if (mem_eq_cstr(machine, "x86_64")) {
+        machine = "x64";
+    } else if (mem_eq_cstr(machine, "aarch64")) {
+        machine = "arm64";
+    }
+    // The supported installer target is Linux. Other targets require their own
+    // verified platform policy rather than accepting a guessed identity.
+    return platform_list(json_get(value, "os"), "linux") && platform_list(json_get(value, "cpu"), machine);
+}
+
+fun validate_dependencies(dependencies: Json) -> bool {
+    if (json_is_valid(dependencies) && !json_is_object(dependencies)) {
+        return package_fail("dependencies must be an object");
+    }
+    if (json_len(dependencies) == 0) {
+        return true;
+    }
+    if (json_len(dependencies) > PACKAGE_COUNT_LIMIT) {
+        return package_fail("invalid dependency map or package count limit exceeded");
+    }
+    for (var i: i64 = 0; i < json_len(dependencies); i++) {
+        var name: str = json_key_at(dependencies, i);
+        var version: str = checked_string(json_get(dependencies, name));
+        if (!valid_name(name) || !workspace_range(name, version)) {
+            return package_fail("dependencies require valid npm names and supported semver ranges");
+        }
+    }
+    return true;
+}
+
+fun registry_url(result: ptr<u8>, name: str, version: str) -> bool {
+    var encoded: array<u8, 512>;
+    var used: i64 = 0;
+    for (var i: i64 = 0; name[i] != 0; i++) {
+        if (name[i] == 47) {
+            encoded[used] = 37;
+            encoded[used+1] = 50;
+            encoded[used+2] = 70;
+            used += 3;
+        } else {
+            encoded[used] = name[i];
+            used += 1;
+        }
+    }
+    encoded[used] = 0;
+    var prefix: array<u8, 8192>;
+    if (!package_path(&prefix[0], "https://registry.npmjs.org", &encoded[0] as str)) {
+        return false;
+    }
+    if (version[0] == 0) {
+        return package_path(result, "https://registry.npmjs.org", &encoded[0] as str);
+    }
+    return package_path(result, &prefix[0] as str, version);
+}
+
+fun install_dependency_map(dependencies: Json, production: Json, overrides: Json, directory: str, level: i64,
+    development: bool) -> bool {
+    for (var i: i64 = 0; i < json_len(dependencies); i++) {
+        var name: str = json_key_at(dependencies, i);
+        if (json_is_valid(json_get(overrides, name))) {
+            continue;
+        }
+        if (development && json_is_valid(json_get(production, name))) {
+            continue;
+        }
+        var version: str = checked_string(json_get(dependencies, name));
+        var inherited: bool = false;
+        for (var j: i64 = level; j > 0; j--) {
+            if (mem_eq_cstr(ancestor_names[j-1], name)) {
+                inherited = satisfies(ancestor_versions[j-1], version);
+                break;
+            }
+        }
+        if (inherited) {
+            continue;
+        }
+        var parent: array<u8, 8192>;
+        var location: array<u8, 8192>;
+        if (!package_path(&parent[0], directory, "node_modules") || !package_path(&location[0], &parent[0] as str,
+            name)) {
+            return false;
+        }
+        if (!install_package(name, version, &location[0] as str, level)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fun install_dependencies(manifest: Json, directory: str, level: i64) -> bool {
+    if (!validate_manifest(manifest, mem_eq_cstr(directory, ""))) {
+        return false;
+    }
+    var dependencies: Json = json_get(manifest, "dependencies");
+    var optional: Json = json_get(manifest, "optionalDependencies");
+    if (!install_dependency_map(dependencies, dependencies, optional, directory, level, false)) {
+        return false;
+    }
+    // Registry packages never install their own development dependencies.
+    if (level == 0 && include_dev) {
+        var development: Json = json_get(manifest, "devDependencies");
+        if (!validate_dependencies(development) || !install_dependency_map(development, dependencies,
+            optional, directory, level, true)) {
+            return false;
+        }
+    }
+    if (!install_optional_map(optional, directory, level)) {
+        return false;
+    }
+    var peers: Json = json_get(manifest, "peerDependencies");
+    var meta: Json = json_get(manifest, "peerDependenciesMeta");
+    var scope: array<u8, 8192>;
+    parent_scope(directory, &scope[0]);
+    for (var i: i64 = 0; i < json_len(peers); i++) {
+        var name: str = json_key_at(peers, i);
+        var optional_peer: bool = json_bool_or(json_get(json_get(meta, name), "optional"), false);
+        var requirement: str = checked_string(json_get(peers, name));
+        var workspace: ptr<Workspace> = workspace_find(name);
+        if (workspace != null && requirement[0] == 119) {
+            requirement = deref workspace.version;
+        }
+        if (!record_peer(name, requirement, &scope[0] as str, optional_peer)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fun install_optional_map(dependencies: Json, directory: str, level: i64) -> bool {
+    for (var i: i64 = 0; i < json_len(dependencies); i++) {
+        var name: str = json_key_at(dependencies, i);
+        var requirement: str = checked_string(json_get(dependencies, name));
+        var inherited: bool = false;
+        for (var j: i64 = level; j > 0; j--) {
+            if (mem_eq_cstr(ancestor_names[j - 1], name)) {
+                inherited = satisfies(ancestor_versions[j - 1], requirement);
+                break;
+            }
+        }
+        if (inherited) {
+            continue;
+        }
+        var parent: array<u8, 8192>;
+        var location: array<u8, 8192>;
+        if (!package_path(&parent[0], directory, "node_modules") ||
+            !package_path(&location[0], &parent[0] as str, name)) {
+            return false;
+        }
+        if (locked) {
+            var skipped: Json = json_get(locked_skips, &location[0] as str);
+            if (json_is_valid(skipped)) {
+                if (!json_is_object(skipped) || !json_str_eq(json_get(skipped, "name"), name) ||
+                    !json_str_eq(json_get(skipped, "range"), requirement) ||
+                    json_is_valid(json_get(packages, &location[0] as str))) {
+                    return package_fail("lockfile optional skip does not match dependency");
+                }
+                used_skips += 1;
+                continue;
+            }
+            // A pinned installed optional package must still validate completely.
+            // A corrupt frozen archive cannot silently change the locked graph.
+            if (!install_package(name, requirement, &location[0] as str, level)) {
+                return false;
+            }
+            continue;
+        }
+        var checkpoint: i64 = install_checkpoint();
+        var graph: GraphCheckpoint = graph_checkpoint();
+        var before: i64 = installed;
+        if (!install_package(name, requirement, &location[0] as str, level)) {
+            var reason: str = install_error();
+            if (!rollback_install(checkpoint)) {
+                return false;
+            }
+            graph_rollback(graph);
+            installed = before;
+            if (!record_skip(&location[0] as str, name, requirement)) {
+                return false;
+            }
+            write_text(2, "Skipping optional dependency ");
+            write_text(2, name);
+            write_text(2, ": ");
+            write_text(2, reason);
+            write_text(2, "\n");
+        }
+    }
+    return true;
+}
+
+fun resolve_peers() -> bool {
+    var index: i64 = 0;
+    while (true) {
+        var peer: ptr<Peer> = peer_at(index);
+        if (peer == null) {
+            break;
+        }
+        var present: ptr<Package> = visible_package(deref peer.scope, deref peer.name);
+        if (present != null) {
+            if (!satisfies(deref present.version, deref peer.range)) {
+                return package_fail("peer dependency version conflict in visible parent scope");
+            }
+        } else if (!deref peer.optional) {
+            var parent: array<u8, 8192>;
+            var location: array<u8, 8192>;
+            if (!package_path(&parent[0], deref peer.scope, "node_modules") ||
+                !package_path(&location[0], &parent[0] as str, deref peer.name)) {
+                return false;
+            }
+            if (graph_has_skip(&location[0] as str) ||
+                (locked && json_is_valid(json_get(locked_skips, &location[0] as str)))) {
+                return package_fail("required peer conflicts with a skipped optional dependency");
+            }
+            // Previous manifest documents have been released. Only graph-owned
+            // identities survive into deferred peer resolution.
+            for (var i: i64 = 0; i < PACKAGE_DEPTH_LIMIT; i++) {
+                ancestor_names[i] = "";
+                ancestor_versions[i] = "";
+            }
+            var level: i64 = 0;
+            for (var i: i64 = 0; location[i] != 0; i++) {
+                if (location[i] == 47 && i >= 12) {
+                    level += 1;
+                }
+            }
+            if (!install_selected_package(deref peer.name, deref peer.range, &location[0] as str, level,
+                deref peer.scope, true)) {
+                return false;
+            }
+        }
+        index += 1;
+    }
+    // Installing a later peer may introduce a nearer visible package for an
+    // earlier edge. Recheck every constraint after the graph stops growing.
+    index = 0;
+    while (true) {
+        var peer: ptr<Peer> = peer_at(index);
+        if (peer == null) {
+            return true;
+        }
+        var present: ptr<Package> = visible_package(deref peer.scope, deref peer.name);
+        if ((present == null && !deref peer.optional) ||
+            (present != null && !satisfies(deref present.version, deref peer.range))) {
+            return package_fail("peer dependency version conflict after graph resolution");
+        }
+        index += 1;
+    }
+}
+
+fun install_package(name: str, requirement: str, location: str, level: i64) -> bool {
+    return install_selected_package(name, requirement, location, level, "", false);
+}
+
+fun install_selected_package(name: str, requirement: str, location: str, level: i64, peer_scope: str,
+    solving_peers: bool) -> bool {
+    if (level >= PACKAGE_DEPTH_LIMIT || installed >= PACKAGE_COUNT_LIMIT || attempted >= PACKAGE_COUNT_LIMIT) {
+        return package_fail("package graph count or depth limit exceeded");
+    }
+    installed += 1;
+    attempted += 1;
+    var workspace: ptr<Workspace> = workspace_find(name);
+    if (workspace != null) {
+        if (!workspace_matches(workspace, requirement)) {
+            return package_fail("local workspace version does not satisfy dependency range");
+        }
+        var present: ptr<Package> = visible_package("", name);
+        if (present != null) {
+            installed -= 1;
+            return true;
+        }
+        return install_workspace(workspace, location, level);
+    }
+    var version: str = requirement;
+    var document: JsonDoc = json_parse_bytes(null, 0, 64, JSON_STRICT);
+    var entry: Json;
+    var metadata_bytes: Blob = Blob {
+        bytes: null, length: 0, capacity: 0
+    };
+    var ok: bool = true;
+    if (locked) {
+        entry = json_get(packages, location);
+        version = checked_string(json_get(entry, "version"));
+        if (!json_is_object(entry) || !json_str_eq(json_get(entry, "name"), name) || !exact_version(version) || !satisfies(version,
+            requirement)) {
+            ok = package_fail("lockfile does not match dependency name version or location");
+        }
+        if (ok && solving_peers && !peer_version_matches(version, name, peer_scope)) {
+            ok = package_fail("locked peer version does not satisfy the shared scope constraints");
+        }
+    } else {
+        var url: array<u8, 8192>;
+        var exact: bool = registry_exact_version(requirement);
+        var registry_version: str = "";
+        if (exact) {
+            registry_version = requirement;
+        }
+        ok = registry_url(&url[0], name, registry_version);
+        if (ok) {
+            metadata_bytes = download_blob(&url[0] as str, FILE_LIMIT);
+            ok = metadata_bytes.bytes != null;
+        }
+        if (ok) {
+            json_free(&document);
+            document = json_parse_bytes(metadata_bytes.bytes, metadata_bytes.length, 64, JSON_STRICT);
+            entry = json_root(document);
+            if (json_ok(document) && !exact) {
+                var versions: Json = json_get(entry, "versions");
+                if (solving_peers) {
+                    version = select_peer_version(versions, requirement, name, peer_scope);
+                } else {
+                    version = select_version(versions, requirement);
+                }
+                if ((version as ptr<u8>) != null) {
+                    entry = json_get(versions, version);
+                } else {
+                    ok = package_fail("no registry version satisfies dependency range");
+                }
+            }
+            if (ok) {
+                ok = json_ok(document) && json_is_object(entry) && json_str_eq(json_get(entry, "name"),
+                    name) && json_str_eq(json_get(entry, "version"), version);
+                if (!ok) {
+                    package_fail("registry metadata name/version mismatch or invalid wjson document");
+                }
+            }
+        }
+    }
+    var source: str = json_null_str();
+    var expected: str = json_null_str();
+    if (ok) {
+        var dist: Json = entry;
+        if (!locked) {
+            dist = json_get(entry, "dist");
+        }
+        var source_key: str = "resolved";
+        if (!locked) {
+            source_key = "tarball";
+        }
+        source = checked_string(json_get(dist, source_key));
+        expected = checked_string(json_get(dist, "integrity"));
+        if ((source as ptr<u8>) == null || (expected as ptr<u8>) == null) {
+            ok = package_fail("package archive URL and SHA512 integrity are required");
+        }
+    }
+    var archive: Blob = Blob {
+        bytes: null, length: 0, capacity: 0
+    };
+    var cached: bool = false;
+    if (ok) {
+        var local: bool = mem_len_cstr(source) > 5 && source[0] == 102 && source[1] == 105 && source[2] == 108 && source[3] == 101 && source[4] == 58;
+        if (local && offline && locked) {
+            var path: array<u8, 8192>;
+            if (source[5] == 47) {
+                archive = read_blob((source as ptr<u8> + 5) as str, PACKAGE_ARCHIVE_LIMIT);
+            } else if (package_path(&path[0], root_path, (source as ptr<u8> + 5) as str)) {
+                archive = read_blob(&path[0] as str, PACKAGE_ARCHIVE_LIMIT);
+            }
+        } else if (local) {
+            package_fail("file: archives require --offline and a matching lockfile");
+        } else if (require_https(source)) {
+            var hit: i64 = read_cached_archive(expected, &archive);
+            if (hit == 1) {
+                cached = true;
+            } else if (hit == 0 && !offline) {
+                archive = download_blob(source, PACKAGE_ARCHIVE_LIMIT);
+            } else if (hit == 0) {
+                package_fail("offline installation requires a verified cached archive or file: source");
+            }
+        }
+        ok = archive.bytes != null;
+    }
+    if (ok) {
+        ok = verify_integrity(archive, expected);
+    }
+    if (ok && !cached && !offline) {
+        ok = store_cached_archive(archive, expected);
+    }
+    if (ok) {
+        ok = extract_package(archive, location);
+    }
+    free_blob(&archive);
+    var manifest_bytes: Blob = Blob {
+        bytes: null, length: 0, capacity: 0
+    };
+    var manifest_doc: JsonDoc = json_parse_bytes(null, 0, 64, JSON_STRICT);
+    if (ok) {
+        var relative: array<u8, 8192>;
+        var path: array<u8, 8192>;
+        ok = package_path(&relative[0], location, "package.json") && staged_path(&path[0], &relative[0] as str);
+        if (ok) {
+            manifest_bytes = read_blob(&path[0] as str, FILE_LIMIT);
+            ok = manifest_bytes.bytes != null;
+        }
+        if (ok) {
+            json_free(&manifest_doc);
+            manifest_doc = json_parse_bytes(manifest_bytes.bytes, manifest_bytes.length, 64, JSON_STRICT);
+            var actual: Json = json_root(manifest_doc);
+            ok = json_ok(manifest_doc) && json_str_eq(json_get(actual, "name"), name) && json_str_eq(json_get(actual,
+                "version"), version);
+            if (!ok) {
+                package_fail("archive package.json does not match locked package identity");
+            }
+        }
+    }
+    if (ok) {
+        ok = record_package(name, version, location, source, expected);
+    }
+    if (ok) {
+        ancestor_names[level] = name;
+        ancestor_versions[level] = version;
+        ok = install_dependencies(json_root(manifest_doc), location, level+1);
+    }
+    json_free(&manifest_doc);
+    free_blob(&manifest_bytes);
+    json_free(&document);
+    free_blob(&metadata_bytes);
+    return ok;
+}
+
+pub fun run_install() -> i32 {
+    graph_clear();
+    workspace_clear();
+    for (var i: i64 = 0; i < PACKAGE_DEPTH_LIMIT; i++) {
+        ancestor_names[i] = "";
+        ancestor_versions[i] = "";
+    }
+    root_path = ".";
+    offline = false;
+    locked = false;
+    installed = 0;
+    attempted = 0;
+    used_skips = 0;
+    include_dev = false;
+    var frozen: bool = false;
+    var replace: bool = false;
+    var refresh: bool = false;
+    for (var i: i32 = 2; i < argc(); i++) {
+        var option: str = arg(i);
+        if (mem_eq_cstr(option, "--include-dev")) {
+            include_dev = true;
+        } else if (mem_eq_cstr(option, "--replace")) {
+            replace = true;
+        } else if (mem_eq_cstr(option, "--update")) {
+            replace = true;
+            refresh = true;
+        } else if (mem_eq_cstr(option, "--offline")) {
+            offline = true;
+            frozen = true;
+        } else if (mem_eq_cstr(option, "--frozen-lockfile")) {
+            frozen = true;
+        } else if (mem_eq_cstr(option, "--project") && i+1 < argc()) {
+            i += 1;
+            root_path = arg(i);
+        } else {
+            write_text(2, "install accepts --include-dev --offline --frozen-lockfile --replace --update and --project <directory>\n");
+            return 2;
+        }
+    }
+    if (refresh && frozen) {
+        write_text(2, "--update cannot be combined with --offline or --frozen-lockfile\n");
+        return 2;
+    }
+    if (!prepare_install(root_path)) {
+        write_text(2, install_error());
+        write_text(2, "\n");
+        return 1;
+    }
+    var path: array<u8, 8192>;
+    if (!package_path(&path[0], root_path, "package.json")) {
+        end_install();
+        return 1;
+    }
+    var manifest_bytes: Blob = read_blob(&path[0] as str, FILE_LIMIT);
+    if (manifest_bytes.bytes == null) {
+        write_text(2, install_error());
+        write_text(2, "\n");
+        end_install();
+        return 1;
+    }
+    var manifest_doc: JsonDoc = json_parse_bytes(manifest_bytes.bytes, manifest_bytes.length, 64, JSON_STRICT);
+    var manifest: Json = json_root(manifest_doc);
+    var ok: bool = json_ok(manifest_doc);
+    if (!ok) {
+        package_fail("package.json is not a valid wjson document");
+    } else {
+        ok = workspace_prepare(json_get(manifest, "workspaces")) && validate_manifest(manifest, true);
+        if (ok && include_dev) {
+            ok = validate_dependencies(json_get(manifest, "devDependencies"));
+        }
+    }
+    var fingerprint: array<u8, 96>;
+    if (ok) {
+        ok = integrity(manifest_bytes.bytes, manifest_bytes.length, &fingerprint[0]);
+    }
+    var lock_bytes: Blob = Blob {
+        bytes: null, length: 0, capacity: 0
+    };
+    var lock_doc: JsonDoc = json_parse_bytes(null, 0, 64, JSON_STRICT);
+    var info: Metadata;
+    var previous_lock: bool = false;
+    if (ok && package_path(&path[0], root_path, "jsrt.lock.wjson")) {
+        previous_lock = metadata(&path[0] as str, &info) == 0;
+        locked = previous_lock && !refresh;
+        if (frozen && !locked) {
+            ok = package_fail("frozen install requires jsrt.lock.wjson");
+        }
+        if (ok && locked) {
+            lock_bytes = read_blob(&path[0] as str, FILE_LIMIT);
+            ok = lock_bytes.bytes != null;
+            if (ok) {
+                json_free(&lock_doc);
+                lock_doc = json_parse_bytes(lock_bytes.bytes, lock_bytes.length, 64, JSON_STRICT);
+                var root: Json = json_root(lock_doc);
+                packages = json_get(root, "packages");
+                locked_skips = json_get(root, "optionalSkips");
+                ok = json_ok(lock_doc) && json_i64_or(json_get(root, "lockfileVersion"), 0) == 1 && json_str_eq(json_get(root,
+                    "manifestIntegrity"), &fingerprint[0] as str) && json_is_object(packages) && json_len(packages) <= PACKAGE_COUNT_LIMIT;
+                var mode: Json = json_get(root, "includeDev");
+                ok = ok && (!json_is_valid(mode) || json_is_bool(mode)) &&
+                    json_bool_or(mode, false) as i32 == include_dev as i32;
+                ok = ok && (!json_is_valid(locked_skips) || json_is_object(locked_skips)) &&
+                    json_len(locked_skips) <= PACKAGE_COUNT_LIMIT;
+                if (!ok) {
+                    package_fail("lockfile is invalid or package.json changed");
+                }
+            }
+        }
+    }
+    if (ok && package_path(&path[0], root_path, "node_modules") && metadata(&path[0] as str, &info) == 0) {
+        if (!replace) {
+            ok = package_fail("node_modules already exists; use --replace or --update for a managed tree");
+        } else if (!previous_lock) {
+            ok = package_fail("replacing a managed tree requires its existing lockfile");
+        } else {
+            ok = replace_transaction(true, refresh);
+            if (!ok) {
+                package_fail(transaction_error());
+            }
+        }
+    } else if (ok && refresh && previous_lock) {
+        ok = replace_transaction(false, true);
+        if (!ok) {
+            package_fail(transaction_error());
+        }
+    }
+    writer = json_writer_new(2);
+    if (ok && !locked) {
+        ok = json_begin_object(&writer) && json_field_i64(&writer, "lockfileVersion", 1) && json_field_str(&writer,
+            "manifestIntegrity", &fingerprint[0] as str) && json_field_bool(&writer, "includeDev", include_dev) &&
+            json_key(&writer, "packages") && json_begin_object(&writer);
+    }
+    var started: bool = false;
+    if (ok) {
+        started = begin_install(root_path);
+        ok = started && ensure_directory("node_modules");
+    }
+    if (ok) {
+        // Publish every declared workspace, including those without root edges.
+        // Register the complete local graph first so local cycles never recurse.
+        for (var i: i64 = 0; i < workspace_count() && ok; i++) {
+            var workspace: ptr<Workspace> = workspace_at(i);
+            var location: array<u8, 8192>;
+            ok = package_path(&location[0], "node_modules", deref workspace.name);
+            if (ok) {
+                installed += 1;
+                attempted += 1;
+                ok = install_workspace_snapshot(workspace, &location[0] as str);
+            }
+        }
+        for (var i: i64 = 0; i < workspace_count() && ok; i++) {
+            var workspace: ptr<Workspace> = workspace_at(i);
+            var location: array<u8, 8192>;
+            ancestor_names[0] = deref workspace.name;
+            ancestor_versions[0] = deref workspace.version;
+            ok = package_path(&location[0], "node_modules", deref workspace.name) &&
+                install_dependencies(deref workspace.manifest, &location[0] as str, 1);
+        }
+    }
+    if (ok) {
+        ok = install_dependencies(manifest, "", 0);
+    }
+    if (ok) {
+        ok = resolve_peers();
+    }
+    if (ok && locked && installed != json_len(packages)) {
+        ok = package_fail("lockfile contains unused or duplicate package locations");
+    }
+    if (ok && locked && used_skips != json_len(locked_skips)) {
+        ok = package_fail("lockfile contains unused optional skips");
+    }
+    if (ok && !locked) {
+        ok = write_graph_packages(&writer) && json_end_object(&writer) &&
+            write_graph_skips(&writer) && json_end_object(&writer);
+    }
+    var lock_text: str = json_null_str();
+    var lock_length: i64 = 0;
+    if (ok && !locked) {
+        lock_text = json_writer_finish(&writer);
+        lock_length = json_writer_len(&writer);
+        ok = (lock_text as ptr<u8>) != null && lock_length <= FILE_LIMIT;
+    }
+    if (ok) {
+        ok = publish_install(lock_text as ptr<u8>, lock_length, !locked);
+    }
+    if (!end_install()) {
+        ok = false;
+    }
+    json_writer_free(&writer);
+    json_free(&lock_doc);
+    free_blob(&lock_bytes);
+    json_free(&manifest_doc);
+    free_blob(&manifest_bytes);
+    graph_clear();
+    workspace_clear();
+    if (!ok) {
+        write_text(2, install_error());
+        write_text(2, "\n");
+        return 1;
+    }
+    println("Installed {} packages; lifecycle scripts disabled", installed);
+    return 0;
+}
+
+fun install_workspace_snapshot(workspace: ptr<Workspace>, location: str) -> bool {
+    if (installed > PACKAGE_COUNT_LIMIT || attempted > PACKAGE_COUNT_LIMIT) {
+        return package_fail("workspace package graph budget exceeded");
+    }
+    var hash: str = &(deref workspace.fingerprint)[0] as str;
+    if (locked) {
+        var entry: Json = json_get(packages, location);
+        if (!json_is_object(entry) || !json_str_eq(json_get(entry, "name"), deref workspace.name) ||
+            !json_str_eq(json_get(entry, "version"), deref workspace.version) ||
+            !json_str_eq(json_get(entry, "resolved"), deref workspace.source) ||
+            !json_str_eq(json_get(entry, "integrity"), hash)) {
+            return package_fail("locked workspace snapshot does not match local content");
+        }
+    }
+    return workspace_copy(workspace, location) && record_package(deref workspace.name, deref workspace.version,
+        location, deref workspace.source, hash);
+}
+fun install_workspace(workspace: ptr<Workspace>, location: str, level: i64) -> bool {
+    if (!install_workspace_snapshot(workspace, location)) {
+        return false;
+    }
+    ancestor_names[level] = deref workspace.name;
+    ancestor_versions[level] = deref workspace.version;
+    return install_dependencies(deref workspace.manifest, location, level + 1);
+}

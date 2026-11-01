@@ -1,0 +1,496 @@
+// Web values, buffers, events and Node/Web stream regressions.
+import("jsrt::tools::support")::{join};
+import("std::fs::file")::{create, write, remove};
+import("std::io::fd")::{io_close};
+import("std::sys::fs")::{ftruncate, mkdir};
+import("./harness")::{async_case, check, contains, expect, filesystem_case, test, TestState, test_state};
+extern(c, "symlink") fun symlink(target: str, link_path: str) -> i32;
+
+pub fun buffer_tests() {
+    test("Buffer builtin identity and Uint8Array inheritance", "const B=require('node:buffer').Buffer;const b=B.from('Wave');console.log(B===Buffer,require('buffer')===require('node:buffer'),b instanceof Uint8Array,b instanceof Buffer,Buffer.isBuffer(b),b.length,b.toString());",
+        "true true true true true 4 Wave\n", 0, "");
+    test("Buffer alloc is zeroed and validates size", "console.log(Buffer.alloc(3).toString('hex'),Buffer.allocUnsafe(3).toString('hex'));for(const n of [-1,Infinity,NaN,1.5,4194305]){try{Buffer.alloc(n);throw 'wrong'}catch(e){if(!(e instanceof RangeError))throw e}}for(const n of ['3',{},null]){try{Buffer.alloc(n);throw 'wrong'}catch(e){if(!(e instanceof TypeError))throw e}}console.log('validated');",
+        "000000 000000\nvalidated\n", 0, "");
+    test("Buffer UTF-8 preserves NUL and replaces lone surrogates", "const b=Buffer.from('한글😀\\0\\ud800');console.log(b.length,Buffer.byteLength('한글😀\\0\\ud800'),b.toString('hex'));console.log(JSON.stringify(b.toString()));",
+        "14 14 ed959ceab880f09f988000efbfbd\n\"한글😀\\u0000�\"\n", 0, "");
+    test("Buffer hex truncation and base64 roundtrip", "console.log(Buffer.from('aabbq1','hex').toString('hex'),Buffer.from('aab','hex').toString('hex'));const b=Buffer.from([0,255,254,1]);console.log(b.toString('base64'),b.toString('base64url'),Buffer.from(' AP_-AQ==!','base64').toString('hex'));",
+        "aabb aa\nAP/+AQ== AP_-AQ 00fffe01\n", 0, "");
+    test("Buffer latin1 ascii and UTF-16LE codecs", "const b=Buffer.from('éÿ','latin1');console.log(b.toString('hex'),b.toString('latin1')==='éÿ',b.toString('ascii')==='i\\x7f');console.log(Buffer.from('A😀\\ud800','utf16le').toString('hex'));console.log(Buffer.from([65,0,66],'utf16le').toString('utf16le'));",
+        "e9ff true true\n41003dd800de00d8\nA\n", 0, "");
+    test("Buffer UTF-8 replacement uses maximal valid prefixes", "for(const bytes of [[0xe1,0x82],[0xe1,0x82,65],[0xed,0xa0,0x80],[0xf0,0x90,0x80],[0xc0,0xaf]])console.log(JSON.stringify(Buffer.from(bytes).toString()));",
+        "\"�\"\n\"�A\"\n\"���\"\n\"�\"\n\"��\"\n", 0, "");
+    test("Buffer array conversion follows Uint8 element conversion", "const a=[-1,256,1.9,NaN,Infinity,undefined,'7',{valueOf(){return 258}}];console.log(Buffer.from(a).toString('hex'));const a2=[];Object.defineProperty(a2,0,{get(){throw new Error('element getter')}});a2.length=1;try{Buffer.from(a2)}catch(e){console.log(e.message)}",
+        "ff00010000000702\nelement getter\n", 0, "");
+    test("Buffer ArrayBuffer views share and Uint8 copies respect offsets", "const a=new Uint8Array([10,20,30,40,50]);const b=Buffer.from(a.buffer,1,3),c=Buffer.from(a.subarray(2,4));b[0]=99;a[2]=88;console.log([...b].join(','),[...c].join(','),b.byteOffset);const d=b.subarray(1,3);d[0]=77;console.log([...a].join(','),Buffer.isBuffer(d),d.byteOffset);",
+        "99,88,40 30,40 1\n10,99,77,40,50 true 2\n", 0, "");
+    test("Buffer slice shares storage with negative relative indices", "const a=Buffer.from('abcde'),b=a.slice(-3,-1);b[0]=88;console.log(a.toString(),b.toString(),a.subarray(9).length,a.subarray(4,1).length,a.toString('utf8',-4,2));",
+        "abXde Xd 0 0 ab\n", 0, "");
+    test("Buffer fill repeats encoded patterns and handles overlap", "const a=Buffer.alloc(7,'ab');console.log(a.toString());a.fill('ff',1,4,'hex');console.log(a.toString('hex'));const b=Buffer.from([1,2,3,4]);b.fill(b.subarray(1,3));console.log(b.toString('hex'));",
+        "abababa\n61ffffff616261\n02030203\n", 0, "");
+    test("Buffer copy snapshots overlapping views", "const b=Buffer.from('abcde');console.log(b.copy(b,1,0,4),b.toString());const c=Buffer.alloc(2);console.log(b.copy(c,0,2),c.toString(),b.copy(c,99));",
+        "4 aabcd\n2 bc 0\n", 0, "");
+    test("Buffer concat copies views and pads or truncates", "const a=Buffer.from('ab'),b=new Uint8Array([99]);console.log(Buffer.concat([a,b]).toString(),Buffer.concat([a,b],5).toString('hex'),Buffer.concat([a,b],1).toString());console.log(Buffer.concat([]).length);",
+        "abc 6162630000 a\n0\n", 0, "");
+    test("Buffer compares unsigned bytes", "const a=Buffer.from([0,255]),b=Buffer.from([0,128]);console.log(a.equals(Buffer.from(a)),a.compare(b),Buffer.compare(b,a),Buffer.compare(Buffer.from([0]),a));",
+        "true 1 -1 -1\n", 0, "");
+    test("Buffer brand cannot be forged with its prototype", "const fake=Object.create(Buffer.prototype),b=Buffer.from('x');console.log(Buffer.isBuffer(fake),Buffer.isBuffer(new Uint8Array(1)));Object.setPrototypeOf(b,null);console.log(Buffer.isBuffer(b));",
+        "false false\ntrue\n", 0, "");
+    test("Buffer native storage and brand resist global mutation", "const B=Buffer;WeakSet.prototype.add=WeakSet.prototype.has=()=>{throw Error('intercepted')};globalThis.Uint8Array=null;globalThis.Buffer=null;const b=B.from('alive');console.log(B.isBuffer(b),b.toString(),require('buffer').Buffer===B);",
+        "true alive true\n", 0, "");
+    test("Buffer inherited typed-array methods use safe species", "const b=Buffer.from([1,2]);console.log([...b.map(x=>x+1)].join(','),Buffer.isBuffer(b.map(x=>x)));",
+        "2,3 false\n", 0, "");
+    test("Buffer toJSON uses wjson and bypasses inherited setters", "Object.defineProperty(Array.prototype,0,{set(){throw Error('setter')},configurable:true});console.log(JSON.stringify(Buffer.from([1,2,255])));delete Array.prototype[0];",
+        "{\"type\":\"Buffer\",\"data\":[1,2,255]}\n", 0, "");
+    test("Buffer rejects unsupported inputs and invalid receivers", "for(const f of [()=>Buffer.from(4),()=>new Buffer(4),()=>Buffer.from('a','unknown'),()=>Buffer.from(new ArrayBuffer(2),3),()=>Buffer.prototype.toString.call({}),()=>Buffer.concat([{}])]){let failed=false;try{f()}catch(e){failed=e instanceof TypeError||e instanceof RangeError}if(!failed)throw Error('missing error')}console.log(Buffer.isEncoding('UTF-8'),Buffer.isEncoding('base64url'),Buffer.isEncoding(''),Buffer.isEncoding(undefined));",
+        "true true false false\n", 0, "");
+}
+
+pub fun event_tests() {
+    test("EventEmitter module identity and synchronous listener receiver", "const E=require('events'),e=new E;console.log(E===require('node:events'),E.EventEmitter===E,e instanceof E,e.addListener===e.on,e.off===e.removeListener);e.on('x',function(a,b){console.log(this===e,a,b)});console.log(e.emit('x',1,'two'),e.emit('absent'));",
+        "true true true true true\ntrue 1 two\ntrue false\n", 0, "");
+    test("EventEmitter once is removed before recursive emission", "const e=new(require('events'));let n=0;e.once('x',()=>{n++;e.emit('x')});e.emit('x');console.log(n,e.listenerCount('x'));",
+        "1 0\n", 0, "");
+    test("EventEmitter mutation preserves current emission snapshot", "const e=new(require('events')),log=[];function b(){log.push('b')}e.on('x',()=>{log.push('a');e.off('x',b);e.on('x',()=>log.push('c'))});e.on('x',b);e.emit('x');e.emit('x');console.log(log.join(','));",
+        "a,b,a,c\n", 0, "");
+    test("EventEmitter append keeps outer length while recursive emission sees new listeners", "const e=new(require('events')),log=[];let nested=false;e.on('x',()=>{log.push(nested?'a1':'a0');if(!nested){e.on('x',()=>log.push('c1'));nested=true;e.emit('x');nested=false}});e.on('x',()=>log.push(nested?'b1':'b0'));e.emit('x');console.log(log.join(','),e.listenerCount('x'));",
+        "a0,a1,b1,c1,b0 3\n", 0, "");
+    test("EventEmitter duplicate removal selects latest registration", "const e=new(require('events')),log=[];function a(){log.push('a')}e.on('x',a);e.on('x',()=>log.push('b'));e.on('x',a);console.log(e.listenerCount('x',a));e.off('x',a);e.emit('x');console.log(log.join(','));",
+        "2\na,b\n", 0, "");
+    test("EventEmitter prepends and once variants preserve order", "const e=new(require('events')),log=[];e.on('x',()=>log.push('a'));e.prependListener('x',()=>log.push('b'));e.prependOnceListener('x',()=>log.push('c'));e.emit('x');e.emit('x');console.log(log.join(','));",
+        "c,b,a,b,a\n", 0, "");
+    test("EventEmitter names preserve symbols NUL and prototype keys", "const e=new(require('events')),s=Symbol('x');for(const k of ['__proto__','x\\0y',s])e.on(k,()=>console.log(typeof k));e.emit('__proto__');e.emit('x\\0y');e.emit(s);console.log(e.eventNames()[2]===s,e.eventNames().length);",
+        "string\nstring\nsymbol\ntrue 3\n", 0, "");
+    test("EventEmitter listener inspection returns independent snapshots", "const e=new(require('events'));function f(){}e.once('x',f);const a=e.listeners('x');console.log(a[0]===f);a.length=0;e.removeAllListeners('other');console.log(e.listenerCount('x'));e.removeAllListeners();console.log(e.eventNames().length);",
+        "true\n1\n0\n", 0, "");
+    test("EventEmitter listener exceptions preserve identity and stop dispatch", "const e=new(require('events')),err=new Error('x');e.on('x',()=>{throw err});e.on('x',()=>console.log('wrong'));try{e.emit('x')}catch(x){console.log(x===err)};try{e.emit('error',err)}catch(x){console.log(x===err)};e.on('error',x=>console.log(x===err));e.emit('error',err);",
+        "true\ntrue\ntrue\n", 0, "");
+    test("EventEmitter private collections resist intrinsic mutation", "const E=require('events'),e=new E;WeakMap.prototype.get=WeakMap.prototype.set=()=>{throw Error('intercepted')};Reflect.defineProperty=null;Array.prototype.push=null;e.on('x',()=>console.log('alive'));e.emit('x');",
+        "alive\n", 0, "");
+    test("EventEmitter listener limits release capacity after removal", "const e=new(require('events'));for(let i=0;i<1024;i++)e.on('x',()=>{});try{e.on('x',()=>{})}catch(x){console.log(x instanceof RangeError)}e.removeAllListeners();e.on('x',()=>{});console.log(e.listenerCount('x'));",
+        "true\n1\n", 0, "");
+    test("EventEmitter validates event and callback without coercion", "const e=new(require('events'));for(const run of [()=>e.on({},()=>{}),()=>e.once('x',4),()=>e.emit(),()=>e.off('x',null)]){try{run()}catch(x){console.log(x instanceof TypeError)}}",
+        "true\ntrue\ntrue\ntrue\n", 0, "");
+    test("EventEmitter preserves derived class prototypes", "const E=require('events');class A extends E{fire(){return this.emit('x')}}const a=new A;a.on('x',function(){console.log(this===a,this instanceof A)});console.log(a.fire(),a instanceof E);",
+        "true true\ntrue true\n", 0, "");
+}
+
+pub fun stream_tests() {
+    var suite: ptr<TestState> = test_state();
+    test("EventTarget reports listener failures after dispatch completes", "const t=new EventTarget();t.addEventListener('x',()=>{throw Error('event-boom')});t.addEventListener('x',()=>console.log('later'));let caught=false;try{t.dispatchEvent(new Event('x'))}catch(e){caught=true}console.log(caught);",
+        "later\nfalse\n", 1, "event-boom");
+    var web_stream_command: array<str, 3> = [(deref suite.binary) as str, "run", "tests/web_streams.js"];
+    expect("Web Streams lifecycle regressions", &web_stream_command[0], 3, null, -1, 0, "");
+    check("Web Streams regressions completed", contains((deref suite.output), (deref suite.output_count), "Web Streams checks passed"));
+    var correctness_command: array<str, 3> = [(deref suite.binary) as str, "run", "tests/web_regressions.js"];
+    expect("Web API correctness regressions", &correctness_command[0], 3, null, -1, 0, "");
+    check("Web correctness regressions completed", contains((deref suite.output), (deref suite.output_count), "Web correctness checks passed"));
+    test("Request fetch preserves TLS refusal and first throwing option getter", "const q=new Request('https://example.test/',{method:'POST',body:'x'}),r=new Request('https://example.test/'),reason={};let later=false;Promise.all([fetch(q,{rejectUnauthorized:false}).catch(e=>console.log(e.message.includes('cannot be disabled'))),fetch(r,{get method(){throw reason},get headers(){later=true}}).catch(e=>console.log(e===reason,later))]);",
+        "true\ntrue false\n", 0, "");
+    test("FormData and Blob uploads preserve pre-aborted fetch reasons", "const c=new AbortController,reason={};c.abort(reason);const f=new FormData;f.append('name','value');Promise.all([f,new Blob(['x'])].map(body=>fetch('https://example.test/',{method:'POST',body,signal:c.signal}).catch(e=>console.log(e===reason))));",
+        "true\ntrue\n", 0, "");
+    test("stream hooks validate primitive writev and stop after reentrant destruction", "const s=require('stream');try{new s.Writable({writev:1})}catch(e){console.log(e instanceof TypeError)}const w=new s.Writable({write(){throw Error('unexpected')}});Object.defineProperty(w,'_writev',{get(){w.destroy();return ()=>{throw Error('unexpected')}}});w.on('close',()=>console.log('closed'));w.cork();w.write('a');w.write('b');w.uncork();",
+        "true\nclosed\n", 0, "");
+    test("FormData preserves duplicates and snapshot iterators do not expose private entries", "const f=new FormData;f.append('a',1);f.append('a','two');f.append('b','three');const pairs=Array.from(f);pairs[0][1]='changed';console.log(f instanceof FormData,f.getAll('a').join(','),f.has('b'),f.get('missing'));f.set('a','new');console.log(Array.from(f.keys()).join(','),Array.from(f.values()).join(','));f.delete('b');console.log(f.has('b'),f.get('a'));",
+        "true 1,two true null\na,b new,three\nfalse new\n", 0, "");
+    test("FormData encodes multipart bytes and escapes disposition attributes", "const f=new FormData,b=new Blob(['abc']);f.append('a\"\\r\\n','한');f.append('file',b,'x\".txt');const r=new Response(f);console.log(f.get('file')===b,r.headers.get('content-type').startsWith('multipart/form-data; boundary=jsrt-'));r.text().then(s=>console.log(s.includes('name=\"a%22%0D%0A\"'),s.includes('filename=\"x%22.txt\"'),s.includes('application/octet-stream'),s.includes('abc'),s.endsWith('--\\r\\n')));",
+        "true true\ntrue true true true true\n", 0, "");
+    test("FormData conversion failure and capacity leave previous entries intact", "const f=new FormData,reason={};f.append('a','keep');try{f.set('a',{toString(){throw reason}})}catch(e){console.log(e===reason)}console.log(f.get('a'));for(let i=1;i<1024;i++)f.append('x','y');try{f.append('z','no')}catch(e){console.log(e instanceof RangeError)}f.delete('x');f.append('z','yes');console.log(f.get('z'));",
+        "true\nkeep\ntrue\nyes\n", 0, "");
+    test("Blob snapshots bytes and supports repeated reads and slices", "const b=Buffer.from('abc'),x=new Blob([b,'한'],{type:'TEXT/PLAIN'});b[0]=122;console.log(x.size,x.type,x instanceof Blob);Promise.all([x.text(),x.text(),x.slice(1,3).text(),x.bytes()]).then(v=>console.log(v[0],v[1],v[2],v[3].length));",
+        "6 text/plain true\nabc한 abc한 bc 6\n", 0, "");
+    test("Response JSON uses captured wjson and clones before consumption", "const r=Response.json({a:1},{status:201}),c=r.clone();JSON.stringify=()=>{throw Error('replaced')};console.log(r instanceof Response,r.status,r.ok,r.headers.get('content-type'),r.bodyUsed);Promise.all([r.json(),c.text(),Response.json({b:2}).text()]).then(v=>console.log(v[0].a,v[1],v[2],r.bodyUsed));",
+        "true 201 true application/json false\n1 {\"a\":1} {\"b\":2} true\n", 0, "");
+    test("Request snapshots URL headers method and buffered body", "const q=new Request('https://example.test/path',{method:'post',headers:{x:'y'},body:new Blob(['abc'],{type:'text/plain'})}),c=q.clone();console.log(q instanceof Request,q.url,q.method,q.headers.get('x'),q.headers.get('content-type'));Promise.all([q.text(),c.text()]).then(v=>console.log(v.join(',')));",
+        "true https://example.test/path POST y text/plain\nabc,abc\n", 0, "");
+    test("Web constructors reject invalid bodies statuses methods and preserve getter failures", "let n=0;for(const f of [()=>new Response('x',{status:204}),()=>new Response('',{status:199}),()=>new Request('https://example.test',{body:'x'}),()=>new Request('https://example.test',{method:'TRACE'})])try{f()}catch(e){n++}const reason={};try{new Blob(['x'],{get type(){throw reason},get endings(){throw Error('later')}})}catch(e){console.log(e===reason)}console.log(n);",
+        "true\n4\n", 0, "");
+    test("Duplex keeps readable and writable completion independent", "const s=require('stream'),d=new s.Duplex({read(){this.push('r');this.push(null)},write(b,e,done){console.log('write',b.toString());done()}});console.log(d instanceof s.Readable,new s.Transform() instanceof s.Duplex);d.on('data',b=>console.log('read',b.toString()));d.on('end',()=>{console.log('end',d.writableFinished);d.end('w')});d.on('finish',()=>console.log('finish',d.readableEnded));",
+        "true true\nread r\nend false\nwrite w\nfinish true\n", 0, "");
+    test("nested cork defers writes and writev completes each callback", "const s=require('stream'),out=[],w=new s.Writable({writev(xs,d){console.log(xs.map(x=>x.chunk.toString()).join(''),xs[0].encoding);d()}});w.cork();w.cork();w.write('a',()=>out.push('a'));w.write('b',()=>out.push('b'));console.log(w.writableCorked,w.writableLength);w.uncork();console.log(w.writableCorked);w.end(()=>console.log(out.join(''),w.writableCorked,w.writableLength));",
+        "2 2\n1\nab buffer\nab 0 0\n", 0, "");
+    test("stream abort runs before user abort listeners and preserves cause", "const c=new AbortController(),s=new(require('stream').PassThrough)({signal:c.signal}),reason={};s.on('error',e=>console.log(e.name,e.cause===reason));s.on('close',()=>console.log('close'));c.signal.addEventListener('abort',()=>console.log(s.destroyed));c.abort(reason);",
+        "true\nAbortError true\nclose\n", 0, "");
+    test("pre-aborted stream destroys asynchronously and writev error completes every write", "const c=new AbortController();c.abort();const s=require('stream'),r=new s.Readable({signal:c.signal});r.on('error',e=>console.log(e.name));const e=Error('batch'),w=new s.Writable({writev(xs,d){d(e)}});w.on('error',x=>console.log(x===e));w.on('close',()=>console.log('closed',w.writableLength));w.cork();w.write('a',x=>console.log('a',x===e));w.write('b',x=>console.log('b',x===e));w.uncork();",
+        "AbortError\na true\nb true\ntrue\nclosed 0\n", 0, "");
+    test("setEncoding from a data listener converts only future queued chunks", "const r=new(require('stream').Readable),out=[];r.push('a');r.push('한');r.push('b');r.push(null);r.on('data',v=>{out.push(typeof v+':'+v.toString());r.setEncoding('utf8')});r.on('end',()=>console.log(out.join('|')));",
+        "object:a|string:한|string:b\n", 0, "");
+    test("UTF8 stream replacement preserves malformed prefixes and BOM across chunks", "const r=new(require('stream').Readable);r.setEncoding('utf8');let s='';r.on('data',v=>s+=v);r.on('end',()=>console.log(JSON.stringify(s)));for(const b of [239,187,191,226,40,161,237,160,128])r.push(Buffer.from([b]));r.push(null);",
+        "\"﻿�(����\"\n", 0, "");
+    test("UTF8 stream decoder preserves code points split at every byte boundary", "const r=new(require('stream').Readable),bytes=Buffer.from('한😀a');console.log(r.setEncoding('UTF-8')===r,r.readableEncoding);let out='';r.on('data',s=>{if(typeof s!=='string')throw Error('bytes');out+=s});r.on('end',()=>console.log(out));for(const b of bytes)r.push(Buffer.from([b]));r.push(null);",
+        "true utf8\n한😀a\n", 0, "");
+    test("setEncoding converts existing queues and measures UTF16 code units", "const r=new(require('stream').Readable);r.push('한😀');r.push('abc');console.log(r.readableLength,r.readableEncoding);r.setEncoding('utf8');console.log(r.readableLength,r.read(2).length,r.readableLength);console.log(r.read(4).charCodeAt(0),r.readableLength);r.push(null);",
+        "10 null\n6 2 4\n56832 0\n", 0, "");
+    test("UTF8 decoder flushes incomplete EOF exactly once for PassThrough", "const p=new(require('stream').PassThrough);p.setEncoding('utf8');let s='';p.on('data',x=>s+=x);p.on('end',()=>console.log(s,s.length));p.end(Buffer.from([97,226,130]));",
+        "a� 2\n", 0, "");
+    test("setEncoding rejects unsupported modes without losing queued data", "const {Readable}=require('stream'),r=new Readable;r.push('keep');for(const enc of ['hex',{},Symbol()])try{r.setEncoding(enc)}catch(e){console.log(e instanceof Error)}console.log(r.read().toString(),r.readableEncoding);const o=new Readable({objectMode:true});try{o.setEncoding('utf8')}catch(e){console.log(e instanceof TypeError)}r.push(null);o.push(null);",
+        "true\ntrue\ntrue\nkeep null\ntrue\n", 0, "");
+    test("UTF8 EOF carry respects full readable chunk limits", "const r=new(require('stream').Readable);for(let i=0;i<1023;i++)r.push('a');r.push(Buffer.from([97,226]));r.push(null);r.setEncoding('utf8');let n=0;r.on('data',s=>n+=s.length);r.on('end',()=>console.log(n));",
+        "1025\n", 0, "");
+    test("object readable preserves identity undefined and one-object reads", "const r=new(require('stream').Readable)({objectMode:true,highWaterMark:2}),x={a:1};console.log(r.push(x),r.push(undefined),r.readableLength);console.log(r.read(99)===x,r.read()===undefined,r.readableLength);r.push(null);",
+        "true false 2\ntrue true 0\n", 0, "");
+    test("object writable serializes values and counts objects for pressure", "const {Writable}=require('stream'),x={a:1};const w=new Writable({objectMode:true,highWaterMark:1,write(v,e,d){console.log(v===x,this.writableLength);setTimeout(d,1)}});console.log(w.write(x),w.writableLength);w.end();w.on('finish',()=>console.log('finished',w.writableLength));",
+        "false 1\ntrue 1\nfinished 0\n", 0, "");
+    test("Transform asynchronous output and flush preserve input ordering", "const {Transform}=require('stream'),t=new Transform({transform(b,e,d){setTimeout(()=>d(null,b.toString().toUpperCase()),1)},flush(d){setTimeout(()=>d(null,'!'),1)}});let out='';t.on('data',b=>out+=b.toString());t.on('end',()=>console.log(out));t.write('a');t.end('b');",
+        "AB!\n", 0, "");
+    test("Transform converts objects to byte chunks with independent modes", "const {Transform}=require('stream'),t=new Transform({writableObjectMode:true,transform(v,e,d){d(null,String(v.a))}});let out='';t.on('data',b=>out+=b.toString());t.on('end',()=>console.log(out));t.write({a:1});t.end({a:2});",
+        "12\n", 0, "");
+    test("Transform readable pressure holds the next input until consumption", "const {Transform}=require('stream');let n=0;const t=new Transform({objectMode:true,highWaterMark:1,transform(v,e,d){n++;d(null,v)}});t.write({a:1});t.end({a:2});setTimeout(()=>{console.log(n,t.readableLength,t.read().a);setTimeout(()=>{console.log(n,t.read().a)},1)},1);",
+        "1 1 1\n2 2\n", 0, "");
+    test("Transform callback errors destroy every pipeline member once", "const s=require('stream'),reason=Error('transform'),r=new s.Readable({read(){this.push('x');this.push(null)}}),t=new s.Transform({transform(b,e,d){d(reason)}}),w=new s.Writable({write(b,e,d){d()}});s.pipeline(r,t,w,e=>console.log(e===reason,r.destroyed,t.destroyed,w.destroyed));",
+        "true true true true\n", 0, "");
+    test("Stream module constructors inherit EventEmitter APIs", "const s=require('stream'),E=require('events');console.log(s===require('node:stream'));for(const C of [s.Readable,s.Writable,s.PassThrough]){const x=new C;console.log(x instanceof C,x instanceof E,typeof x.on,x.destroyed)}",
+        "true\ntrue true function false\ntrue true function false\ntrue true function false\n", 0, "");
+    test("Readable snapshots binary pushes and performs partial reads", "const {Readable}=require('stream'),r=new Readable,a=Buffer.from([255,0,128]);r.push(a);a.fill(42);r.push('ab');console.log(r.readableLength,r.read(4).toString('hex'),r.readableLength,r.read().toString(),r.read()===null);r.push(null);",
+        "5 ff008061 1 b true\n", 0, "");
+    test("Readable waits for requested bytes until EOF", "const r=new(require('stream').Readable);r.push('ab');console.log(r.read(3)===null,r.readableLength);r.push(null);console.log(r.read(3).toString(),r.readableLength);r.on('end',()=>console.log(r.readableEnded));",
+        "true 2\nab 0\ntrue\n", 0, "");
+    test("Readable flowing data and end run after current script", "const r=new(require('stream').Readable);r.push('a');r.push(Buffer.from([0,255]));r.push(null);r.on('data',b=>console.log(Buffer.isBuffer(b),b.toString('hex')));r.on('end',()=>console.log('end',r.readableEnded));console.log('sync');",
+        "sync\ntrue 61\ntrue 00ff\nend true\n", 0, "");
+    test("Readable pause and resume retain queued chunks", "const r=new(require('stream').Readable);r.push('a');r.push('b');r.push(null);r.on('data',b=>{console.log(b.toString());if(b[0]===97){r.pause();setTimeout(()=>{console.log('resume',r.readableLength);r.resume()},1)}});r.on('end',()=>console.log('end'));",
+        "a\nresume 1\nb\nend\n", 0, "");
+    test("Readable pull hook can produce asynchronously", "let n=0;const r=new(require('stream').Readable)({read(size){console.log(size);setTimeout(()=>{this.push(n++?'last':'first');if(n===2)this.push(null)},1)}});const out=[];r.on('data',b=>out.push(b.toString()));r.on('end',()=>console.log(out.join(',')));",
+        "65536\n65536\nfirst,last\n", 0, "");
+    test("Readable highWaterMark signals pressure without dropping data", "const r=new(require('stream').Readable)({highWaterMark:2});console.log(r.push('a'),r.push('b'),r.push('c'),r.readableLength);r.push(null);console.log(r.read(3).toString());",
+        "true false false 3\nabc\n", 0, "");
+    test("Writable serializes asynchronous hooks and finish callbacks", "const out=[];let active=0;const w=new(require('stream').Writable)({write(b,enc,done){if(++active!==1)throw Error('overlap');out.push(b.toString()+':'+enc);setTimeout(()=>{active--;done()},1)}});w.write('a',()=>out.push('callback'));w.end('b',()=>console.log(out.join(','),w.writableFinished,w.writableLength));console.log('sync');",
+        "sync\na:buffer,callback,b:buffer true 0\n", 0, "");
+    test("Writable snapshots views and string encoding before scheduling", "const out=[],a=Buffer.from([9,255,0,128,9]);const w=new(require('stream').Writable)({write(b,e,done){out.push(b.toString('hex'));done()}});w.write(a.subarray(1,4));a.fill(42);w.end('abcd','hex',()=>console.log(out.join(',')));",
+        "ff0080,abcd\n", 0, "");
+    test("Writable synchronous completions still deliver callbacks asynchronously", "const out=[];const w=new(require('stream').Writable)({write(b,e,done){out.push('write');done();out.push('returned')}});w.write('a',()=>out.push('callback'));out.push('sync');w.end(()=>console.log(out.join(',')));",
+        "sync,write,returned,callback\n", 0, "");
+    test("Writable pressure drains only when queued bytes complete", "const w=new(require('stream').Writable)({highWaterMark:2,write(b,e,done){setTimeout(done,1)}});console.log(w.write('ab'),w.writableLength,w.writableNeedDrain);w.on('drain',()=>{console.log(w.writableLength,w.writableNeedDrain);w.end(()=>console.log('finish'))});",
+        "false 2 true\n0 false\nfinish\n", 0, "");
+    test("Writable errors reject queued callbacks before error and close", "const err=new Error('write failed'),out=[];const w=new(require('stream').Writable)({write(b,e,done){done(err)}});w.on('error',x=>out.push('error:'+String(x===err)));w.on('close',()=>console.log(out.join(','),w.destroyed,w.writableLength));w.write('a',x=>out.push('a:'+String(x===err)));w.write('b',x=>out.push('b:'+String(x===err)));",
+        "a:true,b:true,error:true true 0\n", 0, "");
+    test("Writable thrown hook errors preserve error identity", "const err=new Error('hook');const w=new(require('stream').Writable)({write(){throw err}});w.on('error',x=>console.log(x===err));w.on('close',()=>console.log('closed'));w.write('x');",
+        "true\nclosed\n", 0, "");
+    test("Writable duplicate completion is rejected without corrupting queue", "const w=new(require('stream').Writable)({write(b,e,done){done();try{done()}catch(x){console.log(x instanceof Error)}}});w.end('x',()=>console.log('finished'));",
+        "true\nfinished\n", 0, "");
+    test("Destroy before dispatch cancels writes and closes once", "const out=[];const w=new(require('stream').Writable)({write(){throw Error('wrong')}});w.on('close',()=>console.log(out.join(','),w.destroyed));w.write('x',x=>out.push(String(x instanceof Error)));w.destroy();w.destroy();",
+        "true true\n", 0, "");
+    test("Readable destroy discards queued data and suppresses end", "const r=new(require('stream').Readable);r.push('x');r.push(null);r.on('data',()=>console.log('wrong'));r.on('end',()=>console.log('wrong'));r.on('close',()=>console.log(r.destroyed,r.readableLength,r.read()===null));r.destroy();",
+        "true 0 true\n", 0, "");
+    test("Pipe pauses and resumes across a slow writable destination", "const {Readable,Writable}=require('stream'),r=new Readable,out=[];let drains=0;const w=new Writable({highWaterMark:1,write(b,e,done){out.push(b.toString());setTimeout(done,1)}});w.on('drain',()=>drains++);w.on('finish',()=>console.log(out.join(','),drains,r.readableEnded));r.push('a');r.push('b');r.push('c');r.push(null);console.log(r.pipe(w)===w);",
+        "true\na,b,c 2 true\n", 0, "");
+    test("Pipe end false leaves destination open until explicitly ended", "const {Readable,Writable}=require('stream'),r=new Readable,out=[];const w=new Writable({write(b,e,done){out.push(b.toString());done()}});r.push('a');r.push(null);r.pipe(w,{end:false});r.on('end',()=>{console.log(w.writableFinished);w.end(()=>console.log(out.join(',')))});",
+        "false\na\n", 0, "");
+    test("Unpipe removes drain listener and preserves source data", "const {Readable,Writable}=require('stream'),r=new Readable,w=new Writable({write(){throw Error('wrong')}});r.push('x');r.push(null);r.pipe(w);console.log(w.listenerCount('drain'));r.unpipe(w);console.log(w.listenerCount('drain'));r.on('data',b=>console.log(b.toString()));",
+        "1\n0\nx\n", 0, "");
+    test("PassThrough preserves binary bytes through pressure and EOF", "const {PassThrough}=require('stream'),p=new PassThrough({highWaterMark:1}),out=[];p.write(Buffer.from([0,255]));p.end('한');p.on('data',b=>out.push(b));p.on('end',()=>console.log(Buffer.concat(out).toString('hex'),p.writableFinished));",
+        "00ffed959c true\n", 0, "");
+    test("PassThrough holds write completion until read pressure is released", "const p=new(require('stream').PassThrough)({highWaterMark:1});let done=false;p.write('x',()=>{done=true;console.log('callback')});setTimeout(()=>{console.log(done,p.readableLength,p.writableLength,p.read().toString());p.end()},1);",
+        "false 1 1 x\ncallback\n", 0, "");
+    test("Readable PassThrough Writable pipe chain drains correctly", "const {Readable,PassThrough,Writable}=require('stream'),r=new Readable,p=new PassThrough({highWaterMark:1}),out=[];const w=new Writable({highWaterMark:1,write(b,e,done){out.push(b.toString());setTimeout(done,1)}});r.push('a');r.push('b');r.push(null);w.on('finish',()=>console.log(out.join(','),r.readableEnded,p.readableEnded));r.pipe(p).pipe(w);",
+        "a,b true true\n", 0, "");
+    test("Stream private state and scheduling resist replaced intrinsics", "const {Writable}=require('stream'),w=new Writable({write(b,e,done){done()}});WeakMap.prototype.get=WeakMap.prototype.set=Function.prototype.bind=globalThis.queueMicrotask=()=>{throw Error('intercepted')};w.end('x',()=>console.log(w.writableFinished));",
+        "true\n", 0, "");
+    test("Stream validates unsupported modes chunks and receivers", "const {Readable,Writable}=require('stream'),r=new Readable;for(const run of [()=>new Writable({write:42}),()=>new Writable({final:42}),()=>r.push({}),()=>r.read(-1),()=>Readable.prototype.read.call({}),()=>new Readable({highWaterMark:Infinity})]){let ok=false;try{run()}catch(x){ok=x instanceof Error}if(!ok)throw Error('accepted')}r.push(null);try{r.push('late')}catch(x){console.log(x instanceof Error)}",
+        "true\n", 0, "");
+    test("Stream hard queue bounds fail before losing existing bytes", "const {Readable,Writable}=require('stream'),r=new Readable,w=new Writable({write(b,e,done){done()}});r.push(Buffer.alloc(4194304));try{r.push('x')}catch(x){console.log(x instanceof RangeError,r.readableLength)}w.write(Buffer.alloc(4194304));try{w.write('x')}catch(x){console.log(x instanceof RangeError,w.writableLength)}r.destroy();w.destroy();",
+        "true 4194304\ntrue 4194304\n", 0, "");
+    test("Readable coalesces requests while asynchronous pull is outstanding", "let calls=0;const r=new(require('stream').Readable)({read(){calls++;setTimeout(()=>{this.push('x');this.push(null)},1)}});r.read(2);queueMicrotask(()=>r.read(2));queueMicrotask(()=>r.read(2));r.on('data',()=>{});r.on('end',()=>console.log(calls));",
+        "1\n", 0, "");
+    test("Stream option getters preserve first exception without later callbacks", "const {Readable}=require('stream'),err=new Error('first');let visited=0;try{new Readable({get objectMode(){throw err},get read(){visited++;throw Error('second')}})}catch(x){console.log(x===err,visited)}",
+        "true 0\n", 0, "");
+    test("Writable late completion after destroy cannot settle callbacks twice", "const err=new Error('stop');let done,calls=0;const w=new(require('stream').Writable)({write(b,e,cb){done=cb}});w.on('error',x=>console.log(x===err));w.on('close',()=>console.log(calls,w.writableLength));w.write('x',x=>{calls++;console.log(x===err)});setTimeout(()=>{w.destroy(err);done();done()},1);",
+        "true\ntrue\n1 0\n", 0, "");
+    test("Stream close still runs when an error listener throws", "const w=new(require('stream').Writable)({write(b,e,done){done(Error('first'))}});w.on('error',()=>{throw Error('listener failure')});w.on('close',()=>console.log('closed'));w.write('x');",
+        "closed\n", 1, "listener failure");
+    test("Readable and Writable subclasses use prototype hooks", "const {Readable,Writable}=require('stream');class R extends Readable{_read(){this.push('subclass');this.push(null)}}class W extends Writable{_write(b,e,done){console.log(b.toString(),this instanceof W);done()}}const r=new R,w=new W;console.log(r instanceof R,w instanceof W);w.on('finish',()=>console.log('finished'));r.pipe(w);",
+        "true true\nsubclass true\nfinished\n", 0, "");
+    test("Stream chunk bounds also cover zero-length pending writes", "const {Readable,Writable}=require('stream'),r=new Readable,w=new Writable;for(let i=0;i<1024;i++){r.push('x');w.write('')}for(const run of [()=>r.push('x'),()=>w.write('')]){try{run()}catch(x){console.log(x instanceof RangeError)}}console.log(r.read(1).toString(),r.push('y'),r.readableLength);r.destroy();w.destroy();",
+        "true\ntrue\nx true 1024\n", 0, "");
+    test("Readable hook exceptions become error and close", "const err=Error('read failure');const r=new(require('stream').Readable)({read(){throw err}});r.on('error',x=>console.log(x===err));r.on('close',()=>console.log(r.destroyed));r.resume();",
+        "true\ntrue\n", 0, "");
+    test("Data listener exceptions remain fatal instead of becoming stream errors", "const r=new(require('stream').Readable);r.on('error',()=>console.log('wrong'));r.on('data',()=>{throw Error('data listener failure')});r.push('x');r.push(null);",
+        "", 1, "data listener failure");
+    test("Unhandled stream error fails runtime through existing microtask policy", "const w=new(require('stream').Writable)({write(b,e,done){done(new Error('stream rejection'))}});w.write('x');",
+        "", 1, "stream rejection");
+}
+
+pub fun io_stream_tests() {
+    var suite: ptr<TestState> = test_state();
+    test("FileHandle resource budget recovers after explicit closes", "(async()=>{const f=require('fs/promises'),a=[];for(let i=0;i<32;i++)a.push(await f.open('README.md'));try{await f.open('README.md')}catch(e){console.log(e instanceof RangeError)}for(const h of a)await h.close();const h=await f.open('README.md');console.log(h.fd>=0);await h.close()})();",
+        "true\ntrue\n", 0, "");
+    test("FileHandle descriptors are not inherited by spawned executables", "(async()=>{const h=await require('fs/promises').open('README.md'),c=require('child_process').spawn('/usr/bin/test',['-e','/proc/self/fd/'+h.fd],{stdio:'inherit'});c.on('exit',async code=>{console.log(code);await h.close()})})();",
+        "1\n", 0, "");
+    test("object streams enforce queue limits and preserve falsy primitive chunks", "const s=require('stream'),r=new s.Readable({objectMode:true});for(const v of [false,0,undefined])r.push(v);console.log(r.read()===false,r.read()===0,r.read()===undefined);for(let i=0;i<1024;i++)r.push({i});try{r.push({})}catch(e){console.log(e instanceof RangeError,r.readableLength)}r.destroy();",
+        "true true true\ntrue 1024\n", 0, "");
+    test("PassThrough has Transform ancestry while retaining object identities", "const s=require('stream'),p=new s.PassThrough({objectMode:true}),x={};console.log(p instanceof s.Transform);p.on('data',v=>console.log(v===x));p.end(x);",
+        "true\ntrue\n", 0, "");
+    test("asynchronous invalid transform output reaches stream error and close", "const s=require('stream'),t=new s.Transform({transform(b,e,d){setTimeout(()=>d(null,{}),1)}});t.on('error',e=>console.log(e instanceof TypeError));t.on('close',()=>console.log(t.destroyed));t.resume();t.end('x');",
+        "true\ntrue\n", 0, "");
+    async_case("file option objects preserve binary defaults and append without truncation", "const f=require('fs'),p=process.argv[2];f.writeFileSync(p,'A',{mode:384,flush:true});f.writeFileSync(p,'B',{flag:'a',encoding:'utf8'});console.log(f.readFileSync(p,{encoding:'utf8',flag:'r'}),Buffer.isBuffer(f.readFileSync(p,{})));(async()=>{await f.promises.writeFile(p,'C',{flag:'a',flush:true});console.log(await f.promises.readFile(p,{encoding:'utf8'}))})();",
+        "AB true\nABC\n", 0, "");
+    async_case("file write options reject unsupported fields and exclusive overwrite", "const f=require('fs'),p=process.argv[2];f.writeFileSync(p,'keep');for(const options of [{flag:'r+'},{mode:-1},{flush:1},{signal:{}},{unknown:true}])try{f.writeFileSync(p,'bad',options)}catch(e){console.log(e instanceof Error)}try{f.writeFileSync(p,'bad',{flag:'wx'})}catch(e){console.log(e.code)}console.log(f.readFileSync(p,'utf8'));",
+        "true\ntrue\ntrue\ntrue\ntrue\nEEXIST\nkeep\n", 0, "");
+    async_case("file option first exception stops getters before opening a path", "const f=require('fs'),p=process.argv[2],reason=Error('encoding');f.writeFileSync(p,'keep');let touched=0;try{f.writeFileSync(p,'bad',{get encoding(){throw reason},get flag(){touched++;return 'w'}})}catch(e){console.log(e===reason,touched)}console.log(f.readFileSync(p,'utf8'));",
+        "true 0\nkeep\n", 0, "");
+    async_case("FileHandle rejects unknown and symbol options without invoking their getters", "const f=require('fs');(async()=>{const h=await f.promises.open(process.argv[2],'w'),s=Symbol();let n=0;for(const o of [{get signal(){n++;return {}}},{[s]:true}])try{await h.writeFile('bad',o)}catch(e){console.log(e instanceof TypeError)}await h.writeFile('ok');await h.close();console.log(n,f.readFileSync(process.argv[2],'utf8'))})();",
+        "true\ntrue\n0 ok\n", 0, "");
+    async_case("FileHandle positioned read/write preserve current offset and view identity", "const f=require('fs');(async()=>{const h=await f.promises.open(process.argv[2],'w+'),b=Buffer.from('xABz');let r=await h.write(b,1,2,0);console.log(r.bytesWritten,r.buffer===b);const target=Buffer.alloc(5,46);r=await h.read(target,1,2,0);console.log(r.bytesRead,r.buffer===target,target.toString());console.log((await h.readFile('utf8')));await h.close()})();",
+        "2 true\n2 true .AB..\nAB\n", 0, "");
+    async_case("FileHandle string writes snapshot input and report the original string", "const f=require('fs');(async()=>{const h=await f.promises.open(process.argv[2],'w+'),r=await h.write('한글',0,'utf8');console.log(r.bytesWritten,r.buffer);await h.close();console.log(f.readFileSync(process.argv[2],'utf8'))})();",
+        "6 한글\n한글\n", 0, "");
+    async_case("FileHandle invalid ranges leave bytes and offset intact", "const f=require('fs');(async()=>{f.writeFileSync(process.argv[2],'keep');const h=await f.promises.open(process.argv[2],'r+'),b=Buffer.alloc(2);for(const a of [[b,-1,1,0],[b,0,3,0],[b,0,1,-1]])try{await h.write(...a)}catch(e){console.log(e instanceof RangeError)}console.log(await h.readFile('utf8'));await h.close()})();",
+        "true\ntrue\ntrue\nkeep\n", 0, "");
+    async_case("FileHandle close validation failure keeps the descriptor usable", "const f=require('fs');(async()=>{const h=await f.promises.open(process.argv[2],'w');try{await h.close(1)}catch(e){console.log(e instanceof TypeError,h.fd>=0)}await h.writeFile('ok');await h.close();console.log(f.readFileSync(process.argv[2],'utf8'))})();",
+        "true true\nok\n", 0, "");
+    test("Transform subclasses use prototype hooks and flush failures destroy pipelines", "const s=require('stream');class T extends s.Transform{_transform(b,e,d){d(null,b)}_flush(d){d(Error('flush'))}}const t=new T;console.log(t instanceof T,t instanceof s.Transform);t.on('data',()=>{});t.on('error',e=>console.log(e.message));t.on('close',()=>console.log(t.destroyed));t.end('x');",
+        "true true\nflush\ntrue\n", 0, "");
+    async_case("FileHandle serializes writes stat sync and close", "const f=require('fs');(async()=>{const p=process.argv[2],h=await f.promises.open(p,'w+');console.log(h.fd>=0);const a=h.writeFile('ab'),b=h.writeFile(Buffer.from('cd')),s=h.stat(),c=h.close();console.log(c===h.close());await Promise.all([a,b]);console.log((await s).size);await c;console.log(h.fd,f.readFileSync(p,'utf8'));await h.close();try{await h.readFile()}catch(e){console.log(e instanceof Error)}})();",
+        "true\ntrue\n4\n-1 abcd\ntrue\n", 0, "");
+    async_case("FileHandle reads UTF8 and bytes using the descriptor current position", "const f=require('fs');(async()=>{const p=process.argv[2];f.writeFileSync(p,'한글');let h=await f.promises.open(p);console.log(await h.readFile({encoding:'utf8'}),(await h.readFile()).length);await h.close();h=await f.promises.open(p);console.log(Buffer.isBuffer(await h.readFile()));await h.close()})();",
+        "한글 0\ntrue\n", 0, "");
+    async_case("FileHandle validates flags mode and data before truncation or writes", "const f=require('fs');(async()=>{const p=process.argv[2];f.writeFileSync(p,'keep');for(const a of [[p,'bad'],[p,'w',-1],[p,'w',{}]])try{await f.promises.open(...a)}catch(e){console.log(e instanceof Error,f.readFileSync(p,'utf8'))}const h=await f.promises.open(p,'r+');try{await h.writeFile({})}catch(e){console.log(e instanceof TypeError)}console.log(f.readFileSync(p,'utf8'));await h.close()})();",
+        "true keep\ntrue keep\ntrue keep\ntrue\nkeep\n", 0, "");
+    async_case("FileHandle option reentrancy reserves operation order before getters", "const f=require('fs');(async()=>{const p=process.argv[2],h=await f.promises.open(p,'w');let second;const first=h.writeFile('A',{get encoding(){second=h.writeFile('B');return 'utf8'}});await Promise.all([first,second]);await h.close();console.log(f.readFileSync(p,'utf8'))})();",
+        "AB\n", 0, "");
+    async_case("FileHandle throwing options preserve identity and leave handle usable", "const f=require('fs');(async()=>{const p=process.argv[2],h=await f.promises.open(p,'w'),reason=Error('encoding');try{await h.writeFile('bad',{get encoding(){throw reason}})}catch(e){console.log(e===reason)}await h.writeFile('ok');await h.sync();await h.truncate(1);await h.close();console.log(f.readFileSync(p,'utf8'))})();",
+        "true\no\n", 0, "");
+    test("FileHandle failed opens retain structured errors and release resources", "(async()=>{const f=require('fs/promises');for(let i=0;i<40;i++)try{await f.open('/jsrt-absent-handle-path')}catch(e){if(e.code!=='ENOENT')throw e}console.log('released')})();",
+        "released\n", 0, "");
+    async_case("file native hooks reject malformed calls without scheduling invalid I/O", "const f=require('fs'),w=f.createWriteStream(process.argv[2]);for(const run of [()=>w._write({},'buffer',()=>{}),()=>w._write(),()=>w._final(42),()=>w._destroy(null,42)]){try{run()}catch(e){console.log(e instanceof TypeError)}}w.end('ok',()=>console.log(f.readFileSync(process.argv[2],'utf8')));",
+        "true\ntrue\ntrue\ntrue\nok\n", 0, "");
+    async_case("destroying a write stream in open listener cancels queued bytes", "const f=require('fs'),w=f.createWriteStream(process.argv[2]),err=Error('cancel');w.write('never',e=>console.log(e===err));w.on('open',()=>w.destroy(err));w.on('error',e=>console.log(e.message));w.on('close',()=>console.log(f.readFileSync(process.argv[2]).length));",
+        "true\ncancel\n0\n", 0, "");
+    test("finished rolls back partial listener registration on capacity failure", "const {Writable,finished}=require('stream'),w=new Writable;for(let i=0;i<1023;i++)w.on('x',()=>{});try{finished(w,()=>{})}catch(e){console.log(e instanceof RangeError,w.listenerCount('x'),w.listenerCount('end'),w.listenerCount('error'))}w.end();",
+        "true 1023 0 0\n", 0, "");
+    test("pipeline rolls back monitors when a later member is full", "const {Readable,Writable,pipeline}=require('stream'),r=new Readable,w=new Writable;for(let i=0;i<1023;i++)w.on('x',()=>{});try{pipeline(r,w,()=>{})}catch(e){console.log(e instanceof RangeError,r.listenerCount('end'),w.listenerCount('end'))}r.destroy();w.end();",
+        "true 0 0\n", 0, "");
+    test("custom final hook waits for asynchronous resource completion", "const {Writable}=require('stream'),out=[],w=new Writable({write(b,e,d){d()},final(done){out.push('final');setTimeout(()=>{out.push('closed-resource');done()},1)}});w.end('x',()=>console.log(out.join(',')));out.push('sync');",
+        "sync,final,closed-resource\n", 0, "");
+    test("destroy hook throw preserves original stream failure", "const {Writable}=require('stream'),err=Error('first'),w=new Writable({write(b,e,d){d(err)},destroy(){throw Error('second')}});w.on('error',e=>console.log(e===err));w.on('close',()=>console.log('closed'));w.write('x');",
+        "true\nclosed\n", 0, "");
+    async_case("file stream reads in bounded binary chunks and closes", "const f=require('fs'),p=process.argv[2];f.writeFileSync(p,Buffer.from([0,255,128,195,40]));const r=f.createReadStream(p,{highWaterMark:2}),a=[];r.on('data',b=>a.push(b));r.on('end',()=>console.log(a.length,Buffer.concat(a).toString('hex')));r.on('close',()=>console.log('closed'));",
+        "3 00ff80c328\nclosed\n", 0, "");
+    async_case("file stream inclusive byte ranges", "const f=require('fs'),p=process.argv[2];f.writeFileSync(p,'abcdef');const r=f.createReadStream(p,{start:1,end:3,highWaterMark:2}),a=[];r.on('data',b=>a.push(b));r.on('end',()=>console.log(Buffer.concat(a).toString()));",
+        "bcd\n", 0, "");
+    async_case("file write stream queues before open and finishes after close", "const f=require('fs'),p=process.argv[2],w=f.createWriteStream(p,{highWaterMark:2});console.log(w.write(Buffer.from([0,255])));w.end('ab');w.on('finish',()=>console.log(f.readFileSync(p).toString('hex')));w.on('close',()=>console.log('closed'));",
+        "false\n00ff6162\nclosed\n", 0, "");
+    async_case("file streams empty end creates and truncates safely", "const f=require('fs'),p=process.argv[2];f.writeFileSync(p,'old');const w=f.createWriteStream(p);w.end();w.on('finish',()=>console.log(f.readFileSync(p).length));",
+        "0\n", 0, "");
+    async_case("file stream open errors retain structured OS diagnostics", "const f=require('fs');const r=f.createReadStream(process.argv[2]+'.missing');r.on('error',e=>console.log(e.code,e.syscall));r.on('close',()=>console.log('closed'));r.resume();",
+        "ENOENT open\nclosed\n", 0, "");
+    async_case("file stream destruction during pending open drains descriptor ownership", "const r=require('fs').createReadStream(process.argv[2]);r.on('close',()=>console.log(r.destroyed));r.destroy();",
+        "true\n", 0, "");
+    test("finished handles already completed streams asynchronously", "const {Writable,finished}=require('stream'),w=new Writable({write(b,e,d){d()}});w.end();queueMicrotask(()=>{finished(w,e=>console.log(e===undefined));console.log('sync')});",
+        "sync\ntrue\n", 0, "");
+    test("finished detects premature close and returns cleanup", "const {Readable,finished}=require('stream'),r=new Readable;finished(r,e=>console.log(e.code));r.destroy();",
+        "ERR_STREAM_PREMATURE_CLOSE\n", 0, "");
+    test("pipeline coordinates a bounded byte chain", "const {Readable,PassThrough,Writable,pipeline}=require('stream'),r=new Readable,a=[];const w=new Writable({write(b,e,d){a.push(b.toString());d()}});pipeline(r,new PassThrough({highWaterMark:1}),w,e=>console.log(e===undefined,a.join(',')));r.push('a');r.push('b');r.push(null);",
+        "true a,b\n", 0, "");
+    test("pipeline destroys every member on first failure", "const {Readable,Writable,pipeline}=require('stream'),r=new Readable,err=Error('failed'),w=new Writable({write(b,e,d){d(err)}});pipeline(r,w,e=>console.log(e===err,r.destroyed,w.destroyed));r.push('x');",
+        "true true true\n", 0, "");
+    test("promise stream utilities share module identity", "const s=require('stream'),p=require('stream/promises'),r=new s.Readable,w=new s.Writable({write(b,e,d){d()}});console.log(s.promises===p,p===require('node:stream/promises'));p.pipeline(r,w).then(()=>console.log('done'));r.push(null);",
+        "true true\ndone\n", 0, "");
+    async_case("file pipeline propagates read errors and closes destination", "const f=require('fs'),{pipeline}=require('stream'),r=f.createReadStream(process.argv[2]+'.missing'),w=f.createWriteStream(process.argv[2]);pipeline(r,w,e=>console.log(e.code,r.destroyed,w.destroyed));",
+        "ENOENT true true\n", 0, "");
+    var path: str = join((deref suite.directory) as str, "source.js") as str;
+    var fd: i64 = create(path);
+    ftruncate(fd, 8388608);
+    io_close(fd);
+    async_case("read stream processes files larger than whole-file buffer limit", "let n=0;const r=require('fs').createReadStream(process.argv[2]);r.on('data',b=>n+=b.length);r.on('end',()=>console.log(n));",
+        "8388608\n", 0, "");
+    async_case("write stream pipeline exceeds whole-file limit with bounded pressure", "const f=require('fs'),s=require('stream');let n=0;const r=new s.Readable({read(){if(n++<80)this.push(Buffer.alloc(65536,42));else this.push(null)}}),w=f.createWriteStream(process.argv[2]);s.pipeline(r,w,e=>{if(e)throw e;let size=0;const q=f.createReadStream(process.argv[2]);q.on('data',b=>{if(b[0]!==42)throw Error('corrupt');size+=b.length});q.on('end',()=>console.log(size))});",
+        "5242880\n", 0, "");
+}
+
+pub fun url_tests() {
+    test("URL module and globals share constructors", "const u=require('url');console.log(u===require('node:url'),u.URL===URL,u.URLSearchParams===URLSearchParams,new URL('https://example.com') instanceof URL);",
+        "true true true true\n", 0, "");
+    test("URL canonical fields and default ports", "const u=new URL('HTTPS://EXAMPLE.COM:443/a/../b?x=1#top');console.log(u.href,u.protocol,u.host,u.hostname,u.port,u.pathname,u.search,u.hash,u.origin);",
+        "https://example.com/b?x=1#top https: example.com example.com  /b ?x=1 #top https://example.com\n",
+        0, "");
+    test("URL resolves relative paths and preserves IPv6", "console.log(new URL('../c?q=1','https://example.com/a/b').href);const u=new URL('http://[::1]:8080/');console.log(u.hostname,u.host,u.origin);",
+        "https://example.com/c?q=1\n[::1] [::1]:8080 http://[::1]:8080\n", 0, "");
+    test("URL searchParams is live in both directions", "const u=new URL('https://example.com/?a=1&a=2'),p=u.searchParams;p.append('b','x y');console.log(u.search,p===u.searchParams);u.search='?c=3';console.log(p.toString(),p.get('c'));u.href='http://localhost:80/z?d=4';console.log(p.toString(),u.href,p===u.searchParams);",
+        "?a=1&a=2&b=x+y true\nc=3 3\nd=4 http://localhost/z?d=4 true\n", 0, "");
+    test("URL field setters preserve independent components", "const u=new URL('https://example.com/a?x=1#f');u.pathname='/b';u.port='8443';u.hostname='LOCALHOST';u.hash='#g';console.log(u.href);u.host='example.org:443';console.log(u.href);u.search='';u.hash='';console.log(u.href);",
+        "https://localhost:8443/b?x=1#g\nhttps://example.org/b?x=1#g\nhttps://example.org/b\n", 0, "");
+    test("URL conversion exceptions and invalid parsing", "console.log(URL.canParse('broken'),URL.parse('broken')===null,URL.canParse('/a','https://example.com'));const e=Error('convert');for(const f of [()=>new URL({toString(){throw e}}),()=>URL.canParse({toString(){throw e}}),()=>new URL('https://x',Symbol())]){try{f()}catch(x){console.log(x===e||x instanceof TypeError)}}",
+        "false true true\ntrue\ntrue\ntrue\n", 0, "");
+    test("URL Unicode paths and invalid mutation retain previous value", "const u=new URL('https://example.com/한 글');console.log(u.pathname);const old=u.href;try{u.port='70000'}catch(e){console.log(e instanceof TypeError,u.href===old)}console.log(JSON.stringify(u)===JSON.stringify(u.href),String(u)===u.href);",
+        "/%ED%95%9C%20%EA%B8%80\ntrue true\ntrue true\n", 0, "");
+    test("URL query beginning with a question mark is not stripped twice", "const u=new URL('https://example.com/??a=1');console.log(u.searchParams.get('?a'),u.searchParams.has('a'));",
+        "1 false\n", 0, "");
+    test("URL setters preserve encoded NUL and trailing spaces", "const u=new URL('https://example.com/');u.pathname='/a ';u.search='?x=\\0 ';console.log(u.pathname,u.search,u.searchParams.get('x')==='\\0 ');",
+        "/a%20 ?x=%00%20 true\n", 0, "");
+    test("URLSearchParams form encoding and duplicate order", "const p=new URLSearchParams('?a=1&a=2&x=hello+world&empty&&raw=%zz');console.log(p.size,p.get('a'),p.getAll('a').join(','),p.get('x'),p.get('empty'),p.get('missing')===null,p.toString());",
+        "5 1 1,2 hello world  true a=1&a=2&x=hello+world&empty=&raw=%25zz\n", 0, "");
+    test("URLSearchParams mutation and optional value matching", "const p=new URLSearchParams('a=1&a=2&b=3');console.log(p.has('a','2'),p.has('a','3'));p.delete('a','1');p.append('a','4');p.set('a','9');console.log(p.toString());p.delete('a');console.log(p.toString());",
+        "true false\na=9&b=3\nb=3\n", 0, "");
+    test("URLSearchParams array record and copy inputs", "const a=new URLSearchParams([['a',1],['a',2]]),b=new URLSearchParams(a);a.set('a',3);console.log(b.toString());const c=new URLSearchParams({'__proto__':'x',['n\\0k']:'v',x:'a b'});console.log(c.get('n\\0k'),c.get('x'));",
+        "a=1&a=2\nv a b\n", 0, "");
+    test("URLSearchParams percent decoding replaces invalid UTF8", "const p=new URLSearchParams('a=%E2%82&b=%00&c=%F0%9F%8C%8A');console.log(p.get('a')==='�',p.get('b').length,p.get('c')==='🌊');p.set('q','~!*');console.log(p.toString().endsWith('q=%7E%21*'));",
+        "true 1 true\ntrue\n", 0, "");
+    test("URLSearchParams stable UTF16 sort", "const p=new URLSearchParams('z=0&a=1&a=2&b=3');p.sort();console.log(p.toString());",
+        "a=1&a=2&b=3&z=0\n", 0, "");
+    test("URLSearchParams iterators observe later appends after an exhausted step", "const p=new URLSearchParams('a=1'),it=p.entries();console.log(it[Symbol.iterator]()===it,it.next().value.join(':'));p.append('b','2');console.log(it.next().value.join(':'),it.next().done);p.append('c','3');const r=it.next();console.log(r.done,r.value.join(':'),it.next().done,[...p.keys()].join(','),[...p.values()].join(','));",
+        "true a:1\nb:2 true\nfalse c:3 true a,b,c 1,2,3\n", 0, "");
+    test("URLSearchParams foreach remains live and preserves receiver", "const p=new URLSearchParams('a=1'),owner={};p.forEach(function(v,k,self){console.log(v,k,self===p,this===owner);if(k==='a')p.append('b','2')},owner);",
+        "1 a true true\n2 b true true\n", 0, "");
+    test("URLSearchParams reentrant conversion uses current state", "const p=new URLSearchParams('a=1');p.append({toString(){p.set('a','2');return 'b'}},'3');console.log(p.toString());const e=Error('getter');try{new URLSearchParams({get a(){throw e}})}catch(x){console.log(x===e)}",
+        "a=2&b=3\ntrue\n", 0, "");
+    test("URLSearchParams limits and failed operations are atomic", "const p=new URLSearchParams('a=1');try{p.set('a','x'.repeat(8192))}catch(e){console.log(e instanceof RangeError,p.toString())}try{p.get.call({2:3},'a')}catch(e){console.log(e instanceof TypeError)}try{new URLSearchParams([['a']])}catch(e){console.log(e instanceof TypeError)}",
+        "true a=1\ntrue\ntrue\n", 0, "");
+    test("URL state resists overwritten intrinsics", "const u=new URL('https://example.com/?a=1'),p=u.searchParams;WeakMap.prototype.get=()=>{throw Error('poison')};WeakMap.prototype.set=()=>{throw Error('poison')};Object.keys=()=>{throw Error('poison')};Reflect.defineProperty=()=>{throw Error('poison')};p.append('b','2');console.log(u.href,new URLSearchParams({x:1}).toString());",
+        "https://example.com/?a=1&b=2 x=1\n", 0, "");
+}
+
+pub fun crypto_tests() {
+    test("crypto aliases share the same builtin", "const c=require('crypto');console.log(c===require('node:crypto'),c.opensslVersion.startsWith('OpenSSL 3.'));",
+        "true true\n", 0, "");
+    test("crypto SHA256 known answer and empty input", "const c=require('crypto');console.log(c.hash('sha256','abc'));console.log(c.hash('SHA256',''));",
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
+        0, "");
+    test("crypto SHA384 known answer", "console.log(require('crypto').hash('sha384','abc'));", "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7\n",
+        0, "");
+    test("crypto SHA512 known answer", "console.log(require('crypto').hash('sha512','abc'));", "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f\n",
+        0, "");
+    test("Hash snapshots update buffers and supports chaining", "const c=require('crypto'),b=Buffer.from('ab'),h=c.createHash('sha256');console.log(h.update(b)===h);b.fill(0);h.update('63','hex');console.log(h.digest('hex'));",
+        "true\nba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n", 0, "");
+    test("Hash digest defaults to Buffer and finalizes once", "const c=require('crypto'),h=c.createHash('sha256').update('abc'),b=h.digest();console.log(Buffer.isBuffer(b),b.length,b.toString('hex')===c.hash('sha256','abc'));for(const f of [()=>h.digest(),()=>h.update('x')]){try{f()}catch(e){console.log(e.message==='Hash already finalized')}}",
+        "true 32 true\ntrue\ntrue\n", 0, "");
+    test("Hash empty digest and output encodings", "const c=require('crypto');console.log(c.createHash('sha256').digest('hex')===c.hash('sha256',''));console.log(c.hash('sha256','abc','base64'));console.log(c.hash('sha256','abc','buffer').toString('hex')===c.hash('sha256','abc'));",
+        "true\nungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=\ntrue\n", 0, "");
+    test("Hash byte subviews honor offset and length", "const c=require('crypto'),a=new Uint8Array([0,97,98,99,0]);console.log(c.hash('sha256',a.subarray(1,4))===c.hash('sha256','abc'));",
+        "true\n", 0, "");
+    test("crypto rejects unsupported algorithms and invalid inputs", "const c=require('crypto');let n=0;for(const f of [()=>c.hash('sha1','abc'),()=>c.hash('sha256\\0suffix','abc'),()=>c.hash(3,'abc'),()=>c.hash('sha256',{}),()=>c.hash('sha256',23),()=>c.hash('sha256','a','unknown'),()=>c.hash('sha256'),()=>c.createHash('sha256',{}),()=>c.hash('sha256',new Uint16Array(1))]){try{f()}catch(e){if(e instanceof TypeError)n++}}console.log(n);",
+        "9\n", 0, "");
+    test("Hash validates receiver and preserves state after rejected encoding", "const c=require('crypto'),h=c.createHash('sha256').update('abc');for(const f of [()=>h.update.call({},'x'),()=>h.digest.call(null),()=>h.digest('unknown')]){try{f()}catch(e){console.log(e instanceof TypeError)}}console.log(h.digest('hex')===c.hash('sha256','abc'));",
+        "true\ntrue\ntrue\ntrue\n", 0, "");
+    test("Hash rejected updates preserve previously accepted input", "const c=require('crypto'),h=c.createHash('sha256').update('ab');for(const f of [()=>h.update({}),()=>h.update('ff','unknown')]){try{f()}catch(e){console.log(e instanceof TypeError)}}console.log(h.update('c').digest('hex')===c.hash('sha256','abc'));",
+        "true\ntrue\ntrue\n", 0, "");
+    test("Hash million byte SHA256 known answer across update boundaries", "const h=require('crypto').createHash('sha256');for(let i=0;i<100;i++)h.update('a'.repeat(10000));console.log(h.digest('hex'));",
+        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0\n", 0, "");
+    test("crypto randomBytes produces bounded Buffers", "const c=require('crypto');for(const n of [0,1,16,256]){const b=c.randomBytes(n);console.log(Buffer.isBuffer(b),b.length)}console.log(c.randomBytes(32).toString('hex')!==c.randomBytes(32).toString('hex'));",
+        "true 0\ntrue 1\ntrue 16\ntrue 256\ntrue\n", 0, "");
+    test("crypto randomBytes validates arguments without coercion", "const c=require('crypto');let n=0;for(const a of [[],[-1],[1.5],[NaN],[Infinity],[4194305],['4'],[4,()=>{}]]){try{c.randomBytes(...a)}catch(e){n++}}console.log(n);",
+        "8\n", 0, "");
+    test("crypto UUID version and variant", "const c=require('crypto'),a=c.randomUUID(),b=c.randomUUID();console.log(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(a),a!==b);try{c.randomUUID({})}catch(e){console.log(e instanceof TypeError)}",
+        "true true\ntrue\n", 0, "");
+    test("crypto timingSafeEqual compares entire byte subviews", "const c=require('crypto'),a=new Uint8Array([0,97,98,99,0]);console.log(c.timingSafeEqual(a.subarray(1,4),Buffer.from('abc')),c.timingSafeEqual(Buffer.from('abc'),Buffer.from('abd')),c.timingSafeEqual(Buffer.alloc(0),Buffer.alloc(0)));try{c.timingSafeEqual(Buffer.alloc(1),Buffer.alloc(2))}catch(e){console.log(e instanceof RangeError)}try{c.timingSafeEqual('a','a')}catch(e){console.log(e instanceof TypeError)}",
+        "true false true\ntrue\ntrue\n", 0, "");
+    test("Hash processes more than previous aggregate byte and chunk bounds", "const c=require('crypto'),h=c.createHash('sha256'),b=Buffer.alloc(4194304);h.update(b).update(b);console.log(h.digest().length);const k=c.createHash('sha256');for(let i=0;i<2048;i++)k.update('');console.log(k.digest('hex')===c.hash('sha256',''));try{c.createHash('sha256').update(new Uint8Array(4194305))}catch(e){console.log(e instanceof RangeError)}",
+        "32\ntrue\ntrue\n", 0, "");
+    test("HMAC SHA256 RFC4231 known answer", "console.log(require('crypto').createHmac('sha256',Buffer.alloc(20,11)).update('Hi ').update('There').digest('hex'));",
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7\n", 0, "");
+    test("HMAC SHA384 and SHA512 RFC4231 known answers", "const c=require('crypto');for(const a of ['sha384','sha512'])console.log(c.createHmac(a,Buffer.alloc(20,11)).update('Hi There').digest('hex'));",
+        "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6\n87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854\n",
+        0, "");
+    test("HMAC owns key bytes and respects view offsets", "const c=require('crypto'),b=Buffer.from([99,107,101,121,99]),h=c.createHmac('sha256',b.subarray(1,4));b.fill(0);console.log(h.update('abc').digest('hex')===c.createHmac('sha256','key').update('abc').digest('hex'));console.log(c.createHmac('sha256','').digest('hex'));",
+        "true\nb613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad\n", 0, "");
+    test("HMAC validates keys options and finalization", "const c=require('crypto'),h=c.createHmac('sha256','key');for(const f of [()=>c.createHmac('sha256',{}),()=>c.createHmac('sha256'),()=>c.createHmac('sha256','k',{}),()=>h.update(null)]){try{f()}catch(e){console.log(e instanceof TypeError)}}h.digest();try{h.update('a')}catch(e){console.log(e.message==='Hash already finalized')}",
+        "true\ntrue\ntrue\ntrue\ntrue\n", 0, "");
+    test("Unfinished native hash contexts survive allocation and context teardown", "const c=require('crypto'),h=c.createHash('sha256').update('abc');for(let i=0;i<5000;i++){c.createHash('sha256').update('discard');c.createHmac('sha256','key').update('discard')}console.log(h.digest('hex')===c.hash('sha256','abc'));",
+        "true\n", 0, "");
+    test("Hash private state survives user property and intrinsic changes", "const c=require('crypto'),h=c.createHash('sha256');h.chunks=['wrong'];h.done=true;WeakMap.prototype.get=()=>{throw Error('poison')};WeakMap.prototype.set=()=>{throw Error('poison')};Array.prototype[0]='poison';Buffer.from=()=>{throw Error('poison')};console.log(h.update('abc').digest('hex'));",
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n", 0, "");
+}
+
+pub fun binary_io_tests() {
+    var suite: ptr<TestState> = test_state();
+    test("Buffer fixed integer known bytes and endian values", "const b=Buffer.from('ff80fffe89abcdef','hex');console.log(b.readInt8(),b.readUInt8(1),b.readInt16BE(2),b.readUInt16LE(2),b.readInt32BE(4),b.readUInt32LE(4));",
+        "-1 128 -2 65279 -1985229329 4023233417\n", 0, "");
+    test("Buffer fixed writes preserve surrounding bytes in subviews", "const b=Buffer.alloc(12,170),v=b.subarray(2,10);console.log(v.writeUInt32BE(0x12345678),v.writeInt32LE(-2,4));console.log(b.toString('hex'));",
+        "4 8\naaaa12345678feffffffaaaa\n", 0, "");
+    test("Buffer integer widths round trip signed and unsigned limits", "const b=Buffer.alloc(8);for(const bits of [8,16,32])for(const signed of [false,true])for(const endian of bits===8?['']:['LE','BE']){const name=(signed?'Int':'UInt')+bits+endian,max=2**(bits-(signed?1:0))-1,min=signed?-(2**(bits-1)):0;for(const v of [min,0,max]){if(b['write'+name](v)!==bits/8||b['read'+name]()!==v)throw Error(name)}}console.log('fixed limits');",
+        "fixed limits\n", 0, "");
+    test("Buffer floats known IEEE bytes NaN infinity and negative zero", "const b=Buffer.from('0000803f000000000000f03f','hex');console.log(b.readFloatLE(),b.readDoubleLE(4));const a=Buffer.alloc(16);a.writeFloatBE(-0);a.writeDoubleBE(Infinity,4);console.log(a.toString('hex'));a.writeDoubleLE(NaN);console.log(Number.isNaN(a.readDoubleLE()),Object.is(b.writeFloatLE(-0),4),Object.is(b.readFloatLE(),-0));",
+        "1 1\n800000007ff000000000000000000000\ntrue true true\n", 0, "");
+    test("Buffer BigInt known bytes and unsigned aliases", "const b=Buffer.alloc(16);console.log(b.writeBigInt64LE(-9223372036854775808n),b.writeBigUint64BE(18446744073709551615n,8));console.log(b.toString('hex'));console.log(b.readBigInt64LE(),b.readBigUInt64BE(8),b.readBigUint64BE===b.readBigUInt64BE);",
+        "8 16\n0000000000000080ffffffffffffffff\n-9223372036854775808 18446744073709551615 true\n", 0,
+        "");
+    test("Buffer BigInt validates exact range without truncating or mutating", "const b=Buffer.alloc(8,42);let n=0;for(const [m,v] of [['writeBigUInt64LE',-1n],['writeBigUInt64LE',18446744073709551616n],['writeBigInt64BE',9223372036854775808n],['writeBigInt64LE',-9223372036854775809n]])try{b[m](v)}catch(e){if(e instanceof RangeError)n++}for(const v of [1,'1',Object(1n)])try{b.writeBigInt64LE(v)}catch(e){if(e instanceof TypeError)n++}console.log(n,b.toString('hex'));",
+        "7 2a2a2a2a2a2a2a2a\n", 0, "");
+    test("Buffer variable integers cover one through six bytes", "const b=Buffer.alloc(8);for(let width=1;width<=6;width++)for(const e of ['LE','BE'])for(const signed of [false,true]){const name=(signed?'Int':'UInt')+e,max=2**(8*width-(signed?1:0))-1,min=signed?-(2**(8*width-1)):0;for(const v of [min,0,max]){if(b['write'+name](v,1,width)!==width+1||b['read'+name](1,width)!==v)throw Error(name+width)}}b.writeUIntBE(0x010203040506,0,6);console.log(b.subarray(0,6).toString('hex'),b.readUIntLE(0,6));",
+        "010203040506 6618611909121\n", 0, "");
+    test("Buffer numeric offsets reject nonfinite fractional and out of view", "const b=Buffer.alloc(8,42);let n=0;for(const v of [-1,0.5,NaN,Infinity,8])try{b.writeUInt8(1,v)}catch(e){if(e instanceof RangeError)n++}for(const v of ['0',null,{}])try{b.readInt8(v)}catch(e){if(e instanceof TypeError)n++}for(const width of [0,7,NaN,1.5])try{b.readUIntLE(0,width)}catch(e){if(e instanceof RangeError)n++}try{b.subarray(1,2).readUInt16LE()}catch(e){if(e instanceof RangeError)n++}console.log(n,b.toString('hex'));",
+        "13 2a2a2a2a2a2a2a2a\n", 0, "");
+    test("Buffer numeric conversion runs once and preserves thrown value", "const b=Buffer.alloc(8,42),reason={};let n=0;console.log(b.writeUInt16BE({valueOf(){n++;return 258}}),n,b.subarray(0,2).toString('hex'));try{b.writeUInt32LE({valueOf(){throw reason}})}catch(e){console.log(e===reason,b.subarray(0,4).toString('hex'))}for(const v of [-1,256,Infinity,-Infinity])try{b.writeUInt8(v)}catch(e){if(!(e instanceof RangeError))throw e}console.log(b.writeUInt8(NaN),b.readUInt8());",
+        "2 1 0102\ntrue 01022a2a\n1 0\n", 0, "");
+    test("Buffer numbers use captured DataView methods", "const b=Buffer.alloc(8),P=DataView.prototype;P.getUint32=P.setUint32=()=>{throw Error('poison')};globalThis.DataView=null;b.writeUInt32LE(123456);console.log(b.readUInt32LE(),b.readUint32LE===b.readUInt32LE);",
+        "123456 true\n", 0, "");
+    test("Buffer implicit numeric conversion rejects BigInt even through valueOf", "const b=Buffer.alloc(8,42);let n=0;for(const value of [1n,{valueOf(){return 1n}}])for(const m of ['writeUInt8','writeIntLE','writeFloatLE','writeDoubleLE'])try{b[m](value,0,1)}catch(e){if(e instanceof TypeError)n++}try{b.indexOf('a',{valueOf(){return 1n}})}catch(e){if(e instanceof TypeError)n++}Math.min=()=>{throw Error('poison')};b.writeDoubleLE(-0);console.log(n,Object.is(b.readDoubleLE(),-0),b.indexOf('',{valueOf(){return 2}}));",
+        "9 true 2\n", 0, "");
+    test("Buffer numeric conversion cannot retain detached storage", "const b=Buffer.alloc(8);if(typeof ArrayBuffer.prototype.transfer==='function'){const a=new ArrayBuffer(8),v=Buffer.from(a);try{v.writeUInt8({valueOf(){a.transfer();return 1}})}catch(e){console.log(e instanceof RangeError||e instanceof TypeError)}}else console.log(true);",
+        "true\n", 0, "");
+    test("Buffer search strings numbers subviews and overlap", "const b=Buffer.from('abababa');console.log(b.indexOf('aba'),b.lastIndexOf('aba'),b.includes('bab'),b.indexOf(98),b.indexOf(354),b.indexOf(Buffer.from('xabay').subarray(1,4),1));console.log(b.subarray(2,6).indexOf('ba'),b.lastIndexOf('aba',3));",
+        "0 4 true 1 1 2\n1 2\n", 0, "");
+    test("Buffer search normalizes offsets and empty needles", "const b=Buffer.from('abcabc');console.log(b.indexOf('a',-3),b.indexOf('a',1.9),b.lastIndexOf('a',-2),b.indexOf('a',Infinity),b.lastIndexOf('a',-Infinity));console.log(b.indexOf('',Infinity),b.lastIndexOf(''),b.lastIndexOf('',-99),b.indexOf('a',NaN),Buffer.alloc(0).includes(''));",
+        "3 3 3 -1 -1\n6 6 0 0 true\n", 0, "");
+    test("Buffer search encoding and UTF16 byte offsets", "const b=Buffer.from('ababa','utf16le');console.log(b.indexOf('ba',0,'utf16le'),b.lastIndexOf('ba',undefined,'ucs2'),b.indexOf('ba',3,'utf16le'));console.log(Buffer.from('aabbccbb','hex').indexOf('bb','hex'),Buffer.from('aabbccbb','hex').lastIndexOf('bb',undefined,'hex'));",
+        "2 6 2\n1 3\n", 0, "");
+    test("Buffer search repetitive patterns and reentrant offset coercion", "const b=Buffer.alloc(1048576,97);b[b.length-1]=98;const q=Buffer.alloc(32768,97);q[q.length-1]=98;console.log(b.indexOf(q),b.lastIndexOf(q));const v=Buffer.from('abc');console.log(v.indexOf('z',{valueOf(){v[1]=122;return 0}}));const reason={};try{v.indexOf('a',{valueOf(){throw reason}})}catch(e){console.log(e===reason)}",
+        "1015808 1015808\n1\ntrue\n", 0, "");
+    test("Buffer search matches independent bounded exhaustive reference", "let seed=1234,cases=0;function rnd(n){seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed%n}function ref(a,b,offset,back){let at=offset===undefined||Number.isNaN(offset)?(back?a.length:0):Math.trunc(offset);if(at<0)at+=a.length;if(!b.length)return Math.min(a.length,Math.max(0,at));if(back){for(let i=Math.min(a.length-b.length,at);i>=0;i--){let j=0;while(j<b.length&&a[i+j]===b[j])j++;if(j===b.length)return i}}else{for(let i=Math.max(0,at);i<=a.length-b.length;i++){let j=0;while(j<b.length&&a[i+j]===b[j])j++;if(j===b.length)return i}}return -1}for(let k=0;k<120;k++){const a=Buffer.from(Array.from({length:rnd(32)},()=>rnd(4))),b=Buffer.from(Array.from({length:rnd(8)},()=>rnd(4)));for(const off of [undefined,NaN,Infinity,-Infinity,-99,-8,-1,0,1,2.9,99])for(const back of [false,true]){const got=back?a.lastIndexOf(b,off):a.indexOf(b,off);if(got!==ref(a,b,off,back))throw Error(k+':'+off+':'+back+':'+got);cases++}}console.log(cases);",
+        "2640\n", 0, "");
+    test("Buffer search validates values encodings and conversion failures", "const b=Buffer.from('ab');let n=0;for(const f of [()=>b.indexOf(),()=>b.indexOf({}),()=>b.indexOf(new Uint16Array(1)),()=>b.indexOf('a',0,'bad'),()=>b.indexOf('a',Symbol()),()=>b.indexOf('a',1n)])try{f()}catch(e){if(e instanceof TypeError)n++}console.log(n,b.includes(NaN),b.indexOf(Buffer.alloc(0),-1));",
+        "6 false 1\n", 0, "");
+    filesystem_case("Wave fs mkdir rename stat access unlink and rmdir", "const f=require('fs'),p=process.argv[2];console.log(f.existsSync(p),f.mkdirSync(p),f.existsSync(p));f.writeFileSync(p+'/a','abc');console.log(f.accessSync(p+'/a',f.constants.R_OK),f.statSync(p+'/a').size);f.renameSync(p+'/a',p+'/b');console.log(f.existsSync(p+'/a'),f.statSync(p).isDirectory(),f.statSync(p+'/b').isFile());f.unlinkSync(p+'/b');console.log(f.rmdirSync(p),f.existsSync(p));",
+        "false undefined true\nundefined 3\nfalse true true\nundefined false\n", 0, "");
+    filesystem_case("Wave fs recursive mkdir returns first created ancestor", "const f=require('fs'),p=process.argv[2];console.log(f.mkdirSync(p+'/a//b/',{recursive:true})===p,f.mkdirSync(p+'/a/b',{recursive:true}));f.rmdirSync(p+'/a/b');f.rmdirSync(p+'/a');f.rmdirSync(p);",
+        "true undefined\n", 0, "");
+    filesystem_case("Wave fs errors preserve errno paths and rename destination", "const f=require('fs'),p=process.argv[2];for(const op of ['statSync','accessSync','unlinkSync','rmdirSync'])try{f[op](p)}catch(e){console.log(e.code,e.path===p,e.errno===-2)}try{f.renameSync(p,p+'b')}catch(e){console.log(e.code,e.syscall,e.dest===p+'b')}console.log(f.existsSync(p+'\\0x'));",
+        "ENOENT true true\nENOENT true true\nENOENT true true\nENOENT true true\nENOENT rename true\nfalse\n",
+        0, "");
+    filesystem_case("Wave fs distinguishes existing and nonempty directories", "const f=require('fs'),p=process.argv[2];f.mkdirSync(p);f.writeFileSync(p+'/a','keep');try{f.mkdirSync(p)}catch(e){console.log(e.code)}try{f.rmdirSync(p)}catch(e){console.log(e.code)}try{f.mkdirSync(p+'/a/b',{recursive:true})}catch(e){console.log(e.code)}console.log(f.readFileSync(p+'/a','utf8'));f.unlinkSync(p+'/a');f.rmdirSync(p);",
+        "EEXIST\nENOTEMPTY\nENOTDIR\nkeep\n", 0, "");
+    filesystem_case("Wave fs validates options before mutating paths", "const f=require('fs'),p=process.argv[2],reason={};for(const opt of [{recursive:1},{recursive:true,extra:1},{mode:-1},{recursive:true,get mode(){throw reason}}])try{f.mkdirSync(p,opt)}catch(e){console.log(e===reason||e instanceof TypeError||e instanceof RangeError)}console.log(f.existsSync(p));f.mkdirSync(p,{mode:448});console.log(f.statSync(p).mode&511);f.rmdirSync(p);",
+        "true\ntrue\ntrue\ntrue\nfalse\n448\n", 0, "");
+    filesystem_case("Wave fs private Stats methods and captured Date", "const f=require('fs'),p=process.argv[2],D=Date;f.writeFileSync(p,'abc');Date=null;const s=f.statSync(p);console.log(s.size,s.mtime instanceof D,s.mtimeMs>0,s.birthtimeMs===0,s.isFile(),s.isSymbolicLink());s.mode=0;console.log(s.isFile());try{s.isFile.call({mode:32768})}catch(e){console.log(e instanceof TypeError)}",
+        "3 true true true true false\ntrue\ntrue\n", 0, "");
+    filesystem_case("Wave fs recursive getters preserve first failure", "const f=require('fs'),p=process.argv[2],reason={};try{f.mkdirSync(p,{get recursive(){f.mkdirSync(p+'-inner');f.rmdirSync(p+'-inner');throw reason},get mode(){throw Error('secondary')}})}catch(e){console.log(e===reason,!f.existsSync(p))}try{f.mkdirSync(p,new Proxy({},{ownKeys(){throw reason}}))}catch(e){console.log(e===reason)}",
+        "true true\ntrue\n", 0, "");
+    filesystem_case("Wave fs readdir preserves UTF8 dotfiles and ordinary array results", "const f=require('fs'),p=process.argv[2];f.mkdirSync(p);f.mkdirSync(p+'/b');f.writeFileSync(p+'/한글','u');f.writeFileSync(p+'/.hidden','h');const names=f.readdirSync(p);console.log(Array.isArray(names),names.sort().join('|'));f.unlinkSync(p+'/한글');f.unlinkSync(p+'/.hidden');f.rmdirSync(p+'/b');f.rmdirSync(p);",
+        "true .hidden|b|한글\n", 0, "");
+    filesystem_case("Wave fs Dirents retain private type and parent path", "const f=require('fs'),p=process.argv[2];f.mkdirSync(p);f.mkdirSync(p+'/dir');f.writeFileSync(p+'/file','x');const a=f.readdirSync(p,{withFileTypes:true,encoding:'utf8',recursive:false}).sort((a,b)=>a.name.localeCompare(b.name));console.log(a[0].name,a[0].isDirectory(),a[0].isFile(),a[0].parentPath===p);a[1].mode=0;console.log(a[1].name,a[1].isFile(),a[1].isDirectory(),a[1].isSymbolicLink());try{a[1].isFile.call({})}catch(e){console.log(e instanceof TypeError)}f.unlinkSync(p+'/file');f.rmdirSync(p+'/dir');f.rmdirSync(p);",
+        "dir true false true\nfile true false false\ntrue\n", 0, "");
+    filesystem_case("Wave fs readdir stops at failed conversion before reading options", "const f=require('fs');let touched=0;try{f.readdirSync({}, {get withFileTypes(){touched++;throw Error('wrong')}})}catch(e){console.log(e instanceof TypeError,touched)}try{f.readdirSync('/absent-jsrt-dir',{get withFileTypes(){throw Error('option failure')}})}catch(e){console.log(e.message)}for(const o of [{recursive:true},{unknown:true},{withFileTypes:1}])try{f.readdirSync('/absent-jsrt-dir',o)}catch(e){console.log(e instanceof TypeError)}",
+        "true 0\noption failure\ntrue\ntrue\ntrue\n", 0, "");
+    filesystem_case("Wave fs readdir validates paths options and OS errors", "const f=require('fs'),p=process.argv[2];for(const path of [p,p+'\\0x'])try{f.readdirSync(path)}catch(e){console.log(e.code==='ENOENT'||e instanceof TypeError)}f.writeFileSync(p,'keep');try{f.readdirSync(p)}catch(e){console.log(e.code,e.syscall,e.path===p)}for(const opt of [{withFileTypes:1},'buffer'])try{f.readdirSync(p,opt)}catch(e){console.log(e instanceof TypeError)}console.log(f.readFileSync(p,'utf8'));",
+        "true\ntrue\nENOTDIR scandir true\ntrue\ntrue\nkeep\n", 0, "");
+    filesystem_case("Wave fs readdir ignores constructor replacement and inherited index setters", "const f=require('fs'),p=process.argv[2],A=Array;f.mkdirSync(p);f.writeFileSync(p+'/a','a');Array=null;Object.defineProperty(A.prototype,'0',{set(){throw Error('poison')},configurable:true});const names=f.readdirSync(p,'utf8');console.log(A.isArray(names),names.length,names[0]);delete A.prototype[0];f.unlinkSync(p+'/a');f.rmdirSync(p);",
+        "true 1 a\n", 0, "");
+    var link_path: str = join((deref suite.directory) as str, "fs-entry") as str;
+    check("prepare directory with dangling link for Dirent regression", mkdir(link_path, 448) == 0 &&
+        symlink("absent-target", join(link_path, "dangling") as str) == 0);
+    filesystem_case("Wave fs Dirent identifies a dangling link without following it", "const f=require('fs'),p=process.argv[2],d=f.readdirSync(p,{withFileTypes:true})[0];console.log(d.name,d.isSymbolicLink(),d.isFile(),d.isDirectory());f.unlinkSync(p+'/dangling');f.rmdirSync(p);",
+        "dangling true false false\n", 0, "");
+    check("create owned dangling symlink for Wave fs regression", symlink("absent-target", link_path) == 0);
+    filesystem_case("Wave fs lstat identifies a dangling symbolic link", "const f=require('fs'),p=process.argv[2],s=f.lstatSync(p);console.log(s.isSymbolicLink(),s.isFile(),s.size>0);f.unlinkSync(p);try{f.lstatSync(p)}catch(e){console.log(e.code,e.syscall)}",
+        "true false true\nENOENT lstat\n", 0, "");
+    check("prepare dangling symlink for async lstat", symlink("absent-target", link_path) == 0);
+    filesystem_case("async lstat snapshots a dangling link while stat follows it", "const f=require('fs/promises'),p=process.argv[2];Promise.all([f.lstat(p).then(s=>s.isSymbolicLink()&&!s.isFile()),f.stat(p).catch(e=>e.code==='ENOENT')]).then(v=>{console.log(v.every(Boolean));return f.unlink(p)}).then(()=>console.log(require('fs').existsSync(p)));",
+        "true\nfalse\n", 0, "");
+    check("recreate owned dangling symlink after lstat regression", symlink("absent-target", link_path) == 0);
+    filesystem_case("Wave fs dangling link stat fails and unlink removes only link", "const f=require('fs'),p=process.argv[2];console.log(f.existsSync(p));try{f.statSync(p)}catch(e){console.log(e.code)}console.log(f.unlinkSync(p),f.existsSync(p));",
+        "false\nENOENT\nundefined false\n", 0, "");
+    var target_path: str = join((deref suite.directory) as str, "fs-target") as str;
+    check("create owned regular symlink target", write(target_path, "x" as ptr<u8>, 1) == 1 && symlink("fs-target",
+        link_path) == 0);
+    filesystem_case("Wave fs stat follows link and unlink preserves target", "const f=require('fs'),p=process.argv[2];console.log(f.statSync(p).isFile(),f.statSync(p).size);f.unlinkSync(p);console.log(f.existsSync(p),f.readFileSync(p.replace('fs-entry','fs-target'),'utf8'));",
+        "true 1\nfalse x\n", 0, "");
+    remove(target_path);
+    async_case("binary sync files preserve all octets and default to Buffer", "const f=require('node:fs'),p=process.argv[2],b=Buffer.from(Array.from({length:256},(_,i)=>i));f.writeFileSync(p,b);const a=f.readFileSync(p);console.log(Buffer.isBuffer(a),a.equals(b),f.readFileSync(p,null).equals(b));",
+        "true true true\n", 0, "");
+    async_case("binary sync writes respect Uint8Array offsets", "const f=require('fs'),p=process.argv[2],b=new Uint8Array([9,255,0,128,9]);f.writeFileSync(p,b.subarray(1,4));console.log(f.readFileSync(p).toString('hex'));f.writeFileSync(p,new Uint8Array(0));console.log(f.readFileSync(p).length);",
+        "ff0080\n0\n", 0, "");
+    async_case("binary invalid writes validate before truncation", "const f=require('fs'),p=process.argv[2];f.writeFileSync(p,'safe');for(const data of [new Uint16Array(2),new DataView(new ArrayBuffer(2)),{},[1,2]]){try{f.writeFileSync(p,data);throw Error('accepted');}catch(e){if(!(e instanceof TypeError))throw e}}console.log(f.readFileSync(p,'utf8'));",
+        "safe\n", 0, "");
+    async_case("binary sync writes reject oversized views before truncation", "const f=require('fs'),p=process.argv[2];f.writeFileSync(p,'safe');try{f.writeFileSync(p,new Uint8Array(4194305));}catch(e){console.log(e instanceof RangeError)}console.log(f.readFileSync(p,'utf8'));",
+        "true\nsafe\n", 0, "");
+    async_case("binary file results resist replaced global constructors", "const f=require('fs'),B=Buffer,p=process.argv[2];f.writeFileSync(p,B.from([255,0,128]));globalThis.Buffer=globalThis.Uint8Array=null;f.readFileSync(p)[1]=42;console.log(B.isBuffer(f.readFileSync(p)),f.readFileSync(p).toString('hex'));",
+        "true ff0080\n", 0, "");
+    async_case("binary asynchronous files return Buffers including empty results", "const f=require('fs/promises'),p=process.argv[2];f.writeFile(p,Buffer.from([0,255,128,195,40])).then(()=>f.readFile(p)).then(b=>{console.log(Buffer.isBuffer(b),b.toString('hex'));return f.writeFile(p,Buffer.alloc(0))}).then(()=>f.readFile(p,null)).then(b=>console.log(Buffer.isBuffer(b),b.length));",
+        "true 00ff80c328\ntrue 0\n", 0, "");
+    async_case("async writes snapshot submitted view before worker access", "const f=require('fs/promises'),p=process.argv[2],a=Buffer.from([9,0,255,128,9]),b=a.subarray(1,4);const done=f.writeFile(p,b);a.fill(42);done.then(()=>f.readFile(p)).then(b=>console.log(b.toString('hex')));",
+        "00ff80\n", 0, "");
+    async_case("async binary rejection preserves original target", "const f=require('fs'),p=process.argv[2];f.writeFileSync(p,'safe');f.promises.writeFile(p,new DataView(new ArrayBuffer(2))).catch(e=>console.log(e instanceof TypeError,f.readFileSync(p,'utf8')));",
+        "true safe\n", 0, "");
+    test("Buffer initialization preserves ordinary object invariants", "console.log(Object.getPrototypeOf(Object.prototype)===null,Object.prototype.toString.call({}),String({}),JSON.stringify({a:1}),[].toString(),Object.hasOwn(Object.prototype,'toJSON'));",
+        "true [object Object] [object Object] {\"a\":1}  false\n", 0, "");
+    test("Buffer allocation pressure preserves live byte storage", "const b=Buffer.from('rooted');for(let i=0;i<1000;i++){const c=Buffer.alloc(128,i);if(c[0]!==i%256)throw Error('corrupt')}console.log(b.toString(),Buffer.isBuffer(b),b instanceof Uint8Array);",
+        "rooted true true\n", 0, "");
+}

@@ -1,0 +1,195 @@
+// Stream destruction, close completion, state accessors and resource hooks.
+import("./stream_operations")::{schedule, destroy_stream};
+import("./values")::{get, put, text, fail};
+import("./collections")::{list, length, at, flag, set_integer, set_flag, enqueue, bind_one};
+import("./events")::{emit_named};
+import("./stream_state")::{stream_state, stream_state_storage, StreamHostState, STREAM_CORKED_GETTER};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, left: ptr<u8>, right: ptr<u8>) -> bool;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+
+pub fun stream_destroy(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<u8> = stream_state(ctx, receiver, 0, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    var reason: ptr<u8> = undefined(ctx);
+    if (count > 0 && kind(ctx, args[0]) != 1) {
+        reason = args[0];
+    }
+    destroy_stream(ctx, receiver, state, reason, ex);
+    return receiver;
+}
+
+pub fun stream_close(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var state: ptr<u8> = stream_state(ctx, receiver, 0, ex);
+    if (state == null || flag(ctx, state, "closed", ex)) {
+        return undefined(ctx);
+    }
+    if (!flag(ctx, state, "destroyDone", ex)) {
+        if (flag(ctx, state, "destroyStarted", ex)) {
+            return undefined(ctx);
+        }
+        set_flag(ctx, state, "destroyStarted", true, ex);
+        var hook: ptr<u8> = get(ctx, receiver, "_destroy", ex);
+        protect(ctx, hook);
+        if (kind(ctx, hook) == 5 && callable(ctx, hook) && deref ex == null) {
+            var done: ptr<u8> = bind_one(ctx, (deref stream_state_roots.stream_methods)[24], receiver,
+                undefined(ctx), ex);
+            protect(ctx, done);
+            var reason: ptr<u8> = get(ctx, state, "failure", ex);
+            if (kind(ctx, reason) == 0) {
+                reason = js_null(ctx);
+            }
+            var call_args: array<ptr<u8>, 2> = [reason, done];
+            call(ctx, hook, receiver, 2, &call_args[0], ex);
+            unprotect(ctx, done);
+            unprotect(ctx, hook);
+            if (deref ex != null) {
+                var failure: ptr<u8> = deref ex;
+                protect(ctx, failure);
+                deref ex = null;
+                if (kind(ctx, get(ctx, state, "failure", ex)) == 0) {
+                    put(ctx, state, "failure", failure, ex);
+                }
+                set_flag(ctx, state, "destroyDone", true, ex);
+                enqueue(ctx, (deref stream_state_roots.stream_methods)[15], receiver, undefined(ctx),
+                    ex);
+                unprotect(ctx, failure);
+            }
+            return undefined(ctx);
+        }
+        unprotect(ctx, hook);
+        set_flag(ctx, state, "destroyDone", true, ex);
+    }
+    set_flag(ctx, state, "closed", true, ex);
+    var writes: ptr<u8> = get(ctx, state, "writes", ex);
+    protect(ctx, writes);
+    put(ctx, state, "writes", list(ctx, ex), ex);
+    put(ctx, state, "inflight", undefined(ctx), ex);
+    set_integer(ctx, state, "wbytes", 0, ex);
+    set_flag(ctx, state, "writing", false, ex);
+    set_flag(ctx, state, "needDrain", false, ex);
+    var reason: ptr<u8> = get(ctx, state, "failure", ex);
+    protect(ctx, reason);
+    var callback_error: ptr<u8> = reason;
+    if (kind(ctx, callback_error) == 0) {
+        var nested: ptr<u8> = null;
+        fail(ctx, &nested, 0, "stream destroyed before write completion");
+        callback_error = nested;
+    }
+    protect(ctx, callback_error);
+    var first: ptr<u8> = null;
+    for (var i: i64 = 0; i < length(ctx, writes, ex); i++) {
+        var record: ptr<u8> = at(ctx, writes, i, ex);
+        var completion: ptr<u8> = get(ctx, record, "callback", ex);
+        if (kind(ctx, completion) == 5) {
+            var nested: ptr<u8> = null;
+            var call_args: array<ptr<u8>, 1> = [callback_error];
+            call(ctx, completion, receiver, 1, &call_args[0], &nested);
+            if (nested != null && first == null) {
+                first = nested;
+                protect(ctx, first);
+            }
+        }
+    }
+    if (kind(ctx, reason) != 0) {
+        var nested: ptr<u8> = null;
+        var call_args: array<ptr<u8>, 1> = [reason];
+        emit_named(ctx, receiver, "error", 1, &call_args[0], &nested);
+        if (nested != null && first == null) {
+            first = nested;
+            protect(ctx, first);
+        }
+    }
+    var nested: ptr<u8> = null;
+    emit_named(ctx, receiver, "close", 0, null, &nested);
+    if (first != null) {
+        deref ex = first;
+        unprotect(ctx, first);
+    } else if (nested != null) {
+        deref ex = nested;
+    }
+    unprotect(ctx, callback_error);
+    unprotect(ctx, reason);
+    unprotect(ctx, writes);
+    return undefined(ctx);
+}
+
+pub fun stream_get(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var state: ptr<u8> = stream_state(ctx, receiver, 0, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    if (equal(ctx, fn, (deref stream_state_roots.stream_methods)[16])) {
+        return get(ctx, state, "rbytes", ex);
+    }
+    if (equal(ctx, fn, (deref stream_state_roots.stream_methods)[17])) {
+        return get(ctx, state, "wbytes", ex);
+    }
+    if (equal(ctx, fn, (deref stream_state_roots.stream_methods)[STREAM_CORKED_GETTER])) {
+        return get(ctx, state, "corked", ex);
+    }
+    if (equal(ctx, fn, (deref stream_state_roots.stream_methods)[28])) {
+        if (flag(ctx, state, "utf8", ex)) {
+            return text(ctx, "utf8");
+        }
+        return js_null(ctx);
+    }
+    var key: str = "destroyed";
+    if (equal(ctx, fn, (deref stream_state_roots.stream_methods)[19])) {
+        key = "endEmitted";
+    } else if (equal(ctx, fn, (deref stream_state_roots.stream_methods)[20])) {
+        key = "finished";
+    } else if (equal(ctx, fn, (deref stream_state_roots.stream_methods)[21])) {
+        key = "needDrain";
+    } else if (equal(ctx, fn, (deref stream_state_roots.stream_methods)[22])) {
+        key = "flow";
+    }
+    return boolean(ctx, flag(ctx, state, key, ex));
+}
+
+pub fun stream_hook_done(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var state: ptr<u8> = stream_state(ctx, receiver, 0, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    var destroying: bool = equal(ctx, fn, (deref stream_state_roots.stream_methods)[24]);
+    var key: str = "finalDone";
+    if (destroying) {
+        key = "destroyDone";
+    }
+    if (flag(ctx, state, key, ex)) {
+        fail(ctx, ex, 0, "stream hook callback called more than once");
+        return undefined(ctx);
+    }
+    set_flag(ctx, state, key, true, ex);
+    if (count > 1 && kind(ctx, args[1]) != 0 && kind(ctx, args[1]) != 1) {
+        if (destroying) {
+            if (kind(ctx, get(ctx, state, "failure", ex)) == 0) {
+                put(ctx, state, "failure", args[1], ex);
+            }
+        } else {
+            destroy_stream(ctx, receiver, state, args[1], ex);
+            return undefined(ctx);
+        }
+    }
+    if (destroying) {
+        enqueue(ctx, (deref stream_state_roots.stream_methods)[15], receiver, undefined(ctx), ex);
+    } else {
+        schedule(ctx, receiver, state, true, ex);
+    }
+    return undefined(ctx);
+}

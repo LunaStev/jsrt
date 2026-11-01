@@ -1,0 +1,340 @@
+// Engine/constructor/addon ABI, metadata, JSON oracle and core JavaScript.
+import("jsrt::tools::support")::{arg, join, absolute};
+import("jsrt::runtime::config")::{engine_supported};
+import("jsrt::runtime::host")::{install_host, shutdown_host};
+import("jsrt::runtime::values")::{put};
+import("jsrt::runtime::values")::{text};
+import("wjson")::{JsonDoc, Json, json_parse_bytes, json_ok, json_root, json_free, json_path, json_path_i64,
+    json_path_bool, json_str_eq, json_len, JSON_STRICT};
+import("std::fs::file")::{fs_read_all};
+import("std::mem::alloc")::{mem_alloc};
+import("std::mem::ops")::{mem_eq};
+import("std::mem::cstr")::{mem_len_cstr};
+import("std::path::copy")::{path_dirname_copy};
+import("./contexts")::{context_result};
+import("./harness")::{check, contains, expect, test, TestState, test_state};
+extern(c, "jsrt_test_constructor_abi") fun test_constructor_abi() -> i32;
+extern(c, "jsrt_worker_engine_available") fun worker_engine_available() -> bool;
+extern(c, "jsrt_clone_engine_available") fun clone_engine_available() -> bool;
+extern(c, "wr_context_create") fun wr_context_create(cls: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_context_release") fun wr_context_release(ctx: ptr<u8>);
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_string_utf8_capacity") fun wr_string_utf8_capacity(text: ptr<u8>) -> i64;
+extern(c, "wr_string_copy_utf8") fun wr_string_copy_utf8(text: ptr<u8>, data: ptr<u8>, cap: i64) -> i64;
+extern(c, "wr_evaluate") fun wr_evaluate(ctx: ptr<u8>, source: ptr<u8>, receiver: ptr<u8>, url: ptr<u8>, line: i32,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_to_string") fun wr_to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_engine_name") fun wr_engine_name() -> str;
+extern(c, "wr_context_global") fun wr_context_global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_context_data") fun wr_context_data(ctx: ptr<u8>) -> ptr<u8>;
+
+pub fun worker_tests() {
+    check("callable constructor ABI rejects missing mismatched and NULL inputs and forwards valid handles", test_constructor_abi() == 1);
+    test("clone primitives preserve special numbers BigInt and UTF16", "const a=[undefined,null,true,NaN,Infinity,-0,12345678901234567890n,'한글😀\\ud800'].map(v=>structuredClone(v));console.log(a[0]===undefined,a[1]===null,a[2],Number.isNaN(a[3]),a[4]===Infinity,Object.is(a[5],-0),a[6]===12345678901234567890n,a[7]==='한글😀\\ud800');",
+        "true true true true true true true true\n", 0, "");
+    if (!clone_engine_available()) {
+        println("SKIP object clone regression suite: matching engine clone ABI is unavailable");
+    } else {
+        test("clone preserves cycles aliases sparse arrays and safe own properties", "const a={value:1},x={a,b:a,list:new Array(5)};x.self=x;x.list[2]=a;Object.defineProperty(x,'__proto__',{value:{safe:true},enumerable:true});const y=structuredClone(x);console.log(y!==x,y.self===y,y.a===y.b,y.list[2]===y.a,y.list.length,!(0 in y.list),Object.hasOwn(y,'__proto__'),y.__proto__.safe,Object.getPrototypeOf(y)===Object.prototype);",
+            "true true true true 5 true true true true\n", 0, "");
+        test("clone snapshots Date and byte views without sharing storage", "const b=Buffer.from([9,0,255,128,9]),d=new Date(12345),a={b:b.subarray(1,4),d};const c=structuredClone(a);b.fill(42);d.setTime(1);console.log(c.b instanceof Uint8Array,!Buffer.isBuffer(c.b),c.b.join(','),c.d.getTime());",
+            "true true 0,255,128 12345\n", 0, "");
+        test("clone rejects Proxy without invoking user traps", "let count=0;const p=new Proxy({},{getPrototypeOf(){count++;throw Error('wrong')},ownKeys(){count++;throw Error('wrong')}});try{structuredClone(p)}catch(e){console.log(e.name,count)}",
+            "DataCloneError 0\n", 0, "");
+        test("clone stops at the first throwing getter and preserves its value", "const reason={};let later=0;try{structuredClone({get a(){throw reason},get b(){later++;return 1}})}catch(e){console.log(e===reason,later)}",
+            "true 0\n", 0, "");
+        test("clone uses captured intrinsics after constructor replacement", "const D=Date,U=Uint8Array;const a={date:new D(12),bytes:new U([1,2]),n:99n};Object.keys=Object.getPrototypeOf=()=>{throw Error('wrong')};globalThis.BigInt=globalThis.Date=globalThis.Uint8Array=null;const b=structuredClone(a);console.log(b.date instanceof D,b.date.getTime(),b.bytes instanceof U,b.bytes[1],b.n===99n);",
+            "true 12 true 2 true\n", 0, "");
+        test("clone explicitly rejects unsupported values transfer and limits", "for(const v of [()=>{},Symbol('x'),new Map(),new WeakMap(),new Uint16Array(1),new ArrayBuffer(2),new Uint8Array(4194305)])try{structuredClone(v);console.log('wrong')}catch(e){console.log(e.name==='DataCloneError')}try{structuredClone({}, {transfer:[]})}catch(e){console.log(e.name==='DataCloneError')}let a={},b=a;for(let i=0;i<130;i++)b=b.next={};try{structuredClone(a)}catch(e){console.log(e.name==='DataCloneError')}",
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n", 0, "");
+    }
+    if (!worker_engine_available()) {
+        test("Worker refuses an engine without its versioned termination contract", "const {Worker,isMainThread,parentPort,workerData,threadId}=require('worker_threads');console.log(isMainThread,parentPort===null,workerData===undefined,threadId);try{new Worker('42',{eval:true})}catch(e){console.log(e.message.includes('termination ABI'))}",
+            "true true true 0\ntrue\n", 0, "");
+        println("SKIP live Worker regression suite: matching engine Worker ABI is unavailable");
+        return;
+    }
+    test("Worker module aliases expose independent main-thread metadata", "const a=require('worker_threads');console.log(a===require('node:worker_threads'),a.isMainThread,a.threadId,a.parentPort===null,a.workerData===undefined,typeof a.Worker);",
+        "true true 0 true true function\n", 0, "");
+    test("Worker constructor has function and instance semantics", "const {Worker}=require('worker_threads'),{EventEmitter}=require('events');console.log(Worker.name,Worker instanceof Function);try{Worker('42',{eval:true})}catch(e){console.log(e instanceof TypeError)}const w=new Worker('42',{eval:true});console.log(w instanceof Worker,w instanceof EventEmitter);w.on('exit',c=>console.log(c));",
+        "Worker true\ntrue\ntrue true\n0\n", 0, "");
+    test("Worker eval publishes online before messages and exit", "const {Worker}=require('worker_threads');const seen=[];const w=new Worker(\"require('worker_threads').parentPort.postMessage('hello')\",{eval:true});w.on('online',()=>seen.push('online'));w.on('message',v=>seen.push(v));w.on('exit',code=>console.log(seen.join(','),code,w.threadId));",
+        "online,hello 0 -1\n", 0, "");
+    test("Worker file resolves CommonJS and clones workerData before return", "const {Worker}=require('worker_threads'),data={value:1};const w=new Worker('./tests/worker_echo.cjs',{workerData:data});data.value=99;w.on('message',v=>{if(v.ready){console.log(v.data.value,v.isMainThread,v.threadId===w.threadId,v.marker);const a={done:true};a.self=a;w.postMessage(a)}else console.log(v.self===v,v.done)});w.on('exit',c=>console.log('exit',c));",
+        "1 false true worker-relative-module\ntrue true\nexit 0\n", 0, "");
+    test("Worker clone rejects callable data and leaves capacity reusable", "const {Worker}=require('worker_threads');try{new Worker('42',{eval:true,workerData:()=>{}})}catch(e){console.log(e.name)}new Worker('42',{eval:true}).on('exit',c=>console.log(c));",
+        "DataCloneError\n0\n", 0, "");
+    test("Worker errors reach error listeners before nonzero exit", "const {Worker}=require('worker_threads'),w=new Worker(\"throw Error('worker boom')\",{eval:true});w.on('error',e=>console.log(e instanceof Error,e.message.includes('worker boom')));w.on('exit',c=>console.log('exit',c));",
+        "true true\nexit 1\n", 0, "");
+    test("Worker missing file reports asynchronous error and exit", "const {Worker}=require('worker_threads'),w=new Worker('./tests/absent-worker-regression.cjs');w.on('error',e=>console.log(e instanceof Error));w.on('exit',c=>console.log(c));console.log('returned');",
+        "returned\ntrue\n1\n", 0, "");
+    test("Worker timers and async files run on the owning event loop", "const {Worker}=require('worker_threads');new Worker(\"const {parentPort:p}=require('worker_threads');setTimeout(()=>require('fs/promises').stat('tests/http_server.js').then(s=>p.postMessage(s.isFile())),1)\",{eval:true}).on('message',v=>console.log(v)).on('exit',c=>console.log(c));",
+        "true\n0\n", 0, "");
+    test("Worker terminate interrupts catch finally loops and returns one Promise", "const {Worker}=require('worker_threads'),w=new Worker(\"const p=require('worker_threads').parentPort;try{p.postMessage('ready');while(true){}}catch(e){while(true){}}finally{while(true){}}\",{eval:true});w.on('message',()=>{const a=w.terminate(),b=w.terminate();console.log(a===b);a.then(c=>console.log('terminated',c))});w.on('exit',c=>console.log('exit',c));",
+        "true\nexit 1\nterminated 1\n", 0, "");
+    test("Worker immediately terminated during startup is joined", "const {Worker}=require('worker_threads'),w=new Worker('while(true){}',{eval:true});w.on('exit',c=>console.log(c));w.terminate().then(c=>console.log('joined',c));",
+        "1\njoined 1\n", 0, "");
+    test("Worker message queues reserve before getters and enforce pressure", "const {Worker}=require('worker_threads'),w=new Worker('while(true){}',{eval:true});w.on('online',()=>{for(let i=0;i<16;i++)w.postMessage(i);let touched=0;try{w.postMessage({get value(){touched++;return 1}})}catch(e){console.log(e instanceof RangeError,touched)}w.terminate().then(c=>console.log(c))});",
+        "true 0\n1\n", 0, "");
+    test("Worker options reserve before reentrant construction", "const {Worker}=require('worker_threads');let inner;const outer=new Worker(\"require('worker_threads').parentPort.postMessage('outer')\",{get eval(){inner=new Worker(\"require('worker_threads').parentPort.postMessage('inner')\",{eval:true});return true}});Promise.all([new Promise(r=>outer.on('message',r)),new Promise(r=>inner.on('message',r))]).then(v=>console.log(v.sort().join(',')));",
+        "inner,outer\n", 0, "");
+    test("Worker option failure stops later getters without starting a thread", "const {Worker}=require('worker_threads'),reason={};let touched=0;try{new Worker('42',{get eval(){throw reason},get workerData(){touched++;return {}}})}catch(e){console.log(e===reason,touched)}try{new Worker('42',{eval:true,stdout:true})}catch(e){console.log(e instanceof TypeError)}",
+        "true 0\ntrue\n", 0, "");
+    test("Worker slots are released before exit listeners construct replacements", "const {Worker}=require('worker_threads');let n=0;function next(){new Worker('42',{eval:true}).on('exit',c=>{if(c!==0)throw Error('exit');if(++n===12)console.log(n);else next()})}next();",
+        "12\n", 0, "");
+    test("Worker nonzero exitCode has no synthetic error event", "const {Worker}=require('worker_threads');new Worker('process.exitCode=7',{eval:true}).on('error',()=>console.log('wrong')).on('exit',c=>console.log(c));",
+        "7\n", 0, "");
+    test("Worker unhandled rejection is reported through error and exit", "const {Worker}=require('worker_threads');new Worker(\"Promise.reject(Error('worker rejection'))\",{eval:true}).on('error',e=>console.log(e.message.includes('worker rejection'))).on('exit',c=>console.log(c));",
+        "true\n1\n", 0, "");
+    test("Worker nested creation is explicitly rejected", "const {Worker}=require('worker_threads');new Worker(\"const {Worker,parentPort}=require('worker_threads');try{new Worker('42',{eval:true})}catch(e){parentPort.postMessage(e.message.includes('nested'))}\",{eval:true}).on('message',v=>console.log(v));",
+        "true\n", 0, "");
+    test("fatal parent errors terminate and join active Workers", "const {Worker}=require('worker_threads');new Worker('while(true){}',{eval:true});throw Error('parent fatal Worker');",
+        "", 1, "parent fatal Worker");
+}
+
+pub fun info_tests() {
+    var suite: ptr<TestState> = test_state();
+    var expected_features: i64 = 40;
+    if (worker_engine_available()) {
+        expected_features += 1;
+    }
+    if (clone_engine_available()) {
+        expected_features += 1;
+    }
+    var command: array<str, 2> = [(deref suite.binary) as str, "--info"];
+    expect("wjson runtime info command", &command[0], 2, null, -1, 0, "");
+    var doc: JsonDoc = json_parse_bytes((deref suite.output), (deref suite.output_count), 32, JSON_STRICT);
+    var root: Json = json_root(doc);
+    check("wjson parses native runtime metadata", json_ok(doc) && json_str_eq(json_path(root, "runtime"),
+        "jsrt") && json_str_eq(json_path(root, "implementation"), "Wave") && json_str_eq(json_path(root,
+        "serialization.library"), "wjson") && json_str_eq(json_path(root, "serialization.backend"), "Wave") && json_path_bool(root,
+        "serialization.replacesJsonGlobals", false) && json_str_eq(json_path(root, "serialization.version"),
+        "0.4.0") && json_str_eq(json_path(root, "serialization.commit"), "ca2a8cd9f029db5d1d6790342ba507efe0d84d32") && json_len(json_path(root,
+        "features")) == expected_features && json_path_bool(root, "installer.includeDevOption", false) &&
+        json_path_i64(root, "limits.workers", -1) == 8 && json_path_i64(root, "limits.workerMessages", -1) == 16 &&
+        json_path_i64(root, "limits.cloneNodes", -1) == 4096 && json_path_i64(root, "limits.cloneBytes", -1) == 4194304 &&
+        json_path_i64(root, "limits.cloneDepth", -1) == 128 &&
+        json_path_i64(root, "limits.testFiles", -1) == 256 &&
+        json_str_eq(json_path(root, "addons.api"), "Node-API v1 subset") && !json_path_bool(root,
+        "addons.complete", true) && json_str_eq(json_path(root, "features[23]"), "crypto") && json_str_eq(json_path(root,
+        "features[24]"), "url") && json_str_eq(json_path(root, "features[26]"), "packageInstall") && json_path_bool(root,
+        "crypto.incrementalHash", false) && !json_path_bool(root, "installer.exactVersionsOnly", true) && json_path_bool(root,
+        "installer.semverRanges", false) && json_path_bool(root, "installer.archiveCache", false) && !json_path_bool(root,
+        "installer.lifecycleScripts", true) && json_str_eq(json_path(root, "installer.recoveryJournal"),
+        ".jsrt-transaction/state.wjson v1/v2") && json_path_bool(root, "installer.managedReplacement", false) &&
+        json_path_bool(root, "installer.updateOption", false) && json_str_eq(json_path(root, "installer.projectLock"),
+        "directory flock") && !json_path_bool(root, "installer.atomicAcrossPaths", true) && json_path_i64(root,
+        "limits.urlBytes", -1) == 8191 && json_path_i64(root, "limits.packageArchiveBytes", -1) == 33554432 && json_str_eq(json_path(root,
+        "crypto.backend"), "OpenSSL") && json_str_eq(json_path(root, "crypto.entropy"), "Wave std OS random") && json_path_i64(root,
+        "limits.hashUpdateBytes", -1) == 4194304 && json_str_eq(json_path(root, "features[3]"), "process") && json_str_eq(json_path(root,
+        "features[4]"), "fsSyncUtf8") && json_str_eq(json_path(root, "features[5]"), "commonjs") && json_str_eq(json_path(root,
+        "features[6]"), "fsPromises") && json_str_eq(json_path(root, "features[7]"), "unhandledRejections") && json_str_eq(json_path(root,
+        "features[8]"), "httpServer") && json_str_eq(json_path(root, "features[9]"), "buffer") && json_str_eq(json_path(root,
+        "features[10]"), "fsBinary") && json_str_eq(json_path(root, "features[11]"), "events") && json_str_eq(json_path(root,
+        "features[12]"), "byteStreams") && json_str_eq(json_path(root, "features[13]"), "fileStreams") && json_str_eq(json_path(root,
+        "features[14]"), "streamUtilities") && json_str_eq(json_path(root, "features[15]"), "httpStreams") && json_str_eq(json_path(root,
+        "features[16]"), "httpClient") && json_str_eq(json_path(root, "features[17]"), "fetch") && json_str_eq(json_path(root,
+        "client.backend"), "libcurl") && json_path_bool(root, "client.verifyCertificates", false) && json_str_eq(json_path(root,
+        "network.backend"), "libuv") && json_str_eq(json_path(root, "network.version"), "1.53.0") && json_str_eq(json_path(root,
+        "network.httpParserVersion"), "9.4.3") && json_str_eq(json_path(root, "enginePolicy.name"), "JavaScriptCoreGTK") && json_path_i64(root,
+        "enginePolicy.minimumVersion[0]", -1) == 2 && json_path_i64(root, "enginePolicy.minimumVersion[1]",
+        -1) == 54 && json_path_i64(root, "enginePolicy.minimumVersion[2]", -1) == 1 && json_path_i64(root,
+        "enginePolicy.minimumVersion[3]", -1) == 0);
+    var major: i64 = json_path_i64(root, "engine.major", -1);
+    var minor: i64 = json_path_i64(root, "engine.minor", -1);
+    var micro: i64 = json_path_i64(root, "engine.micro", -1);
+    var patch: i64 = json_path_i64(root, "engine.patch", -1);
+    var compatibility: bool = json_path_bool(root, "compatibilityBuild", false);
+    check("metadata reports an engine and explicit compatibility policy", major >= 0 && minor >= 0 && micro >= 0 && json_str_eq(json_path(root,
+        "engine.name"), wr_engine_name()) && (compatibility || engine_supported(major as u32, minor as u32,
+        micro as u32, patch as u32)));
+    check("metadata exposes configured security limits", json_path_i64(root, "limits.fileBytes", -1) == 4194304 && json_path_i64(root,
+        "limits.webStreamQueueEntries", -1) == 1024 && json_path_i64(root, "limits.webStreamPendingReads", -1) == 1024 &&
+        json_path_i64(root, "limits.textCodecBytes", -1) == 4194304 && json_path_i64(root,
+        "limits.fileJobs", -1) == 16 && json_path_i64(root, "limits.fileWorkers", -1) == 2 && json_path_i64(root,
+        "limits.moduleRecords", -1) == 1024 && json_path_i64(root, "limits.moduleDepth", -1) == 128 && json_path_i64(root,
+        "limits.bufferBytes", -1) == 4194304 && json_path_i64(root, "limits.bufferTextUnits", -1) == 16777216 && json_path_i64(root,
+        "limits.bufferConcatParts", -1) == 65536 && json_path_i64(root, "limits.eventListeners", -1) == 1024 && json_path_i64(root,
+        "limits.streamQueueBytes", -1) == 4194304 && json_path_i64(root, "limits.streamQueueChunks",
+        -1) == 1024 && json_path_i64(root, "limits.streamHighWaterMark", -1) == 65536 && json_path_i64(root,
+        "limits.fileStreams", -1) == 32 && json_path_i64(root, "limits.httpClients", -1) == 16 && json_path_i64(root,
+        "limits.httpRequestBytes", -1) == 67108864 && !json_path_bool(root, "limits.sandbox", true) && !json_path_bool(root,
+        "limits.heapBounded", true));
+    json_free(&doc);
+    var extra: array<str, 3> = [(deref suite.binary) as str, "--info", "ignored"];
+    expect("info rejects unexpected arguments", &extra[0], 3, "" as ptr<u8>, 0, 2, "takes no arguments");
+}
+
+fun addon_case(name: str, fixture: str, source: str, expected: str, code: i32, error: str) {
+    var suite: ptr<TestState> = test_state();
+    var parent: array<u8, 8192>;
+    // Addons belong to the temporary test runner, independently of the runtime
+    // under test. Release validation deliberately moves the runtime elsewhere.
+    var executable: ptr<u8> = absolute(arg(0));
+    if (executable == null || path_dirname_copy(&parent[0], 8192, executable as str) < 0) {
+        check(name, false);
+        return;
+    }
+    var path: str = join(&parent[0] as str, fixture) as str;
+    var command: array<str, 4> = [(deref suite.binary) as str, "-e", source, path];
+    expect(name, &command[0], 4, expected as ptr<u8>, mem_len_cstr(expected), code, error);
+}
+
+pub fun native_addon_tests() {
+    addon_case("real Node-API addon runs through JSC and Wave require cache", "addon.node", "const p=process.argv[2],a=require(p);console.log(a.add(20,22),a===require(p),a===require(p.slice(0,-5)),a.data(),a.answer);",
+        "42 true true 41 42\n", 0, "");
+    addon_case("native strings preserve Unicode embedded NUL and empty strings", "addon.node", "const a=require(process.argv[2]);console.log(a.echo('한글 🌊')==='한글 🌊',a.echo('A\\0B')==='A\\0B',a.echo('')==='');",
+        "true true true\n", 0, "");
+    addon_case("native error uses captured realm constructors and own error code", "addon.node", "const a=require(process.argv[2]),Type=TypeError;globalThis.TypeError=null;Object.defineProperty(Error.prototype,'code',{set(){throw 1}});try{a.add(1,'x')}catch(e){console.log(e instanceof Type,e.code,e.message)}",
+        "true ERR_NATIVE_ARGUMENT expected two numbers\n", 0, "");
+    addon_case("native callback preserves receiver and arbitrary JS return value", "addon.node", "const a=require(process.argv[2]),receiver={x:40},value={id:2};console.log(a.invoke(function(v){return this.x+v},receiver,2),a.invoke(function(v){'use strict';return this===undefined&&v===value},undefined,value));",
+        "42 true\n", 0, "");
+    addon_case("JS callback exceptions cross the native bridge unchanged", "addon.node", "const a=require(process.argv[2]),original=new Error('original');try{a.invoke(()=>{throw original},undefined,1)}catch(e){console.log(e===original)}console.log(a.clearException(()=>{throw original})===original,a.add(1,2));",
+        "true\ntrue 3\n", 0, "");
+    addon_case("native property getters preserve thrown JS exceptions", "addon.node", "const a=require(process.argv[2]),original=new Error('getter');console.log(a.read({value:42}));try{a.read({get value(){throw original}})}catch(e){console.log(e===original)}",
+        "42\ntrue\n", 0, "");
+    addon_case("native has trap errors are propagated without engine fallback", "addon.node", "const a=require(process.argv[2]),e=Error('has');console.log(a.has({value:1}),a.has({}));try{a.has(new Proxy({},{has(){throw e}}))}catch(x){console.log(x===e)}",
+        "true false\ntrue\n", 0, "");
+    addon_case("native array predicate preserves revoked proxy exceptions", "addon.node", "const a=require(process.argv[2]),p=Proxy.revocable([],{});console.log(a.isArray([]),a.isArray({}));p.revoke();try{a.isArray(p.proxy)}catch(e){console.log(e instanceof TypeError)}",
+        "true false\ntrue\n", 0, "");
+    addon_case("native integer conversion handles NaN infinity and modulo boundaries", "addon.node",
+        "const a=require(process.argv[2]);console.log([NaN,Infinity,-Infinity,4294967297,2147483648,-1.9].map(a.integer).join(','));",
+        "0,0,0,1,-2147483648,-1\n", 0, "");
+    addon_case("native handle scopes release more than the per-frame root budget", "addon.node", "console.log(require(process.argv[2]).scopes());",
+        "70000\n", 0, "");
+    addon_case("native API rejects use from a non-owning native thread", "addon.node", "console.log(require(process.argv[2]).wrongThread());",
+        "1\n", 0, "");
+    addon_case("native descriptors preserve attributes and getter behavior", "addon.node", "const a=require(process.argv[2]),d=Object.getOwnPropertyDescriptor(a,'add');console.log(d.writable,d.enumerable,d.configurable,typeof Object.getOwnPropertyDescriptor(a,'answer').get,a.answer);",
+        "false false false function 42\n", 0, "");
+    addon_case("native bridge ignores mutations of captured reflection helpers", "addon.node", "Reflect.defineProperty=()=>{throw 1};Reflect.has=()=>{throw 2};Reflect.apply=()=>{throw 3};Array.isArray=()=>{throw 4};const a=require(process.argv[2]);console.log(a.has({value:1}),a.isArray([]),a.invoke(x=>x+1,null,41));",
+        "true true 42\n", 0, "");
+    addon_case("native initialization errors retain escaped native functions safely", "addon-init.node",
+        "try{require(process.argv[2])}catch(e){console.log(e.code,e.message)}console.log(escapedNative.add(20,22));",
+        "ERR_NATIVE_INIT native initialization failed\n42\n", 0, "");
+    addon_case("unsupported native API version fails before initialization", "addon-version.node", "try{require(process.argv[2])}catch(e){console.log(e.code)}",
+        "ERR_NAPI_VERSION\n", 0, "");
+    addon_case("non-addon shared library is rejected with a loader error", "addon-symbol.node", "try{require(process.argv[2])}catch(e){console.log(e.code)}",
+        "ERR_DLOPEN_FAILED\n", 0, "");
+    addon_case("missing Node-API methods fail at dynamic loading", "addon-api.node", "try{require(process.argv[2])}catch(e){console.log(e.code,e.message.includes('napi_create_external'))}",
+        "ERR_DLOPEN_FAILED true\n", 0, "");
+    addon_case("require resolve does not initialize native code", "addon-init.node", "console.log(require.resolve(process.argv[2])===process.argv[2],typeof globalThis.escapedNative);",
+        "true undefined\n", 0, "");
+    var parent: array<u8, 8192>;
+    var executable: ptr<u8> = absolute(arg(0));
+    if (executable == null || path_dirname_copy(&parent[0], 8192, executable as str) < 0) {
+        check("native context fixture path", false);
+        return;
+    }
+    var path: str = join(&parent[0] as str, "addon.node") as str;
+    var a: ptr<u8> = wr_context_create(null);
+    var b: ptr<u8> = wr_context_create(null);
+    if (a == null || b == null) {
+        check("native context creation", false);
+        if (a != null) {
+            wr_context_release(a);
+        }
+        if (b != null) {
+            wr_context_release(b);
+        }
+        return;
+    }
+    var ex: ptr<u8> = null;
+    var ready_a: bool = install_host(a, 0, true, "<native-a>", &ex);
+    if (ready_a) {
+        put(a, wr_context_global(a), "nativeFixture", text(a, path), &ex);
+    }
+    ready_a = ready_a && ex == null;
+    ex = null;
+    var ready_b: bool = install_host(b, 0, true, "<native-b>", &ex);
+    if (ready_b) {
+        put(b, wr_context_global(b), "nativeFixture", text(b, path), &ex);
+    }
+    ready_b = ready_b && ex == null;
+    check("native environments attach separately to two full hosts", ready_a && ready_b && context_result(a,
+        "globalThis.addon=require(nativeFixture);addon.add(20,22)", "42") && context_result(b, "globalThis.addon=require(nativeFixture);addon.add(30,12)",
+        "42"));
+    check("second native host closes without retaining Wave state", shutdown_host(b) && wr_context_data(b) == null);
+    wr_context_release(b);
+    if (ready_a) {
+        check("native function survives disposal of another addon environment", context_result(a, "addon.add(40,2)",
+            "42"));
+    }
+    check("first native host closes without retaining Wave state", shutdown_host(a) && wr_context_data(a) == null);
+    wr_context_release(a);
+}
+
+pub fun json_tests() {
+    var suite: ptr<TestState> = test_state();
+    var command: array<str, 3> = [(deref suite.binary) as str, "run", "tests/wjson.js"];
+    expect("Wave wjson JavaScript API suite", &command[0], 3, null, -1, 0, "");
+    check("wjson API suite completed", contains((deref suite.output), (deref suite.output_count), "checks passed"));
+
+    var source_buffer: ptr<u8> = mem_alloc(65537);
+    var source_count: i64 = fs_read_all("tests/json_cases.js", source_buffer, 65536);
+    if (source_count < 0) {
+        check("read JSON differential cases", false);
+        return;
+    }
+    deref source_buffer[source_count] = 0;
+    var ctx: ptr<u8> = wr_context_create(null);
+    if (ctx == null) {
+        check("create native JSON oracle", false);
+        return;
+    }
+    var source: ptr<u8> = wr_string_utf8(source_buffer as str);
+    var ex: ptr<u8> = null;
+    wr_evaluate(ctx, source, null, null, 1, &ex);
+    var invocation: ptr<u8> = wr_string_utf8("jsonCases()");
+    var result: ptr<u8> = null;
+    if (ex == null) {
+        result = wr_evaluate(ctx, invocation, null, null, 1, &ex);
+    }
+    wr_string_release(invocation);
+    if (ex != null || result == null) {
+        check("native JSON oracle evaluation", false);
+        wr_string_release(source);
+        wr_context_release(ctx);
+        return;
+    }
+    var text: ptr<u8> = wr_to_string(ctx, result, &ex);
+    var capacity: i64 = wr_string_utf8_capacity(text);
+    var expected: ptr<u8> = mem_alloc(capacity + 1);
+    var length: i64 = wr_string_copy_utf8(text, expected, capacity);
+    // Replace the terminator with the runtime console's final newline.
+    deref expected[length - 1] = 10;
+    wr_string_release(text);
+    wr_string_release(source);
+    wr_context_release(ctx);
+    command[2] = "tests/json_cases.js";
+    expect("JSON differential cases execute", &command[0], 3, null, -1, 0, "");
+    var same: bool = (deref suite.output_count) == length && mem_eq((deref suite.output), expected, length);
+    check("wjson matches unmodified engine JSON fixtures", same);
+    if (!same) {
+        println("  native bytes {}, host bytes {}", length, (deref suite.output_count));
+    }
+}
+
+pub fun core_tests() {
+    var suite: ptr<TestState> = test_state();
+    test("real JavaScript classes, BigInt and regex", "class Counter { #value=40; next(){return ++this.#value;} } const c=new Counter(); console.log(JSON.stringify([c.next(),c.next()]), 2n**64n, /(?<word>hello)/u.exec('hello').groups.word); console.log(new Map([['a',7]]).get('a'), typeof Promise, typeof WeakRef);",
+        "[41,42] 18446744073709551616 hello\n7 function function\n", 0, "");
+    test("Unicode and primitive console values", "console.log('한글 🌊', true, null, undefined); console.log();",
+        "한글 🌊 true null undefined\n\n", 0, "");
+    var nul_command: array<str, 3> = [(deref suite.binary) as str, "-e", "console.log('A\\0B');"];
+    var nul_expected: array<u8, 4> = [65, 0, 66, 10];
+    expect("console preserves embedded NUL", &nul_command[0], 3, &nul_expected[0], 4, 0, "");
+    test("stderr console", "console.log('out'); console.error('error',2); console.warn('warning');",
+        "out\n", 0, "error 2\nwarning");
+    test("syntax error", "const = ;", "", 1, "SyntaxError");
+    test("runtime exception and stack", "function fail(){throw new Error('engine failure');} fail();",
+        "", 1, "Error: engine failure");
+    check("exception stack contains function and source", contains((deref suite.errors), (deref suite.error_count), "fail") && contains((deref suite.errors),
+        (deref suite.error_count), "<eval>"));
+    test("primitive exception", "throw 'plain failure';", "", 1, "plain failure");
+    test("console conversion exception", "console.log({toString(){throw new Error('conversion failure');}});",
+        "", 1, "conversion failure");
+    test("stack getter preserves original error", "throw {toString(){return 'original failure';},get stack(){throw new Error('getter failed');}};",
+        "", 1, "original failure");
+
+}

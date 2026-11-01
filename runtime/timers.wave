@@ -1,0 +1,587 @@
+// Scheduling belongs to the host. Promise microtasks remain owned by the engine.
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::time::clock")::{time_now_monotonic_ns};
+import("./context_state")::{context_slot, allocate_context_slot, release_context_slot, TIMERS_SLOT};
+import("./config")::{TIMER_LIMIT, ARGUMENT_LIMIT};
+
+extern(c, "wr_undefined") fun wr_undefined(context: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_number") fun wr_number(context: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_null") fun wr_null(context: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_boolean") fun wr_boolean(context: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_array") fun wr_array(context: ptr<u8>, count: i64, values: ptr<ptr<u8>>, exception: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_object") fun wr_object(context: ptr<u8>, js_class: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun wr_set_prototype(context: ptr<u8>, object: ptr<u8>, prototype: ptr<u8>);
+extern(c, "wr_string_value") fun wr_string_value(context: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_to_number") fun wr_to_number(context: ptr<u8>, value: ptr<u8>, exception: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_is_object") fun wr_is_object(context: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_protect") fun wr_protect(context: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(context: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_callable") fun wr_callable(context: ptr<u8>, object: ptr<u8>) -> bool;
+extern(c, "wr_call") fun wr_call(context: ptr<u8>, function: ptr<u8>, this_object: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_construct") fun wr_construct(context: ptr<u8>, constructor: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    exception: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_function") fun wr_function(context: ptr<u8>, name: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_context_global") fun wr_context_global(context: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_get") fun wr_get(context: ptr<u8>, object: ptr<u8>, name: ptr<u8>, exception: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set") fun wr_set(context: ptr<u8>, object: ptr<u8>, name: ptr<u8>, value: ptr<u8>, attributes: u32,
+    exception: ptr<ptr<u8>>);
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "jsrt_timer_callback") fun jsrt_timer_callback(kind: i32) -> ptr<u8>;
+extern(c, "wr_rejection_handler") fun wr_rejection_handler(context: ptr<u8>, function: ptr<u8>, exception: ptr<ptr<u8>>);
+
+const MAX_ID: i64 = 9007199254740991;
+
+struct Timer {
+    id: i64;
+    deadline: i64;
+    interval: i64;
+    callback: ptr<u8>;
+    args: ptr<ptr<u8>>;
+    count: i64;
+    active: bool;
+    running: bool;
+}
+
+struct TimerState {
+    storage: ptr<Timer>;
+    current_context: ptr<u8>;
+    next_id: i64;
+    type_error: ptr<u8>;
+    range_error: ptr<u8>;
+    microtask_failure: ptr<u8>;
+    promise_ready: ptr<u8>;
+    promise_then: ptr<u8>;
+    function_bind: ptr<u8>;
+    reflect_apply: ptr<u8>;
+    microtask_dispatch: ptr<u8>;
+    rejection_callback: ptr<u8>;
+    rejection_monitoring: bool;
+    rejection_failed: bool;
+}
+
+fun timer_state(context: ptr<u8>) -> ptr<TimerState> {
+    return context_slot(context, TIMERS_SLOT) as ptr<TimerState>;
+}
+
+export(c) fun jsrt_unhandled_rejection(context: ptr<u8>, function: ptr<u8>, this_object: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<TimerState> = timer_state(context);
+    if (s != null && deref s.rejection_monitoring && deref s.microtask_failure == null) {
+        var reason: ptr<u8> = wr_undefined(context);
+        if (count > 1) {
+            reason = args[1];
+        }
+        deref s.microtask_failure = reason;
+        wr_protect(context, reason);
+        deref s.rejection_failed = true;
+    }
+    return wr_undefined(context);
+}
+
+pub fun unhandled_rejection_failed(context: ptr<u8>, value: ptr<u8>) -> bool {
+    var s: ptr<TimerState> = timer_state(context);
+    return s != null && deref s.rejection_failed && value == deref s.microtask_failure;
+}
+
+fun throw_error(context: ptr<u8>, exception: ptr<ptr<u8>>, message: str, range: bool) {
+    var s: ptr<TimerState> = timer_state(context);
+    if (exception == null) {
+        return;
+    }
+    var text: ptr<u8> = wr_string_utf8(message);
+    var arguments: array<ptr<u8>, 1> = [wr_string_value(context, text)];
+    var constructor: ptr<u8> = deref s.type_error;
+    if (range) {
+        constructor = deref s.range_error;
+    }
+    var nested: ptr<u8> = null;
+    var error: ptr<u8> = wr_construct(context, constructor, 1, &arguments[0], &nested);
+    if (nested != null) {
+        error = nested;
+    }
+    deref exception = error;
+    wr_string_release(text);
+}
+
+fun release_timer(context: ptr<u8>, timer: ptr<Timer>) {
+    if (deref timer.id == 0) {
+        return;
+    }
+    wr_unprotect(context, deref timer.callback);
+    var arguments: ptr<ptr<u8>> = deref timer.args;
+    var count: i64 = deref timer.count;
+    for (var i: i64 = 0; i < count; i++) {
+        wr_unprotect(context, arguments[i]);
+    }
+    if (arguments != null) {
+        mem_free(arguments as ptr<u8>, count * (size_of<ptr<u8>>() as i64));
+    }
+    deref timer.id = 0;
+    deref timer.callback = null;
+    deref timer.args = null;
+    deref timer.count = 0;
+    deref timer.active = false;
+    deref timer.running = false;
+}
+
+fun schedule(context: ptr<u8>, count: i64, args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>, repeating: bool) -> ptr<u8> {
+    var s: ptr<TimerState> = timer_state(context);
+    if (count < 1 || !wr_is_object(context, args[0]) || !wr_callable(context, args[0])) {
+        throw_error(context, exception, "timer callback must be a function", false);
+        return wr_undefined(context);
+    }
+    var delay: f64 = 1.0;
+    if (count > 1) {
+        delay = wr_to_number(context, args[1], exception);
+        if (exception != null && deref exception != null) {
+            return wr_undefined(context);
+        }
+    }
+    // Match the common server-runtime minimum and signed-32-bit delay range.
+    if (delay != delay || delay < 1.0 || delay > 2147483647.0) {
+        delay = 1.0;
+    }
+    var nanos: i64 = (delay as i64) * 1000000;
+    if (count - 2 > ARGUMENT_LIMIT || deref s.next_id > MAX_ID) {
+        throw_error(context, exception, "timer argument or identifier limit exceeded", true);
+        return wr_undefined(context);
+    }
+    var slot: ptr<Timer> = null;
+    for (var i: i64 = 0; i < TIMER_LIMIT; i++) {
+        var timer: ptr<Timer> = deref s.storage + i;
+        if (deref timer.id == 0) {
+            slot = timer;
+            break;
+        }
+    }
+    if (slot == null) {
+        throw_error(context, exception, "pending timer limit exceeded (1024)", true);
+        return wr_undefined(context);
+    }
+    var now: i64 = time_now_monotonic_ns();
+    if (now < 0 || now > 9223372036854775807 - nanos) {
+        throw_error(context, exception, "cannot represent timer deadline", true);
+        return wr_undefined(context);
+    }
+    var argument_count: i64 = count - 2;
+    if (argument_count < 0) {
+        argument_count = 0;
+    }
+    var copy: ptr<ptr<u8>> = null;
+    if (argument_count > 0) {
+        copy = mem_alloc(argument_count * (size_of<ptr<u8>>() as i64)) as ptr<ptr<u8>>;
+        if (copy == null) {
+            throw_error(context, exception, "cannot allocate timer arguments", true);
+            return wr_undefined(context);
+        }
+    }
+    wr_protect(context, args[0]);
+    for (var i: i64 = 0; i < argument_count; i++) {
+        deref copy[i] = args[i + 2];
+        wr_protect(context, copy[i]);
+    }
+    deref slot.id = deref s.next_id;
+    deref slot.deadline = now + nanos;
+    deref slot.interval = 0;
+    if (repeating) {
+        deref slot.interval = nanos;
+    }
+    deref slot.callback = args[0];
+    deref slot.args = copy;
+    deref slot.count = argument_count;
+    deref slot.active = true;
+    deref slot.running = false;
+    deref s.next_id += 1;
+    return wr_number(context, (deref slot.id) as f64);
+}
+
+export(c) fun jsrt_set_timeout(context: ptr<u8>, function: ptr<u8>, this_object: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>) -> ptr<u8> {
+    return schedule(context, count, args, exception, false);
+}
+
+export(c) fun jsrt_set_interval(context: ptr<u8>, function: ptr<u8>, this_object: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>) -> ptr<u8> {
+    return schedule(context, count, args, exception, true);
+}
+
+export(c) fun jsrt_clear_timer(context: ptr<u8>, function: ptr<u8>, this_object: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<TimerState> = timer_state(context);
+    if (count < 1) {
+        return wr_undefined(context);
+    }
+    var number: f64 = wr_to_number(context, args[0], exception);
+    if (exception != null && deref exception != null) {
+        return wr_undefined(context);
+    }
+    if (number != number || number < 1.0 || number > 9007199254740991.0) {
+        return wr_undefined(context);
+    }
+    var id: i64 = number as i64;
+    for (var i: i64 = 0; i < TIMER_LIMIT; i++) {
+        var timer: ptr<Timer> = deref s.storage + i;
+        if (deref timer.id == id) {
+            deref timer.active = false;
+            if (!deref timer.running) {
+                release_timer(context, timer);
+            }
+            break;
+        }
+    }
+    return wr_undefined(context);
+}
+
+export(c) fun jsrt_queue_microtask(context: ptr<u8>, function: ptr<u8>, this_object: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<TimerState> = timer_state(context);
+    if (count < 1 || !wr_is_object(context, args[0]) || !wr_callable(context, args[0])) {
+        throw_error(context, exception, "microtask callback must be a function", false);
+        return wr_undefined(context);
+    }
+    // Let the engine retain the callback in a bound native function, then put
+    // it on its own Promise job queue. No second host queue or JS shim.
+    var bound_args: array<ptr<u8>, 2> = [wr_undefined(context), args[0]];
+    var handler: ptr<u8> = wr_call(context, deref s.function_bind, deref s.microtask_dispatch, 2, &bound_args[0],
+        exception);
+    if (handler == null || deref exception != null) {
+        return wr_undefined(context);
+    }
+    wr_protect(context, handler);
+    var then_args: array<ptr<u8>, 1> = [handler];
+    wr_call(context, deref s.promise_then, deref s.promise_ready, 1, &then_args[0], exception);
+    wr_unprotect(context, handler);
+    return wr_undefined(context);
+}
+
+export(c) fun jsrt_run_microtask(context: ptr<u8>, function: ptr<u8>, this_object: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<TimerState> = timer_state(context);
+    if (s == null) {
+        return wr_undefined(context);
+    }
+    if (count < 1) {
+        return wr_undefined(context);
+    }
+    var callback: ptr<u8> = args[0];
+    wr_protect(context, callback);
+    var thrown: ptr<u8> = null;
+    var empty: ptr<u8> = wr_array(context, 0, null, &thrown);
+    if (empty != null && thrown == null) {
+        wr_protect(context, empty);
+        // Reflect.apply preserves undefined `this` and passes zero arguments.
+        // Ignore the return value so thenables are not assimilated.
+        var invoke: array<ptr<u8>, 3> = [callback, wr_undefined(context), empty];
+        wr_call(context, deref s.reflect_apply, null, 3, &invoke[0], &thrown);
+        wr_unprotect(context, empty);
+    }
+    if (thrown != null && deref s.microtask_failure == null) {
+        deref s.microtask_failure = thrown;
+        wr_protect(context, thrown);
+    }
+    wr_unprotect(context, callback);
+    // Exceptions are recorded by the host, not converted to Promise rejection.
+    return wr_undefined(context);
+}
+
+fun install_function(context: ptr<u8>, name: str, kind: i32) -> bool {
+    var key: ptr<u8> = wr_string_utf8(name);
+    var function: ptr<u8> = wr_function(context, key, jsrt_timer_callback(kind));
+    wr_protect(context, function);
+    var exception: ptr<u8> = null;
+    wr_set(context, wr_context_global(context), key, function, 0, &exception);
+    wr_unprotect(context, function);
+    wr_string_release(key);
+    return exception == null;
+}
+
+fun capture_property(context: ptr<u8>, object: ptr<u8>, name: str) -> ptr<u8> {
+    var key: ptr<u8> = wr_string_utf8(name);
+    var exception: ptr<u8> = null;
+    var constructor: ptr<u8> = wr_get(context, object, key, &exception);
+    wr_string_release(key);
+    if (exception != null || constructor == null) {
+        return null;
+    }
+    wr_protect(context, constructor);
+    return constructor;
+}
+
+fun capture_constructor(context: ptr<u8>, name: str) -> ptr<u8> {
+    return capture_property(context, wr_context_global(context), name);
+}
+
+fun capture_method(context: ptr<u8>, constructor_name: str, method: str) -> ptr<u8> {
+    var constructor: ptr<u8> = capture_constructor(context, constructor_name);
+    if (constructor == null) {
+        return null;
+    }
+    var prototype: ptr<u8> = capture_property(context, constructor, "prototype");
+    var result: ptr<u8> = null;
+    if (prototype != null) {
+        result = capture_property(context, prototype, method);
+        wr_unprotect(context, prototype);
+    }
+    wr_unprotect(context, constructor);
+    return result;
+}
+
+fun set_named(context: ptr<u8>, object: ptr<u8>, name: str, value: ptr<u8>, attributes: u32, exception: ptr<ptr<u8>>) {
+    wr_protect(context, value);
+    var key: ptr<u8> = wr_string_utf8(name);
+    wr_set(context, object, key, value, attributes, exception);
+    wr_string_release(key);
+    wr_unprotect(context, value);
+}
+
+fun install_microtasks(context: ptr<u8>) -> bool {
+    var s: ptr<TimerState> = timer_state(context);
+    deref s.promise_then = capture_method(context, "Promise", "then");
+    deref s.function_bind = capture_method(context, "Function", "bind");
+    var reflect: ptr<u8> = capture_constructor(context, "Reflect");
+    if (reflect != null) {
+        deref s.reflect_apply = capture_property(context, reflect, "apply");
+        wr_unprotect(context, reflect);
+    }
+    if (deref s.promise_then == null || deref s.function_bind == null || deref s.reflect_apply == null) {
+        return false;
+    }
+    var promise: ptr<u8> = capture_constructor(context, "Promise");
+    if (promise == null) {
+        return false;
+    }
+    var resolve: ptr<u8> = capture_property(context, promise, "resolve");
+    var exception: ptr<u8> = null;
+    if (resolve != null) {
+        deref s.promise_ready = wr_call(context, resolve, promise, 0, null, &exception);
+        if (deref s.promise_ready != null && exception == null) {
+            wr_protect(context, deref s.promise_ready);
+        } else {
+            deref s.promise_ready = null;
+        }
+        wr_unprotect(context, resolve);
+    }
+    wr_unprotect(context, promise);
+    if (deref s.promise_ready == null || exception != null) {
+        return false;
+    }
+    // SpeciesConstructor falls back to the intrinsic Promise when constructor
+    // is undefined. User changes to Promise.prototype/@@species cannot hijack
+    // our private ready promise or observe the bound native handler.
+    set_named(context, deref s.promise_ready, "constructor", wr_undefined(context), 14, &exception);
+    if (exception != null) {
+        return false;
+    }
+    var key: ptr<u8> = wr_string_utf8("runMicrotask");
+    deref s.microtask_dispatch = wr_function(context, key, jsrt_timer_callback(4));
+    wr_string_release(key);
+    if (deref s.microtask_dispatch == null) {
+        return false;
+    }
+    wr_protect(context, deref s.microtask_dispatch);
+    key = wr_string_utf8("queueMicrotask");
+    var queue: ptr<u8> = wr_function(context, key, jsrt_timer_callback(3));
+    wr_string_release(key);
+    if (queue == null) {
+        return false;
+    }
+    wr_protect(context, queue);
+    // Keep the public function's arity at 1 using the captured engine primitive.
+    reflect = capture_constructor(context, "Reflect");
+    var define: ptr<u8> = null;
+    if (reflect != null) {
+        define = capture_property(context, reflect, "defineProperty");
+    }
+    if (define != null) {
+        var descriptor: ptr<u8> = wr_object(context, null, null);
+        wr_protect(context, descriptor);
+        wr_set_prototype(context, descriptor, wr_null(context));
+        set_named(context, descriptor, "value", wr_number(context, 1.0), 0, &exception);
+        set_named(context, descriptor, "configurable", wr_boolean(context, true), 0, &exception);
+        key = wr_string_utf8("length");
+        var define_args: array<ptr<u8>, 3> = [queue, wr_string_value(context, key), descriptor];
+        if (exception == null) {
+            wr_call(context, define, reflect, 3, &define_args[0], &exception);
+        }
+        wr_string_release(key);
+        wr_unprotect(context, descriptor);
+        wr_unprotect(context, define);
+    }
+    if (reflect != null) {
+        wr_unprotect(context, reflect);
+    }
+    var ok: bool = define != null && exception == null;
+    if (ok) {
+        set_named(context, wr_context_global(context), "queueMicrotask", queue, 0, &exception);
+        ok = exception == null;
+    }
+    wr_unprotect(context, queue);
+    return ok;
+}
+
+pub fun install_timers(context: ptr<u8>) -> bool {
+    var s: ptr<TimerState> = timer_state(context);
+    if (!allocate_context_slot(context, TIMERS_SLOT, size_of<TimerState>() as i64)) {
+        return false;
+    }
+    s = timer_state(context);
+    deref s.storage = mem_alloc_zeroed(TIMER_LIMIT * (size_of<Timer>() as i64)) as ptr<Timer>;
+    if (deref s.storage == null) {
+        return false;
+    }
+    deref s.current_context = context;
+    deref s.next_id = 1;
+    deref s.type_error = capture_constructor(context, "TypeError");
+    deref s.range_error = capture_constructor(context, "RangeError");
+    if (deref s.type_error == null || deref s.range_error == null) {
+        return false;
+    }
+    if (!install_function(context, "setTimeout", 0) || !install_function(context, "setInterval", 1) || !install_function(context,
+        "clearTimeout", 2) || !install_function(context, "clearInterval", 2)) {
+        return false;
+    }
+    if (!install_microtasks(context)) {
+        return false;
+    }
+    var name: ptr<u8> = wr_string_utf8("unhandledRejection");
+    deref s.rejection_callback = wr_function(context, name, jsrt_timer_callback(5));
+    wr_string_release(name);
+    wr_protect(context, deref s.rejection_callback);
+    var exception: ptr<u8> = null;
+    deref s.rejection_monitoring = true;
+    wr_rejection_handler(context, deref s.rejection_callback, &exception);
+    return exception == null;
+}
+
+// Scheduling queries expose no timer storage to the event loop.
+pub fun timers_ready(context: ptr<u8>) -> bool {
+    var s: ptr<TimerState> = timer_state(context);
+    return s != null && deref s.storage != null && context == deref s.current_context;
+}
+
+pub fun report_job_failure(context: ptr<u8>, exception: ptr<ptr<u8>>) -> bool {
+    var s: ptr<TimerState> = timer_state(context);
+    if (s == null || deref s.microtask_failure == null) {
+        return false;
+    }
+    deref exception = deref s.microtask_failure;
+    return true;
+}
+
+fun next_timer(context: ptr<u8>) -> ptr<Timer> {
+    var s: ptr<TimerState> = timer_state(context);
+    if (s == null || deref s.storage == null) {
+        return null;
+    }
+    var selected: ptr<Timer> = null;
+    for (var i: i64 = 0; i < TIMER_LIMIT; i++) {
+        var timer: ptr<Timer> = deref s.storage + i;
+        if (deref timer.id != 0 && deref timer.active) {
+            if (selected == null) {
+                selected = timer;
+            } else if (deref timer.deadline < deref selected.deadline || (deref timer.deadline == deref selected.deadline && deref timer.id < deref selected.id)) {
+                selected = timer;
+            }
+        }
+    }
+    return selected;
+}
+
+// -1 means no active timer; all real deadlines use the monotonic clock.
+pub fun next_timer_deadline(context: ptr<u8>) -> i64 {
+    var selected: ptr<Timer> = next_timer(context);
+    if (selected == null) {
+        return -1;
+    }
+    return deref selected.deadline;
+}
+
+pub fun run_due_timer(context: ptr<u8>, now: i64, exception: ptr<ptr<u8>>) -> bool {
+    var s: ptr<TimerState> = timer_state(context);
+    var selected: ptr<Timer> = next_timer(context);
+    if (selected == null || deref selected.deadline > now) {
+        return true;
+    }
+    deref selected.running = true;
+    if (deref selected.interval == 0) {
+        deref selected.active = false;
+    }
+    var thrown: ptr<u8> = null;
+    wr_call(context, deref selected.callback, null, deref selected.count, deref selected.args, &thrown);
+    deref selected.running = false;
+    if (thrown != null) {
+        deref exception = thrown;
+        return false;
+    }
+    if (deref s.microtask_failure != null) {
+        deref exception = deref s.microtask_failure;
+        return false;
+    }
+    if (deref selected.active && deref selected.interval > 0) {
+        now = time_now_monotonic_ns();
+        if (now < 0 || now > 9223372036854775807 - deref selected.interval) {
+            return false;
+        }
+        deref selected.deadline = now + deref selected.interval;
+    } else {
+        release_timer(context, selected);
+    }
+    return true;
+}
+
+pub fun shutdown_timers(context: ptr<u8>) {
+    var s: ptr<TimerState> = timer_state(context);
+    if (s == null) {
+        return;
+    }
+    deref s.rejection_monitoring = false;
+    if (deref s.storage != null) {
+        for (var i: i64 = 0; i < TIMER_LIMIT; i++) {
+            release_timer(context, deref s.storage + i);
+        }
+        mem_free(deref s.storage as ptr<u8>, TIMER_LIMIT * (size_of<Timer>() as i64));
+    }
+    if (deref s.microtask_failure != null) {
+        wr_unprotect(context, deref s.microtask_failure);
+    }
+    if (deref s.type_error != null) {
+        wr_unprotect(context, deref s.type_error);
+    }
+    if (deref s.range_error != null) {
+        wr_unprotect(context, deref s.range_error);
+    }
+    if (deref s.promise_ready != null) {
+        wr_unprotect(context, deref s.promise_ready);
+    }
+    if (deref s.promise_then != null) {
+        wr_unprotect(context, deref s.promise_then);
+    }
+    if (deref s.function_bind != null) {
+        wr_unprotect(context, deref s.function_bind);
+    }
+    if (deref s.reflect_apply != null) {
+        wr_unprotect(context, deref s.reflect_apply);
+    }
+    if (deref s.microtask_dispatch != null) {
+        wr_unprotect(context, deref s.microtask_dispatch);
+    }
+    if (deref s.rejection_callback != null) {
+        wr_unprotect(context, deref s.rejection_callback);
+    }
+    deref s.storage = null;
+    deref s.current_context = null;
+    deref s.microtask_failure = null;
+    deref s.type_error = null;
+    deref s.range_error = null;
+    deref s.promise_ready = null;
+    deref s.promise_then = null;
+    deref s.function_bind = null;
+    deref s.reflect_apply = null;
+    deref s.microtask_dispatch = null;
+    deref s.rejection_callback = null;
+    deref s.rejection_failed = false;
+    release_context_slot(context, TIMERS_SLOT, size_of<TimerState>() as i64);
+}

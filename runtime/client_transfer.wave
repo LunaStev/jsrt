@@ -1,0 +1,140 @@
+// Native curl callback state. No JS calls occur inside transport callbacks.
+import("std::mem::ops")::{mem_copy};
+pub struct Client {
+    active: bool;
+    started: bool;
+    done: bool;
+    settled: bool;
+    cancelled: bool;
+    paused: bool;
+    follow: bool;
+    redirect_error: bool;
+    easy: ptr<u8>;
+    headers: ptr<u8>;
+    request_header_count: i64;
+    request_header_bytes: i64;
+    content_type_set: bool;
+    url: ptr<u8>;
+    verb: ptr<u8>;
+    upload: ptr<u8>;
+    upload_length: i64;
+    head: ptr<u8>;
+    head_length: i64;
+    status: i32;
+    location: bool;
+    ready: bool;
+    pending: ptr<u8>;
+    pending_length: i64;
+    result: i32;
+    request: ptr<u8>;
+    body: ptr<u8>;
+    resolve: ptr<u8>;
+    reject: ptr<u8>;
+    signal: ptr<u8>;
+    abort_hook: ptr<u8>;
+    abort_record: ptr<u8>;
+    abort_reason: ptr<u8>;
+    aborted: bool;
+    streaming: bool;
+    upload_eof: bool;
+    upload_paused: bool;
+    upload_offset: i64;
+    upload_done: ptr<u8>;
+}
+
+export(c) fun jsrt_curl_upload(bytes: ptr<u8>, size: i64, count: i64, data: ptr<u8>) -> i64 {
+    var c: ptr<Client> = data as ptr<Client>;
+    if (size != 1 || count < 0 || deref c.cancelled || deref c.aborted) {
+        return 268435456;
+    }
+    var n: i64 = deref c.upload_length - deref c.upload_offset;
+    if (n == 0) {
+        if (deref c.upload_eof) {
+            return 0;
+        }
+        deref c.upload_paused = true;
+        return 268435457;
+    }
+    if (n > count) {
+        n = count;
+    }
+    mem_copy(bytes, deref c.upload + deref c.upload_offset, n);
+    deref c.upload_offset += n;
+    return n;
+}
+
+export(c) fun jsrt_curl_body(bytes: ptr<u8>, size: i64, count: i64, data: ptr<u8>) -> i64 {
+    var c: ptr<Client> = data as ptr<Client>;
+    if (size != 1 || count < 0 || deref c.cancelled || deref c.aborted) {
+        return 0;
+    }
+    if (deref c.follow && deref c.location && deref c.status >= 300 && deref c.status < 400) {
+        return count;
+    }
+    if (count > 65536 - deref c.pending_length) {
+        deref c.paused = true;
+        return 268435457;
+    }
+    mem_copy(deref c.pending + deref c.pending_length, bytes, count);
+    deref c.pending_length += count;
+    return count;
+}
+
+export(c) fun jsrt_curl_header(bytes: ptr<u8>, size: i64, count: i64, data: ptr<u8>) -> i64 {
+    var c: ptr<Client> = data as ptr<Client>;
+    if (size != 1 || count < 0 || deref c.cancelled || deref c.aborted) {
+        return 0;
+    }
+    if (count >= 12 && bytes[0] == 72 && bytes[1] == 84 && bytes[2] == 84 && bytes[3] == 80 && bytes[4] == 47) {
+        deref c.head_length = 0;
+        deref c.location = false;
+        deref c.ready = false;
+        deref c.pending_length = 0;
+        var at: i64 = 5;
+        while (at < count && bytes[at] != 32) {
+            at += 1;
+        }
+        at += 1;
+        if (at + 2 < count) {
+            deref c.status = ((bytes[at] - 48) as i32) * 100 + ((bytes[at + 1] - 48) as i32) * 10 + (bytes[at + 2] - 48) as i32;
+        }
+    }
+    if (count > 65536 - deref c.head_length) {
+        return 0;
+    }
+    mem_copy(deref c.head + deref c.head_length, bytes, count);
+    deref c.head_length += count;
+    (deref c.head)[deref c.head_length] = 0;
+    if (count >= 9) {
+        var matches: bool = true;
+        var expected: str = "location:";
+        for (var i: i64 = 0; i < 9; i++) {
+            var b: u8 = bytes[i];
+            if (b >= 65 && b <= 90) {
+                b += 32;
+            }
+            if (b != expected[i]) {
+                matches = false;
+            }
+        }
+        if (matches) {
+            deref c.location = true;
+        }
+    }
+    if (count == 2 && bytes[0] == 13 && bytes[1] == 10) {
+        deref c.ready = deref c.status >= 200 && !(deref c.follow && deref c.location && deref c.status >= 300 && deref c.status < 400);
+    }
+    return count;
+}
+
+pub fun receive_body(c: ptr<Client>, bytes: ptr<u8>, length: i64) -> i64 {
+    return jsrt_curl_body(bytes, 1, length, c as ptr<u8>);
+}
+
+pub fun receive_header(c: ptr<Client>, bytes: ptr<u8>, length: i64) -> i64 {
+    return jsrt_curl_header(bytes, 1, length, c as ptr<u8>);
+}
+
+pub fun supply_upload(c: ptr<Client>, bytes: ptr<u8>, length: i64) -> i64 {
+    return jsrt_curl_upload(bytes, 1, length, c as ptr<u8>);
+}

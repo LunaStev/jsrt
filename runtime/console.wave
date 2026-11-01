@@ -1,0 +1,68 @@
+// Console host API and native callback entry points.
+import("./output")::{write_text, print_value};
+
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_value") fun wr_string_value(context: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_undefined") fun wr_undefined(context: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_function") fun wr_function(context: ptr<u8>, name: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_protect") fun wr_protect(context: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_set") fun wr_set(context: ptr<u8>, object: ptr<u8>, name: ptr<u8>, value: ptr<u8>, attributes: u32,
+    exception: ptr<ptr<u8>>);
+extern(c, "wr_unprotect") fun wr_unprotect(context: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_object") fun wr_object(context: ptr<u8>, js_class: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_context_global") fun wr_context_global(context: ptr<u8>) -> ptr<u8>;
+extern(c, "jsrt_console_callback") fun jsrt_console_callback(error_output: i32) -> ptr<u8>;
+
+fun console_write(context: ptr<u8>, count: i64, args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>, fd: i64) -> ptr<u8> {
+    for (var i: i64 = 0; i < count; i++) {
+        if (i > 0) {
+            write_text(fd, " ");
+        }
+        if (!print_value(context, args[i], fd, exception)) {
+            if (exception != null && deref exception == null) {
+                var message: ptr<u8> = wr_string_utf8("console conversion or output failed");
+                deref exception = wr_string_value(context, message);
+                wr_string_release(message);
+            }
+            return wr_undefined(context);
+        }
+    }
+    write_text(fd, "\n");
+    return wr_undefined(context);
+}
+
+export(c) fun jsrt_console_log(context: ptr<u8>, function: ptr<u8>, this_object: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>) -> ptr<u8> {
+    return console_write(context, count, args, exception, 1);
+}
+
+export(c) fun jsrt_console_error(context: ptr<u8>, function: ptr<u8>, this_object: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>) -> ptr<u8> {
+    return console_write(context, count, args, exception, 2);
+}
+
+fun console_method(context: ptr<u8>, console: ptr<u8>, name: str, error_output: i32) -> bool {
+    var key: ptr<u8> = wr_string_utf8(name);
+    var function: ptr<u8> = wr_function(context, key, jsrt_console_callback(error_output));
+    var exception: ptr<u8> = null;
+    wr_protect(context, function);
+    wr_set(context, console, key, function, 0, &exception);
+    wr_unprotect(context, function);
+    wr_string_release(key);
+    return exception == null;
+}
+
+pub fun install_console(context: ptr<u8>) -> bool {
+    var console: ptr<u8> = wr_object(context, null, null);
+    wr_protect(context, console);
+    var ok: bool = console_method(context, console, "log", 0);
+    ok = ok && console_method(context, console, "error", 1);
+    ok = ok && console_method(context, console, "warn", 1);
+    var name: ptr<u8> = wr_string_utf8("console");
+    var exception: ptr<u8> = null;
+    wr_set(context, wr_context_global(context), name, console, 0, &exception);
+    wr_string_release(name);
+    wr_unprotect(context, console);
+    return ok && exception == null;
+}

@@ -1,0 +1,300 @@
+// Duration and resource sampling belong to tooling, never to JS execution policy.
+import("./support")::{argc, arg, absolute, private_directory, ensure_directory, join, concat, spawn, wait};
+import("./private_files")::{clean_private_directory};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("std::mem::ops")::{mem_eq};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::fs::file")::{create, write, fs_read_all, Metadata, metadata};
+import("std::io::fd")::{io_close};
+import("std::io::fd")::{io_write_all};
+import("std::sys::fs")::{open, fsync};
+import("std::process::wait")::{proc_wait_nohang, proc_status_exited, proc_status_exit_code};
+import("std::time::clock")::{time_now_monotonic_ns};
+import("std::time::sleep")::{time_sleep_ms};
+extern(c, "opendir") fun directory_open(path: str) -> ptr<u8>;
+extern(c, "closedir") fun directory_close(directory: ptr<u8>) -> i32;
+extern(c, "jsrt_directory_next") fun directory_next(directory: ptr<u8>, name: ptr<u8>, capacity: i64) -> i32;
+extern(c, "fflush") fun flush(stream: ptr<u8>) -> i32;
+const SAMPLE_MS: i64 = 1000;
+const WARMUP_MS: i64 = 30000;
+const RSS_GROWTH_KIB: i64 = 131072;
+const FD_GROWTH: i64 = 32;
+const THREAD_GROWTH: i64 = 32;
+
+pub fun decimal(value: i64) -> ptr<u8> {
+    var result: ptr<u8> = mem_alloc(32);
+    if (result == null || value < 0) {
+        return null;
+    }
+    var reverse: array<u8, 32>;
+    var n: i64 = value;
+    var count: i64 = 0;
+    while (count == 0 || n > 0) {
+        reverse[count] = 48 + (n % 10) as u8;
+        n = n / 10;
+        count += 1;
+    }
+    for (var i: i64 = 0; i < count; i++) {
+        result[i] = reverse[count - i - 1];
+    }
+    result[count] = 0;
+    return result;
+}
+
+fun field(path: str, prefix: str) -> i64 {
+    var bytes: array<u8, 65536>;
+    var n: i64 = fs_read_all(path, &bytes[0], 65536);
+    var width: i64 = mem_len_cstr(prefix);
+    for (var i: i64 = 0; i + width < n; i++) {
+        if ((i == 0 || bytes[i - 1] == 10) && mem_eq(&bytes[i], prefix as ptr<u8>, width)) {
+            i += width;
+            while (i < n && (bytes[i] == 32 || bytes[i] == 9)) {
+                i += 1;
+            }
+            var result: i64 = 0;
+            while (i < n && bytes[i] >= 48 && bytes[i] <= 57) {
+                result = result * 10 + (bytes[i] - 48) as i64;
+                i += 1;
+            }
+            return result;
+        }
+    }
+    return -1;
+}
+
+fun entries(path: str) -> i64 {
+    var d: ptr<u8> = directory_open(path);
+    if (d == null) {
+        return -1;
+    }
+    var count: i64 = 0;
+    var name: array<u8, 256>;
+    while (true) {
+        var status: i32 = directory_next(d, &name[0], 256);
+        if (status <= 0) {
+            if (status < 0) {
+                count = -1;
+            }
+            break;
+        }
+        if (!mem_eq_cstr(&name[0] as str, ".") && !mem_eq_cstr(&name[0] as str, "..")) {
+            count += 1;
+        }
+    }
+    directory_close(d);
+    return count;
+}
+
+pub fun run_soak() -> i32 {
+    var binary: str = "target/native/jsrt";
+    var duration: i64 = 600;
+    var report: str = "";
+    for (var i: i32 = 2; i < argc(); i++) {
+        if (mem_eq_cstr(arg(i), "--binary") && i + 1 < argc()) {
+            i += 1;
+            binary = arg(i);
+        } else if (mem_eq_cstr(arg(i), "--report") && i + 1 < argc()) {
+            i += 1;
+            report = arg(i);
+        } else if (mem_eq_cstr(arg(i), "--duration-seconds") && i + 1 < argc()) {
+            i += 1;
+            var value: str = arg(i);
+            duration = 0;
+            for (var j: i64 = 0; value[j] != 0; j++) {
+                if (value[j] < 48 || value[j] > 57 || duration > 86400) {
+                    return 2;
+                }
+                duration = duration * 10 + (value[j] - 48) as i64;
+            }
+        } else {
+            println("soak accepts --binary <path> --duration-seconds <1..86400> --report <new-csv-file>");
+            return 2;
+        }
+    }
+    return measured_soak(binary, duration, report);
+}
+
+pub fun soak_binary(binary: str, duration: i64) -> i32 {
+    return measured_soak(binary, duration, "");
+}
+
+fun measured_soak(binary: str, duration: i64, report: str) -> i32 {
+    var report_fd: i64 = -1;
+    if (report[0] != 0) {
+        report_fd = open(report, 655553, 384);
+        if (report_fd < 0) {
+            println("Report must be a new regular file in an existing directory");
+            return 1;
+        }
+        var columns: str = "elapsed_ms,rss_kib,fd_count,thread_count\n";
+        if (io_write_all(report_fd, columns as ptr<u8>, mem_len_cstr(columns)) != mem_len_cstr(columns)) {
+            io_close(report_fd);
+            return 1;
+        }
+    }
+    if (duration < 1 || duration > 86400 || !ensure_directory("target")) {
+        if (report_fd >= 0) {
+            io_close(report_fd);
+        }
+        return 2;
+    }
+    var root: ptr<u8> = private_directory("target", "soak-");
+    if (root == null) {
+        if (report_fd >= 0) {
+            io_close(report_fd);
+        }
+        return 1;
+    }
+    var stdout_path: str = join(root as str, "stdout") as str;
+    var stderr_path: str = join(root as str, "stderr") as str;
+    var stdout_fd: i64 = create(stdout_path);
+    var stderr_fd: i64 = create(stderr_path);
+    var command: array<str, 3> = [absolute(binary) as str, "tests/soak.js", absolute(root as str) as str];
+    var pid: i64 = -1;
+    if (stdout_fd >= 0 && stderr_fd >= 0) {
+        pid = spawn(&command[0], 3, stdout_fd, stderr_fd);
+    }
+    if (stdout_fd >= 0) {
+        io_close(stdout_fd);
+    }
+    if (stderr_fd >= 0) {
+        io_close(stderr_fd);
+    }
+    if (pid < 0) {
+        if (report_fd >= 0) {
+            io_close(report_fd);
+        }
+        clean_private_directory(root as str);
+        return 1;
+    }
+    var proc: str = join("/proc", decimal(pid) as str) as str;
+    var start: i64 = time_now_monotonic_ns();
+    var rss_start: i64 = -1;
+    var rss_peak: i64 = 0;
+    var rss_end: i64 = 0;
+    var fd_start: i64 = -1;
+    var fd_peak: i64 = 0;
+    var thread_start: i64 = -1;
+    var thread_peak: i64 = 0;
+    var samples: i64 = 0;
+    var status: i32 = 0;
+    var result: i32 = 1;
+    var stopped: bool = false;
+    var next_sample: i64 = 0;
+    println("Mixed-load soak: {} seconds, four I/O lanes, loopback TCP, Worker churn", duration);
+    flush(null);
+    while (true) {
+        var completed: i64 = proc_wait_nohang(pid, &status);
+        if (completed == pid) {
+            if (proc_status_exited(status)) {
+                result = proc_status_exit_code(status);
+            }
+            break;
+        }
+        if (completed < 0) {
+            break;
+        }
+        var elapsed: i64 = (time_now_monotonic_ns() - start) / 1000000;
+        if (elapsed >= next_sample) {
+            var rss: i64 = field(join(proc, "status") as str, "VmRSS:");
+            var threads: i64 = field(join(proc, "status") as str, "Threads:");
+            var fds: i64 = entries(join(proc, "fd") as str);
+            if (rss > 0 && fds > 0 && threads > 0) {
+                if (report_fd >= 0) {
+                    var fields: array<i64, 4> = [elapsed, rss, fds, threads];
+                    for (var i: i64 = 0; i < 4; i++) {
+                        var value: ptr<u8> = decimal(fields[i]);
+                        var separator: str = ",";
+                        if (i == 3) {
+                            separator = "\n";
+                        }
+                        if (value == null || io_write_all(report_fd, value, mem_len_cstr(value as str)) != mem_len_cstr(value as str) ||
+                            io_write_all(report_fd, separator as ptr<u8>, 1) != 1) {
+                            println("Resource report write failed");
+                            io_close(report_fd);
+                            report_fd = -2;
+                            if (value != null) {
+                                mem_free(value, 32);
+                            }
+                            break;
+                        }
+                        mem_free(value, 32);
+                    }
+                }
+                rss_end = rss;
+                if (rss > rss_peak) {
+                    rss_peak = rss;
+                }
+                if (fds > fd_peak) {
+                    fd_peak = fds;
+                }
+                if (threads > thread_peak) {
+                    thread_peak = threads;
+                }
+                if (elapsed >= WARMUP_MS || duration < 30) {
+                    if (rss_start < 0) {
+                        rss_start = rss;
+                        fd_start = fds;
+                        thread_start = threads;
+                    }
+                }
+                samples += 1;
+            }
+            if (samples % 30 == 0) {
+                println("soak {}s: RSS {} KiB, peak {}, FDs {}, threads {}", elapsed / 1000, rss, rss_peak, fds, threads);
+                flush(null);
+            }
+            next_sample = elapsed + SAMPLE_MS;
+        }
+        if (!stopped && elapsed >= duration * 1000) {
+            stopped = true;
+            var stop: str = join(root as str, "stop") as str;
+            if (write(stop, "stop" as ptr<u8>, 4) != 4) {
+                break;
+            }
+        }
+        if (elapsed >= duration * 1000 + 60000) {
+            // Only the owned diagnostic child is reaped on drain failure.
+            break;
+        }
+        time_sleep_ms(50);
+    }
+    if (result != 0) {
+        wait(pid, 1000);
+    }
+    var info: Metadata;
+    var done: bool = metadata(join(root as str, "done") as str, &info) == 0;
+    println("Soak samples {}, RSS KiB warm/peak/end {}/{}/{}, FD warm/peak {}/{}, thread warm/peak {}/{}",
+        samples, rss_start, rss_peak, rss_end, fd_start, fd_peak, thread_start, thread_peak);
+    var bytes: array<u8, 65537>;
+    var n: i64 = fs_read_all(stdout_path, &bytes[0], 65536);
+    if (n > 0) {
+        bytes[n] = 0;
+        println("{}", &bytes[0] as str);
+    }
+    n = fs_read_all(stderr_path, &bytes[0], 65536);
+    if (n > 0) {
+        bytes[n] = 0;
+        println("soak stderr: {}", &bytes[0] as str);
+    }
+    var ok: bool = result == 0 && done && stopped && samples > 0 && rss_start > 0 &&
+        rss_peak <= rss_start + RSS_GROWTH_KIB && fd_peak <= fd_start + FD_GROWTH &&
+        thread_peak <= thread_start + THREAD_GROWTH;
+    if (report_fd >= 0) {
+        ok = fsync(report_fd) == 0 && ok;
+        io_close(report_fd);
+    }
+    ok = report_fd != -2 && ok;
+    var observed_seconds: i64 = (time_now_monotonic_ns() - start) / 1000000000;
+    if (observed_seconds > 30 && rss_start > 0) {
+        println("RSS warm-to-end drift: {} KiB/min (sampled; inspect CSV for trend)",
+            (rss_end - rss_start) * 60 / (observed_seconds - 30));
+    }
+    ok = clean_private_directory(root as str) && ok;
+    if (!ok) {
+        println("Soak FAILED (child {}, completion {}, controlled stop {})", result, done, stopped);
+        return 1;
+    }
+    println("Soak PASS; owned files and diagnostic process cleaned");
+    return 0;
+}

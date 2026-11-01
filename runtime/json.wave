@@ -1,0 +1,140 @@
+// Install and release JSON intrinsics; forward engine callbacks to parse/stringify.
+import("./json_support")::{intrinsic, get, set, callable, call};
+import("./json_parse")::{parse_json};
+import("./json_stringify")::{stringify_json};
+import("./context_state")::{JSON_SLOT, context_slot, allocate_context_slot, release_context_slot};
+import("./wjson_platform")::{prepare_wjson};
+extern(c, "wr_undefined") fun wr_undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_boolean") fun wr_boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_number") fun wr_number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_string_value") fun wr_string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_protect") fun wr_protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_context_global") fun wr_context_global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_object") fun wr_object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set") fun wr_set(ctx: ptr<u8>, obj: ptr<u8>, key: ptr<u8>, value: ptr<u8>, flags: u32,
+    ex: ptr<ptr<u8>>);
+extern(c, "wr_function") fun wr_function(ctx: ptr<u8>, name: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "jsrt_json_callback") fun jsrt_json_callback(kind: i32) -> ptr<u8>;
+
+export(c) fun jsrt_json_parse(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return parse_json(ctx, function, receiver, count, args, ex);
+}
+
+export(c) fun jsrt_json_stringify(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return stringify_json(ctx, function, receiver, count, args, ex);
+}
+
+fun capture(ctx: ptr<u8>, object: ptr<u8>, name: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var value: ptr<u8> = get(ctx, object, name, ex);
+    if (deref ex != null || value == null) {
+        return null;
+    }
+    wr_protect(ctx, value);
+    return value;
+}
+
+fun prototype_method(ctx: ptr<u8>, global: ptr<u8>, name: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var constructor: ptr<u8> = get(ctx, global, name, ex);
+    if (deref ex != null) {
+        return null;
+    }
+    var prototype: ptr<u8> = get(ctx, constructor, "prototype", ex);
+    if (deref ex != null) {
+        return null;
+    }
+    return capture(ctx, prototype, "valueOf", ex);
+}
+
+pub fun install_json(ctx: ptr<u8>) -> bool {
+    if (prepare_wjson() != 0) {
+        return false;
+    }
+    if (!allocate_context_slot(ctx, JSON_SLOT, 104)) {
+        return false;
+    }
+    var ex: ptr<u8> = null;
+    var global: ptr<u8> = wr_context_global(ctx);
+    deref intrinsic(ctx, 5) = capture(ctx, global, "TypeError", &ex);
+    deref intrinsic(ctx, 6) = capture(ctx, global, "SyntaxError", &ex);
+    deref intrinsic(ctx, 7) = capture(ctx, global, "RangeError", &ex);
+    var reflect: ptr<u8> = get(ctx, global, "Reflect", &ex);
+    deref intrinsic(ctx, 0) = capture(ctx, reflect, "apply", &ex);
+    deref intrinsic(ctx, 3) = capture(ctx, reflect, "defineProperty", &ex);
+    deref intrinsic(ctx, 1) = capture(ctx, get(ctx, global, "Object", &ex), "keys", &ex);
+    deref intrinsic(ctx, 2) = capture(ctx, get(ctx, global, "Array", &ex), "isArray", &ex);
+    deref intrinsic(ctx, 8) = prototype_method(ctx, global, "Number", &ex);
+    deref intrinsic(ctx, 9) = prototype_method(ctx, global, "String", &ex);
+    deref intrinsic(ctx, 10) = prototype_method(ctx, global, "Boolean", &ex);
+    deref intrinsic(ctx, 11) = prototype_method(ctx, global, "BigInt", &ex);
+    deref intrinsic(ctx, 12) = capture(ctx, get(ctx, global, "Object", &ex), "is", &ex);
+    if (ex != null) {
+        return false;
+    }
+    var object: ptr<u8> = get(ctx, global, "JSON", &ex);
+    var raw: ptr<u8> = get(ctx, object, "isRawJSON", &ex);
+    if (callable(ctx, raw)) {
+        deref intrinsic(ctx, 4) = raw;
+        wr_protect(ctx, deref intrinsic(ctx, 4));
+    }
+    for (var i: i32 = 0; i < 2; i++) {
+        var name: str = "parse";
+        if (i == 1) {
+            name = "stringify";
+        }
+        var key: ptr<u8> = wr_string_utf8(name);
+        var fn: ptr<u8> = wr_function(ctx, key, jsrt_json_callback(i));
+        wr_protect(ctx, fn);
+        // Native callback functions have length 0; expose the standard arity.
+        var descriptor: ptr<u8> = wr_object(ctx, null, null);
+        wr_protect(ctx, descriptor);
+        var arity: f64 = 2.0;
+        if (i == 1) {
+            arity = 3.0;
+        }
+        set(ctx, descriptor, "value", wr_number(ctx, arity), 0, &ex);
+        set(ctx, descriptor, "configurable", wr_boolean(ctx, true), 0, &ex);
+        var length_name: ptr<u8> = wr_string_utf8("length");
+        var args: array<ptr<u8>, 3> = [fn, wr_string_value(ctx, length_name), descriptor];
+        call(ctx, deref intrinsic(ctx, 3), wr_undefined(ctx), &args[0], 3, &ex);
+        wr_string_release(length_name);
+        wr_unprotect(ctx, descriptor);
+        wr_set(ctx, object, key, fn, 4, &ex);
+        wr_unprotect(ctx, fn);
+        wr_string_release(key);
+    }
+    return ex == null;
+}
+
+pub fun shutdown_json(ctx: ptr<u8>) {
+    if (context_slot(ctx, JSON_SLOT) == null) {
+        return;
+    }
+    var roots: array<ptr<u8>, 13> = [deref intrinsic(ctx, 0), deref intrinsic(ctx, 1), deref intrinsic(ctx,
+        2), deref intrinsic(ctx, 3), deref intrinsic(ctx, 4), deref intrinsic(ctx, 5), deref intrinsic(ctx,
+        6), deref intrinsic(ctx, 7), deref intrinsic(ctx, 8), deref intrinsic(ctx, 9), deref intrinsic(ctx,
+        10), deref intrinsic(ctx, 11), deref intrinsic(ctx, 12)];
+    for (var i: i64 = 0; i < 13; i++) {
+        if (roots[i] != null) {
+            wr_unprotect(ctx, roots[i]);
+        }
+    }
+    deref intrinsic(ctx, 0) = null;
+    deref intrinsic(ctx, 1) = null;
+    deref intrinsic(ctx, 2) = null;
+    deref intrinsic(ctx, 3) = null;
+    deref intrinsic(ctx, 4) = null;
+    deref intrinsic(ctx, 5) = null;
+    deref intrinsic(ctx, 6) = null;
+    deref intrinsic(ctx, 7) = null;
+    deref intrinsic(ctx, 8) = null;
+    deref intrinsic(ctx, 9) = null;
+    deref intrinsic(ctx, 10) = null;
+    deref intrinsic(ctx, 11) = null;
+    deref intrinsic(ctx, 12) = null;
+    release_context_slot(ctx, JSON_SLOT, 104);
+}

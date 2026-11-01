@@ -1,0 +1,145 @@
+// Shared stream queue, scheduling, backpressure and destruction operations.
+import("./values")::{get, put, text, plain, fail};
+import("./collections")::{list, length, append, integer, flag, set_integer, set_flag, enqueue};
+import("./events")::{remove_listener};
+import("./stream_state")::{stream_state_storage, StreamHostState, stream_chunk_size};
+import("./buffer_core")::{byte_view_length};
+import("./stream_text")::{decode_stream_chunk};
+import("./stream_state")::{detach_stream_signal};
+import("./config")::{STREAM_BYTE_LIMIT, STREAM_CHUNK_LIMIT};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+
+pub fun schedule(ctx: ptr<u8>, receiver: ptr<u8>, state: ptr<u8>, writing: bool, ex: ptr<ptr<u8>>) {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var key: str = "readScheduled";
+    var code: i64 = 9;
+    if (writing) {
+        key = "writeScheduled";
+        code = 10;
+    }
+    if (deref ex != null || flag(ctx, state, "destroyed", ex) || flag(ctx, state, key, ex)) {
+        return;
+    }
+    set_flag(ctx, state, key, true, ex);
+    enqueue(ctx, (deref stream_state_roots.stream_methods)[code], receiver, undefined(ctx), ex);
+}
+
+pub fun release_pass_write(ctx: ptr<u8>, receiver: ptr<u8>, state: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    if ((!flag(ctx, state, "passThrough", ex) && !flag(ctx, state, "transform", ex)) ||
+        !flag(ctx, state, "writing", ex)) {
+        return;
+    }
+    var bytes: i64 = integer(ctx, state, "rbytes", ex);
+    if (bytes != 0 && bytes >= integer(ctx, state, "readHigh", ex)) {
+        return;
+    }
+    var record: ptr<u8> = get(ctx, state, "inflight", ex);
+    if (flag(ctx, state, "transform", ex) && !flag(ctx, record, "transformed", ex)) {
+        return;
+    }
+    if (kind(ctx, record) == 5 && !flag(ctx, record, "done", ex)) {
+        set_flag(ctx, record, "done", true, ex);
+        enqueue(ctx, (deref stream_state_roots.stream_methods)[12], receiver, record, ex);
+    }
+}
+
+pub fun auto_destroy(ctx: ptr<u8>, receiver: ptr<u8>, state: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var category: i64 = integer(ctx, state, "type", ex);
+    if (deref ex == null && flag(ctx, state, "autoDestroy", ex) &&
+        ((category & 1) == 0 || flag(ctx, state, "endEmitted", ex)) &&
+        ((category & 2) == 0 || flag(ctx, state, "finished", ex))) {
+        destroy_stream(ctx, receiver, state, undefined(ctx), ex);
+    }
+}
+
+pub fun push_chunk(ctx: ptr<u8>, receiver: ptr<u8>, state: ptr<u8>, chunk: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var decoder: ptr<u8> = null;
+    if (flag(ctx, state, "utf8", ex)) {
+        decoder = plain(ctx);
+        protect(ctx, decoder);
+        put(ctx, decoder, "utf8Pending", get(ctx, state, "utf8Pending", ex), ex);
+        chunk = decode_stream_chunk(ctx, decoder, chunk, false, ex);
+    }
+    protect(ctx, chunk);
+    var reads: ptr<u8> = get(ctx, state, "reads", ex);
+    var size: i64 = stream_chunk_size(ctx, state, chunk, true, ex);
+    var bytes: i64 = integer(ctx, state, "rbytes", ex);
+    if (size > STREAM_BYTE_LIMIT - bytes || length(ctx, reads, ex) >= STREAM_CHUNK_LIMIT) {
+        fail(ctx, ex, 2, "readable queue limit exceeded");
+    }
+    if (deref ex != null) {
+        unprotect(ctx, chunk);
+        if (decoder != null) {
+            unprotect(ctx, decoder);
+        }
+        return false;
+    }
+    if (decoder != null) {
+        put(ctx, state, "utf8Pending", get(ctx, decoder, "utf8Pending", ex), ex);
+        unprotect(ctx, decoder);
+    }
+    if (size > 0) {
+        append(ctx, reads, chunk, ex);
+        set_integer(ctx, state, "rbytes", bytes + size, ex);
+    }
+    schedule(ctx, receiver, state, false, ex);
+    unprotect(ctx, chunk);
+    return bytes + size < integer(ctx, state, "readHigh", ex);
+}
+
+pub fun finish_text(ctx: ptr<u8>, state: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (!flag(ctx, state, "utf8", ex) || !flag(ctx, state, "ended", ex)) {
+        return;
+    }
+    var pending: ptr<u8> = get(ctx, state, "utf8Pending", ex);
+    if (kind(ctx, pending) == 0 || byte_view_length(ctx, pending, ex) == 0 || deref ex != null) {
+        return;
+    }
+    if (length(ctx, get(ctx, state, "reads", ex), ex) >= STREAM_CHUNK_LIMIT ||
+        integer(ctx, state, "rbytes", ex) >= STREAM_BYTE_LIMIT) {
+        return;
+    }
+    var chunk: ptr<u8> = decode_stream_chunk(ctx, state, undefined(ctx), true, ex);
+    protect(ctx, chunk);
+    var size: i64 = stream_chunk_size(ctx, state, chunk, true, ex);
+    if (deref ex == null) {
+        append(ctx, get(ctx, state, "reads", ex), chunk, ex);
+        set_integer(ctx, state, "rbytes", integer(ctx, state, "rbytes", ex) + size, ex);
+    }
+    unprotect(ctx, chunk);
+}
+
+pub fun unpipe(ctx: ptr<u8>, receiver: ptr<u8>, state: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var dest: ptr<u8> = get(ctx, state, "pipe", ex);
+    if (kind(ctx, dest) != 5) {
+        return;
+    }
+    var listener: ptr<u8> = get(ctx, state, "drainListener", ex);
+    protect(ctx, listener);
+    protect(ctx, dest);
+    put(ctx, state, "pipe", undefined(ctx), ex);
+    put(ctx, state, "drainListener", undefined(ctx), ex);
+    set_flag(ctx, state, "pipePaused", false, ex);
+    remove_listener(ctx, dest, text(ctx, "drain"), listener, null, ex);
+    unprotect(ctx, dest);
+    unprotect(ctx, listener);
+}
+
+pub fun destroy_stream(ctx: ptr<u8>, receiver: ptr<u8>, state: ptr<u8>, reason: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    if (flag(ctx, state, "destroyed", ex)) {
+        return;
+    }
+    set_flag(ctx, state, "destroyed", true, ex);
+    detach_stream_signal(ctx, state, ex);
+    set_flag(ctx, state, "flow", false, ex);
+    put(ctx, state, "failure", reason, ex);
+    unpipe(ctx, receiver, state, ex);
+    put(ctx, state, "reads", list(ctx, ex), ex);
+    set_integer(ctx, state, "rbytes", 0, ex);
+    enqueue(ctx, (deref stream_state_roots.stream_methods)[15], receiver, undefined(ctx), ex);
+}

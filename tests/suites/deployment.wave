@@ -1,0 +1,50 @@
+// Release signature verification and tampering rejection with disposable keys.
+import("jsrt::tools::support")::{join, private_directory, spawn, wait};
+import("jsrt::tools::private_files")::{clean_private_directory};
+import("jsrt::tools::private_files")::{copy_regular};
+import("jsrt::tools::release_sign")::{sign_archive, verify_archive};
+import("std::fs::file")::{write};
+import("std::mem::ops")::{mem_zero};
+import("./harness")::{check, TestState, test_state};
+
+pub fun release_signature_tests() {
+    var suite: ptr<TestState> = test_state();
+    var root: ptr<u8> = private_directory((deref suite.directory) as str, "signature-tests-");
+    check("reserve private release signature test workspace", root != null);
+    if (root == null) {
+        return;
+    }
+    var key: str = join(root as str, "key.pem") as str;
+    var archive: str = join(root as str, "archive") as str;
+    var output: str = join(root as str, "signatures") as str;
+    var sign_scratch: ptr<u8> = private_directory(root as str, "sign-");
+    var command: array<str, 6> = ["/usr/bin/openssl", "genpkey", "-algorithm", "ED25519", "-out", key];
+    var ok: bool = sign_scratch != null && wait(spawn(&command[0], 6, -1, -1), 10000) == 0 &&
+        write(archive, "original" as ptr<u8>, 8) == 8;
+    check("create disposable Ed25519 release signature fixture", ok);
+    if (ok) {
+        ok = sign_archive(archive, key, output, sign_scratch as str);
+        check("release archive receives detached Ed25519 signature", ok);
+    }
+    if (ok) {
+        var trusted: str = join(root as str, "trusted.pem") as str;
+        ok = copy_regular(join(output, "public-key.pem") as str, trusted, 384);
+        var scratch: ptr<u8> = private_directory(root as str, "verify-");
+        check("release signature verifies against an independently supplied public key", ok &&
+            scratch != null && verify_archive(archive, trusted, output, scratch as str));
+        check("release signing refuses to overwrite an existing signature directory",
+            !sign_archive(archive, key, output, sign_scratch as str));
+        write(archive, "modified" as ptr<u8>, 8);
+        scratch = private_directory(root as str, "modified-");
+        check("release signature rejects modified archive bytes", scratch != null &&
+            !verify_archive(archive, trusted, output, scratch as str));
+        write(archive, "original" as ptr<u8>, 8);
+        var altered: array<u8, 64>;
+        mem_zero(&altered[0], 64);
+        write(join(output, "archive.sig") as str, &altered[0], 64);
+        scratch = private_directory(root as str, "bad-signature-");
+        check("release signature rejects a forged signature despite a matching digest", scratch != null &&
+            !verify_archive(archive, trusted, output, scratch as str));
+    }
+    check("remove all disposable release keys signatures and inputs", clean_private_directory(root as str));
+}

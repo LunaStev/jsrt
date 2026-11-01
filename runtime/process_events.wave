@@ -1,0 +1,274 @@
+// Signal callbacks only mark native records. Dispatch and cleanup belong to Wave.
+import("./context_state")::{owned_context_slot, release_context_slot};
+import("./events")::{event_parent, event_state, emit_named, has_named_listeners};
+import("./values")::{get, put, text, fail};
+import("./http_values")::{http_native};
+import("./network")::{initialize_network, network_loop, poll_network, wait_network};
+import("./streams")::{create_stream};
+import("./process_io")::{process_read_stream};
+import("./buffer_core")::{byte_view_length, copy_byte_view};
+import("./config")::{FILE_LIMIT};
+import("std::io::fd")::{io_write_all};
+import("std::mem::layout")::{size_of};
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed, mem_free};
+import("std::mem::cstr")::{mem_eq_cstr};
+import("./system")::{copy_host_path};
+import("./worker_state")::{worker_state, WorkerState};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, value: ptr<u8>, parent: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "jsrt_uv_signal_size") fun signal_size() -> i64;
+extern(c, "uv_signal_init") fun signal_initialize(loop: ptr<u8>, handle: ptr<u8>) -> i32;
+extern(c, "jsrt_uv_signal_start") fun signal_start(loop: ptr<u8>, handle: ptr<u8>, data: ptr<u8>, signal: i32) -> i32;
+extern(c, "jsrt_uv_signal_stop") fun signal_stop(handle: ptr<u8>);
+extern(c, "uv_handle_get_data") fun handle_data(handle: ptr<u8>) -> ptr<u8>;
+extern(c, "uv_ref") fun reference(handle: ptr<u8>);
+extern(c, "uv_unref") fun unreference(handle: ptr<u8>);
+
+struct Signal {
+    handle: ptr<u8>;
+    pending: bool;
+    closed: bool;
+    stopping: bool;
+}
+struct State {
+    process: ptr<u8>;
+    stdout: ptr<u8>;
+    stderr: ptr<u8>;
+    signals: array<Signal, 2>;
+}
+fun state(ctx: ptr<u8>) -> ptr<State> {
+    return owned_context_slot(ctx, 37, size_of<State>() as i64) as ptr<State>;
+}
+const SIGNAL_ADD: i32 = 18;
+const STDIO_WRITE: i32 = 19;
+const NEXT_TICK: i32 = 24;
+
+export(c) fun jsrt_signal_ready(handle: ptr<u8>) {
+    var record: ptr<Signal> = handle_data(handle) as ptr<Signal>;
+    deref record.pending = true;
+}
+export(c) fun jsrt_signal_closed(handle: ptr<u8>) {
+    var record: ptr<Signal> = handle_data(handle) as ptr<Signal>;
+    deref record.closed = true;
+}
+export(c) fun jsrt_process_signal_add(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count != 1 || kind(ctx, args[0]) != 4) {
+        return undefined(ctx);
+    }
+    var name: array<u8, 128>;
+    if (copy_host_path(ctx, args[0], &name[0], 128, ex) < 0) {
+        return undefined(ctx);
+    }
+    var index: i64 = -1;
+    var signal: i32 = 15;
+    if (mem_eq_cstr(&name[0] as str, "SIGTERM")) {
+        index = 0;
+    } else if (mem_eq_cstr(&name[0] as str, "SIGINT")) {
+        index = 1;
+        signal = 2;
+    }
+    if (index < 0) {
+        return undefined(ctx);
+    }
+    var worker: ptr<WorkerState> = worker_state(ctx);
+    if (worker != null && deref worker.parent != null) {
+        fail(ctx, ex, 1, "Workers cannot subscribe to process signals");
+        return undefined(ctx);
+    }
+    var s: ptr<State> = state(ctx);
+    var record: ptr<Signal> = &(deref s.signals)[index];
+    if (deref record.handle == null) {
+        if (initialize_network() != 0) {
+            fail(ctx, ex, 0, "cannot initialize signal loop");
+            return undefined(ctx);
+        }
+        deref record.handle = mem_alloc_zeroed(signal_size());
+        if (deref record.handle == null) {
+            fail(ctx, ex, 0, "cannot allocate signal handle");
+        } else {
+            deref record.closed = false;
+            deref record.stopping = false;
+            if (signal_initialize(network_loop(), deref record.handle) != 0) {
+                mem_free(deref record.handle, signal_size());
+                deref record.handle = null;
+                fail(ctx, ex, 0, "cannot initialize signal watcher");
+            } else if (signal_start(network_loop(), deref record.handle, record as ptr<u8>, signal) != 0) {
+                signal_stop(deref record.handle);
+                while (!deref record.closed) {
+                    poll_network();
+                }
+                mem_free(deref record.handle, signal_size());
+                deref record.handle = null;
+                fail(ctx, ex, 0, "cannot start signal watcher");
+            }
+        }
+    }
+    return undefined(ctx);
+}
+
+export(c) fun jsrt_process_stdio_write(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<State> = state(ctx);
+    if (count < 3 || kind(ctx, args[2]) != 5 || !callable(ctx, args[2]) ||
+        (owner != deref s.stdout && owner != deref s.stderr)) {
+        fail(ctx, ex, 1, "invalid stdio write hook");
+        return undefined(ctx);
+    }
+    var n: i64 = byte_view_length(ctx, args[0], ex);
+    if (deref ex != null || n < 0) {
+        return undefined(ctx);
+    }
+    if (n > FILE_LIMIT) {
+        fail(ctx, ex, 2, "stdio write exceeds the file byte limit");
+        return undefined(ctx);
+    }
+    var bytes: ptr<u8> = mem_alloc(n + 1);
+    if (bytes == null) {
+        fail(ctx, ex, 0, "cannot allocate stdio bytes");
+        return undefined(ctx);
+    }
+    copy_byte_view(ctx, args[0], bytes, n, ex);
+    var fd: i64 = 1;
+    if (owner == deref s.stderr) {
+        fd = 2;
+    }
+    if (deref ex == null && io_write_all(fd, bytes, n) != n) {
+        fail(ctx, ex, 0, "stdio write failed");
+    }
+    mem_free(bytes, n + 1);
+    var error: ptr<u8> = deref ex;
+    deref ex = null;
+    var result: array<ptr<u8>, 1> = [error];
+    var size: i64 = 0;
+    if (error != null) {
+        size = 1;
+        protect(ctx, error);
+    }
+    call(ctx, args[2], owner, size, &result[0], ex);
+    if (error != null) {
+        unprotect(ctx, error);
+    }
+    return undefined(ctx);
+}
+
+pub fun install_process_events(ctx: ptr<u8>, process: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var s: ptr<State> = state(ctx);
+    deref s.process = process;
+    protect(ctx, process);
+    prototype(ctx, process, event_parent(ctx));
+    var record: ptr<u8> = event_state(ctx, process, ex);
+    put(ctx, record, "afterAdd", http_native(ctx, "processSignal", SIGNAL_ADD), ex);
+    deref s.stdout = create_stream(ctx, 2, ex);
+    protect(ctx, deref s.stdout);
+    deref s.stderr = create_stream(ctx, 2, ex);
+    protect(ctx, deref s.stderr);
+    put(ctx, deref s.stdout, "_write", http_native(ctx, "stdioWrite", STDIO_WRITE), ex);
+    put(ctx, deref s.stderr, "_write", http_native(ctx, "stdioWrite", STDIO_WRITE), ex);
+    put(ctx, process, "stdout", deref s.stdout, ex);
+    put(ctx, process, "stderr", deref s.stderr, ex);
+    put(ctx, process, "stdin", process_read_stream(ctx, -1, true, ex), ex);
+    put(ctx, process, "nextTick", http_native(ctx, "nextTick", NEXT_TICK), ex);
+}
+
+pub fun poll_process_signals(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var s: ptr<State> = state(ctx);
+    var names: array<str, 2> = ["SIGTERM", "SIGINT"];
+    for (var i: i64 = 0; i < 2; i++) {
+        var record: ptr<Signal> = &(deref s.signals)[i];
+        if (deref record.pending) {
+            deref record.pending = false;
+            var args: array<ptr<u8>, 1> = [text(ctx, names[i])];
+            emit_named(ctx, deref s.process, names[i], 1, &args[0], ex);
+        }
+        if (deref record.handle != null && !deref record.stopping &&
+            !has_named_listeners(ctx, deref s.process, names[i])) {
+            deref record.stopping = true;
+            signal_stop(deref record.handle);
+        }
+        if (deref record.handle != null && deref record.stopping && deref record.closed) {
+            mem_free(deref record.handle, signal_size());
+            deref record.handle = null;
+        }
+    }
+    return deref ex == null;
+}
+
+pub fun reference_signals(ctx: ptr<u8>, enabled: bool) {
+    var s: ptr<State> = state(ctx);
+    for (var i: i64 = 0; i < 2; i++) {
+        var record: ptr<Signal> = &(deref s.signals)[i];
+        if (deref record.handle != null && !deref record.stopping) {
+            if (enabled) {
+                reference(deref record.handle);
+            } else {
+                unreference(deref record.handle);
+            }
+        }
+    }
+}
+
+pub fun process_signals_present(ctx: ptr<u8>) -> bool {
+    var s: ptr<State> = state(ctx);
+    return (deref s.signals)[0].handle != null || (deref s.signals)[1].handle != null;
+}
+
+pub fun wait_process_signals(ctx: ptr<u8>, timeout: i32) -> bool {
+    reference_signals(ctx, true);
+    var ok: bool = wait_network(ctx, timeout);
+    reference_signals(ctx, false);
+    return ok;
+}
+
+pub fun emit_process_exit(ctx: ptr<u8>, code: i32, ex: ptr<ptr<u8>>) {
+    var s: ptr<State> = state(ctx);
+    if (deref s.process != null) {
+        var args: array<ptr<u8>, 1> = [number(ctx, code as f64)];
+        emit_named(ctx, deref s.process, "exit", 1, &args[0], ex);
+    }
+}
+
+pub fun emit_process_before_exit(ctx: ptr<u8>, code: i32, ex: ptr<ptr<u8>>) {
+    var s: ptr<State> = state(ctx);
+    if (deref s.process != null) {
+        var args: array<ptr<u8>, 1> = [number(ctx, code as f64)];
+        emit_named(ctx, deref s.process, "beforeExit", 1, &args[0], ex);
+    }
+}
+
+pub fun shutdown_process_events(ctx: ptr<u8>) {
+    var s: ptr<State> = state(ctx);
+    for (var i: i64 = 0; i < 2; i++) {
+        var record: ptr<Signal> = &(deref s.signals)[i];
+        if (deref record.handle != null) {
+            if (!deref record.stopping) {
+                deref record.stopping = true;
+                signal_stop(deref record.handle);
+            }
+            while (!deref record.closed) {
+                poll_network();
+            }
+            mem_free(deref record.handle, signal_size());
+            deref record.handle = null;
+        }
+    }
+    if (deref s.process != null) {
+        unprotect(ctx, deref s.process);
+        deref s.process = null;
+    }
+    if (deref s.stdout != null) {
+        unprotect(ctx, deref s.stdout);
+        deref s.stdout = null;
+    }
+    if (deref s.stderr != null) {
+        unprotect(ctx, deref s.stderr);
+        deref s.stderr = null;
+    }
+    release_context_slot(ctx, 37, size_of<State>() as i64);
+}

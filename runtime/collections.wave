@@ -1,0 +1,137 @@
+import("./context_state")::{COLLECTIONS_SLOT, context_slot, allocate_context_slot, release_context_slot};
+fun intrinsic(ctx: ptr<u8>, index: i64) -> ptr<ptr<u8>> {
+    return(context_slot(ctx, COLLECTIONS_SLOT) as ptr<ptr<u8>>) + index;
+}
+
+// Private engine-owned state and jobs shared by events and streams.
+import("./values")::{get, put, capture, define_key};
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_construct") fun construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, value: ptr<u8>, parent: ptr<u8>);
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_to_number") fun numeric(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_get_index") fun element(ctx: ptr<u8>, value: ptr<u8>, at: u32, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+pub fun install_collections(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (!allocate_context_slot(ctx, COLLECTIONS_SLOT, 40)) {
+        return false;
+    }
+    deref intrinsic(ctx, 0) = capture(ctx, global(ctx), "WeakMap", ex);
+    var parent: ptr<u8> = get(ctx, deref intrinsic(ctx, 0), "prototype", ex);
+    deref intrinsic(ctx, 1) = capture(ctx, parent, "get", ex);
+    deref intrinsic(ctx, 2) = capture(ctx, parent, "set", ex);
+    var function_ctor: ptr<u8> = get(ctx, global(ctx), "Function", ex);
+    deref intrinsic(ctx, 3) = capture(ctx, get(ctx, function_ctor, "prototype", ex), "bind", ex);
+    deref intrinsic(ctx, 4) = capture(ctx, global(ctx), "queueMicrotask", ex);
+    return deref ex == null;
+}
+
+pub fun weak_map(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return construct(ctx, deref intrinsic(ctx, 0), 0, null, ex);
+}
+
+pub fun weak_get(ctx: ptr<u8>, map: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var args: array<ptr<u8>, 1> = [key];
+    return call(ctx, deref intrinsic(ctx, 1), map, 1, &args[0], ex);
+}
+
+pub fun weak_set(ctx: ptr<u8>, map: ptr<u8>, key: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var args: array<ptr<u8>, 2> = [key, value];
+    call(ctx, deref intrinsic(ctx, 2), map, 2, &args[0], ex);
+}
+
+pub fun list(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var result: ptr<u8> = array(ctx, 0, null, ex);
+    protect(ctx, result);
+    prototype(ctx, result, js_null(ctx));
+    unprotect(ctx, result);
+    return result;
+}
+
+pub fun integer(ctx: ptr<u8>, value: ptr<u8>, key: str, ex: ptr<ptr<u8>>) -> i64 {
+    var result: ptr<u8> = get(ctx, value, key, ex);
+    if (deref ex != null) {
+        return 0;
+    }
+    return numeric(ctx, result, ex) as i64;
+}
+
+pub fun flag(ctx: ptr<u8>, value: ptr<u8>, key: str, ex: ptr<ptr<u8>>) -> bool {
+    return truth(ctx, get(ctx, value, key, ex));
+}
+
+pub fun set_integer(ctx: ptr<u8>, value: ptr<u8>, key: str, n: i64, ex: ptr<ptr<u8>>) {
+    put(ctx, value, key, number(ctx, n as f64), ex);
+}
+
+pub fun set_flag(ctx: ptr<u8>, value: ptr<u8>, key: str, state: bool, ex: ptr<ptr<u8>>) {
+    put(ctx, value, key, boolean(ctx, state), ex);
+}
+
+pub fun length(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64 {
+    return integer(ctx, value, "length", ex);
+}
+
+pub fun at(ctx: ptr<u8>, value: ptr<u8>, n: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return element(ctx, value, n as u32, ex);
+}
+
+pub fun set_at(ctx: ptr<u8>, value: ptr<u8>, n: i64, item: ptr<u8>, ex: ptr<ptr<u8>>) {
+    protect(ctx, item);
+    define_key(ctx, value, number(ctx, n as f64), item, ex, true);
+    unprotect(ctx, item);
+}
+
+pub fun append(ctx: ptr<u8>, value: ptr<u8>, item: ptr<u8>, ex: ptr<ptr<u8>>) {
+    protect(ctx, item);
+    var n: i64 = length(ctx, value, ex);
+    set_at(ctx, value, n, item, ex);
+    unprotect(ctx, item);
+}
+
+pub fun remove_at(ctx: ptr<u8>, value: ptr<u8>, n: i64, ex: ptr<ptr<u8>>) {
+    var size: i64 = length(ctx, value, ex);
+    for (var i: i64 = n; i + 1 < size && deref ex == null; i++) {
+        set_at(ctx, value, i, at(ctx, value, i + 1, ex), ex);
+    }
+    if (size > 0) {
+        set_integer(ctx, value, "length", size - 1, ex);
+    }
+}
+
+pub fun bind_one(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var args: array<ptr<u8>, 2> = [receiver, value];
+    return call(ctx, deref intrinsic(ctx, 3), fn, 2, &args[0], ex);
+}
+
+pub fun enqueue(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var bound: ptr<u8> = bind_one(ctx, fn, receiver, value, ex);
+    if (deref ex != null) {
+        return;
+    }
+    protect(ctx, bound);
+    var args: array<ptr<u8>, 1> = [bound];
+    call(ctx, deref intrinsic(ctx, 4), null, 1, &args[0], ex);
+    unprotect(ctx, bound);
+}
+
+pub fun shutdown_collections(ctx: ptr<u8>) {
+    if (context_slot(ctx, COLLECTIONS_SLOT) == null) {
+        return;
+    }
+    for (var i: i64 = 0; i < 5; i++) {
+        if (deref intrinsic(ctx, i) != null) {
+            unprotect(ctx, deref intrinsic(ctx, i));
+            deref intrinsic(ctx, i) = null;
+        }
+    }
+    release_context_slot(ctx, COLLECTIONS_SLOT, 40);
+}

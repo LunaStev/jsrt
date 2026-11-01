@@ -1,0 +1,119 @@
+// File URL policy is Wave-owned. The engine receives canonical local file keys.
+import("./values")::{fail};
+import("./byte_codec")::{decode_utf8_strict};
+import("std::mem::cstr")::{mem_len_cstr};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::ops")::{mem_copy};
+extern(c, "wr_string_utf8") fun source_url(value: str) -> ptr<u8>;
+const PATH_CAP: i64 = 8192;
+
+pub fun file_source_url(ctx: ptr<u8>, path: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (deref ex != null) {
+        return null;
+    }
+    if (path[0] != 47) {
+        return source_url(path);
+    }
+    var n: i64 = mem_len_cstr(path);
+    var capacity: i64 = n * 3 + 8;
+    var bytes: ptr<u8> = mem_alloc(capacity);
+    if (bytes == null) {
+        fail(ctx, ex, 2, "cannot allocate module source URL");
+        return null;
+    }
+    mem_copy(bytes, "file://" as ptr<u8>, 7);
+    var used: i64 = 7;
+    var alphabet: str = "0123456789ABCDEF";
+    for (var i: i64 = 0; i < n; i++) {
+        var c: u8 = path[i];
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) ||
+            c == 47 || c == 45 || c == 46 || c == 95 || c == 126) {
+            bytes[used] = c;
+            used += 1;
+        } else {
+            bytes[used] = 37;
+            bytes[used + 1] = alphabet[(c / 16) as i64];
+            bytes[used + 2] = alphabet[(c % 16) as i64];
+            used += 3;
+        }
+    }
+    bytes[used] = 0;
+    var result: ptr<u8> = source_url(bytes as str);
+    mem_free(bytes, capacity);
+    return result;
+}
+fun lower(value: u8) -> u8 {
+    if (value >= 65 && value <= 90) {
+        return value + 32;
+    }
+    return value;
+}
+fun hex(value: u8) -> i32 {
+    if (value >= 48 && value <= 57) {
+        return (value - 48) as i32;
+    }
+    value = lower(value);
+    if (value >= 97 && value <= 102) {
+        return (value - 87) as i32;
+    }
+    return -1;
+}
+pub fun decode_file_url(ctx: ptr<u8>, source: ptr<u8>, destination: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var size: i64 = mem_len_cstr(source as str);
+    if (size < 5 || lower(source[0]) != 102 || lower(source[1]) != 105 || lower(source[2]) != 108 ||
+        lower(source[3]) != 101 || source[4] != 58) {
+        return false;
+    }
+    if (size < 8 || source[5] != 47 || source[6] != 47) {
+        fail(ctx, ex, 1, "file imports require an absolute file URL");
+        return false;
+    }
+    var start: i64 = 7;
+    while (start < size && source[start] != 47) {
+        start += 1;
+    }
+    if (start != 7) {
+        var host: str = "localhost";
+        var valid: bool = start == 16;
+        for (var i: i64 = 0; i < 9 && valid; i++) {
+            valid = lower(source[7 + i]) == host[i];
+        }
+        if (!valid) {
+            fail(ctx, ex, 1, "file URL hosts must be empty or localhost");
+            return false;
+        }
+    }
+    if (start >= size) {
+        fail(ctx, ex, 1, "file imports require an absolute path");
+        return false;
+    }
+    var used: i64 = 0;
+    for (var i: i64 = start; i < size; i++) {
+        var octet: u8 = source[i];
+        if (octet == 63 || octet == 35 || octet == 92) {
+            fail(ctx, ex, 1, "file import queries fragments and backslashes are not implemented");
+            return false;
+        }
+        if (octet == 37) {
+            if (i + 2 >= size || hex(source[i + 1]) < 0 || hex(source[i + 2]) < 0) {
+                fail(ctx, ex, 1, "invalid file URL percent encoding");
+                return false;
+            }
+            octet = (hex(source[i + 1]) * 16 + hex(source[i + 2])) as u8;
+            i += 2;
+            if (octet == 0 || octet == 47 || octet == 92) {
+                fail(ctx, ex, 1, "encoded separators and NUL are forbidden in file imports");
+                return false;
+            }
+        }
+        if (used >= PATH_CAP - 1) {
+            fail(ctx, ex, 2, "file URL path exceeds limit");
+            return false;
+        }
+        destination[used] = octet;
+        used += 1;
+    }
+    destination[used] = 0;
+    decode_utf8_strict(ctx, destination, used, ex);
+    return deref ex == null;
+}

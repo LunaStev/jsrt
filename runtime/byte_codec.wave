@@ -1,0 +1,444 @@
+// Length-delimited text codecs shared by files and binary buffers.
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::cstr")::{mem_eq_cstr};
+import("./values")::{fail};
+import("./config")::{BUFFER_TEXT_LIMIT};
+extern(c, "wr_type") fun wr_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_to_string") fun wr_to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_length") fun wr_string_length(text: ptr<u8>) -> i64;
+extern(c, "wr_string_characters") fun wr_string_characters(text: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_string_utf16") fun wr_string_utf16(text: ptr<u16>, length: i64) -> ptr<u8>;
+extern(c, "wr_string_value") fun wr_string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_undefined") fun wr_undefined(ctx: ptr<u8>) -> ptr<u8>;
+
+pub fun encode_utf8(ctx: ptr<u8>, value: ptr<u8>, buffer: ptr<u8>, cap: i64, path: bool, ex: ptr<ptr<u8>>) -> i64 {
+    if (wr_type(ctx, value) != 4) {
+        fail(ctx, ex, 1, "expected a string");
+        return -1;
+    }
+    var text: ptr<u8> = wr_to_string(ctx, value, ex);
+    if (text == null) {
+        return -1;
+    }
+    var length: i64 = wr_string_length(text);
+    if (length > cap - 1) {
+        wr_string_release(text);
+        fail(ctx, ex, 2, "UTF-8 string size limit exceeded");
+        return -1;
+    }
+    var units: ptr<u16> = wr_string_characters(text);
+    if (path) {
+        for (var i: i64 = 0; i < length; i++) {
+            var c: u16 = units[i];
+            if (c == 0 || (c >= 56320 && c <= 57343)) {
+                wr_string_release(text);
+                fail(ctx, ex, 1, "path contains NUL or an unpaired surrogate");
+                return -1;
+            }
+            if (c >= 55296 && c < 56320) {
+                if (i + 1 >= length || units[i + 1] < 56320 || units[i + 1] > 57343) {
+                    wr_string_release(text);
+                    fail(ctx, ex, 1, "path contains an unpaired surrogate");
+                    return -1;
+                }
+                i += 1;
+            }
+        }
+    }
+    var used: i64 = 0;
+    for (var i: i64 = 0; i < length; i++) {
+        var cp: u32 = units[i] as u32;
+        if (cp >= 55296 && cp < 56320 && i + 1 < length && units[i + 1] >= 56320 && units[i + 1] <= 57343) {
+            cp = 65536 + ((cp - 55296) << 10) + (units[i + 1] as u32) - 56320;
+            i += 1;
+        } else if (cp >= 55296 && cp <= 57343) {
+            cp = 65533;
+        }
+        var width: i64 = 1;
+        if (cp >= 65536) {
+            width = 4;
+        } else if (cp >= 2048) {
+            width = 3;
+        } else if (cp >= 128) {
+            width = 2;
+        }
+        if (used + width >= cap) {
+            wr_string_release(text);
+            fail(ctx, ex, 2, "UTF-8 string size limit exceeded");
+            return -1;
+        }
+        if (width == 1) {
+            deref buffer[used] = cp as u8;
+        } else if (width == 2) {
+            deref buffer[used] = (192 | (cp >> 6)) as u8;
+            deref buffer[used + 1] = (128 | (cp & 63)) as u8;
+        } else if (width == 3) {
+            deref buffer[used] = (224 | (cp >> 12)) as u8;
+            deref buffer[used + 1] = (128 | ((cp >> 6) & 63)) as u8;
+            deref buffer[used + 2] = (128 | (cp & 63)) as u8;
+        } else {
+            deref buffer[used] = (240 | (cp >> 18)) as u8;
+            deref buffer[used + 1] = (128 | ((cp >> 12) & 63)) as u8;
+            deref buffer[used + 2] = (128 | ((cp >> 6) & 63)) as u8;
+            deref buffer[used + 3] = (128 | (cp & 63)) as u8;
+        }
+        used += width;
+    }
+    deref buffer[used] = 0;
+    wr_string_release(text);
+    return used;
+}
+
+pub fun decode_utf8_strict(ctx: ptr<u8>, data: ptr<u8>, length: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var units: ptr<u16> = mem_alloc((length + 1) * 2) as ptr<u16>;
+    if (units == null) {
+        fail(ctx, ex, 2, "cannot allocate decoded file");
+        return wr_undefined(ctx);
+    }
+    var at: i64 = 0;
+    var used: i64 = 0;
+    var valid: bool = true;
+    while (at < length && valid) {
+        var lead: u32 = data[at] as u32;
+        var cp: u32 = lead;
+        var extra: i64 = 0;
+        var minimum: u32 = 0;
+        at += 1;
+        if (lead >= 194 && lead <= 223) {
+            cp = lead & 31;
+            extra = 1;
+            minimum = 128;
+        } else if (lead >= 224 && lead <= 239) {
+            cp = lead & 15;
+            extra = 2;
+            minimum = 2048;
+        } else if (lead >= 240 && lead <= 244) {
+            cp = lead & 7;
+            extra = 3;
+            minimum = 65536;
+        } else if (lead >= 128) {
+            valid = false;
+        }
+        if (at + extra > length) {
+            valid = false;
+        }
+        for (var i: i64 = 0; i < extra && valid; i++) {
+            var octet: u32 = data[at] as u32;
+            if (octet < 128 || octet > 191) {
+                valid = false;
+            }
+            cp = (cp << 6) | (octet & 63);
+            at += 1;
+        }
+        if (cp < minimum || cp > 1114111 || (cp >= 55296 && cp <= 57343)) {
+            valid = false;
+        }
+        if (valid) {
+            if (cp >= 65536) {
+                cp -= 65536;
+                deref units[used] = (55296 + (cp >> 10)) as u16;
+                used += 1;
+                deref units[used] = (56320 + (cp & 1023)) as u16;
+                used += 1;
+            } else {
+                deref units[used] = cp as u16;
+                used += 1;
+            }
+        }
+    }
+    var result: ptr<u8> = wr_undefined(ctx);
+    if (valid) {
+        var text: ptr<u8> = wr_string_utf16(units, used);
+        result = wr_string_value(ctx, text);
+        wr_string_release(text);
+    } else {
+        fail(ctx, ex, 1, "file contains invalid UTF-8");
+    }
+    mem_free(units as ptr<u8>, (length + 1) * 2);
+    return result;
+}
+
+pub fun encoding(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>, quiet: bool) -> i32 {
+    if (value == null || wr_type(ctx, value) == 0) {
+        return 0;
+    }
+    if (wr_type(ctx, value) != 4) {
+        if (!quiet) {
+            fail(ctx, ex, 1, "encoding must be a string");
+        }
+        return -1;
+    }
+    var js: ptr<u8> = wr_to_string(ctx, value, ex);
+    if (js == null) {
+        return -1;
+    }
+    var length: i64 = wr_string_length(js);
+    var units: ptr<u16> = wr_string_characters(js);
+    var bytes: array<u8, 32>;
+    var valid: bool = length < 32;
+    for (var i: i64 = 0; i < length && valid; i++) {
+        var octet: u16 = units[i];
+        if (octet >= 65 && octet <= 90) {
+            octet += 32;
+        }
+        if (octet == 0 || octet >= 128) {
+            valid = false;
+        } else {
+            bytes[i] = octet as u8;
+        }
+    }
+    wr_string_release(js);
+    var code: i32 = -1;
+    if (valid) {
+        bytes[length] = 0;
+        var name: str = &bytes[0] as str;
+        if (mem_eq_cstr(name, "utf8") || mem_eq_cstr(name, "utf-8") || (length == 0 && !quiet)) {
+            code = 0;
+        } else if (mem_eq_cstr(name, "hex")) {
+            code = 1;
+        } else if (mem_eq_cstr(name, "base64")) {
+            code = 2;
+        } else if (mem_eq_cstr(name, "base64url")) {
+            code = 3;
+        } else if (mem_eq_cstr(name, "latin1") || mem_eq_cstr(name, "binary")) {
+            code = 4;
+        } else if (mem_eq_cstr(name, "ascii")) {
+            code = 5;
+        } else if (mem_eq_cstr(name, "utf16le") || mem_eq_cstr(name, "utf-16le") || mem_eq_cstr(name,
+            "ucs2") || mem_eq_cstr(name, "ucs-2")) {
+            code = 6;
+        }
+    }
+    if (code < 0 && !quiet) {
+        fail(ctx, ex, 1, "unknown buffer encoding");
+    }
+    return code;
+}
+
+fun hex_digit(value: u16) -> i64 {
+    if (value >= 48 && value <= 57) {
+        return(value - 48) as i64;
+    }
+    if (value >= 65 && value <= 70) {
+        return(value - 55) as i64;
+    }
+    if (value >= 97 && value <= 102) {
+        return(value - 87) as i64;
+    }
+    return -1;
+}
+
+fun base64_digit(value: u16) -> i64 {
+    if (value >= 65 && value <= 90) {
+        return(value - 65) as i64;
+    }
+    if (value >= 97 && value <= 122) {
+        return(value - 71) as i64;
+    }
+    if (value >= 48 && value <= 57) {
+        return(value + 4) as i64;
+    }
+    if (value == 43 || value == 45) {
+        return 62;
+    }
+    if (value == 47 || value == 95) {
+        return 63;
+    }
+    return -1;
+}
+
+// Returns decoded byte count; the output always has capacity for a terminator.
+pub fun encode_bytes(ctx: ptr<u8>, value: ptr<u8>, code: i32, bytes: ptr<u8>, capacity: i64, ex: ptr<ptr<u8>>) -> i64 {
+    if (code == 0) {
+        return encode_utf8(ctx, value, bytes, capacity, false, ex);
+    }
+    if (wr_type(ctx, value) != 4) {
+        fail(ctx, ex, 1, "expected a string");
+        return -1;
+    }
+    var js: ptr<u8> = wr_to_string(ctx, value, ex);
+    if (js == null) {
+        return -1;
+    }
+    var length: i64 = wr_string_length(js);
+    var used: i64 = 0;
+    if (length > BUFFER_TEXT_LIMIT) {
+        wr_string_release(js);
+        fail(ctx, ex, 2, "buffer text limit exceeded");
+        return -1;
+    }
+    var units: ptr<u16> = wr_string_characters(js);
+    var valid: bool = true;
+    var bits: u32 = 0;
+    var available: i32 = 0;
+    for (var i: i64 = 0; i < length && valid; i++) {
+        var octet: i64 = -1;
+        if (code == 1) {
+            if (i + 1 >= length) {
+                break;
+            }
+            var high: i64 = hex_digit(units[i]);
+            var low: i64 = hex_digit(units[i + 1]);
+            if (high < 0 || low < 0) {
+                break;
+            }
+            octet = high * 16 + low;
+            i += 1;
+        } else if (code == 2 || code == 3) {
+            if (units[i] == 61) {
+                break;
+            }
+            var digit: i64 = base64_digit(units[i]);
+            if (digit < 0) {
+                continue;
+            }
+            bits = ((bits << 6) | digit as u32) & 65535;
+            available += 6;
+            if (available < 8) {
+                continue;
+            }
+            available -= 8;
+            octet = ((bits >> available) & 255) as i64;
+        } else if (code == 4 || code == 5) {
+            octet = (units[i] & 255) as i64;
+        } else if (code == 6) {
+            if (used + 2 >= capacity) {
+                valid = false;
+                break;
+            }
+            bytes[used] = (units[i] & 255) as u8;
+            bytes[used + 1] = (units[i] >> 8) as u8;
+            used += 2;
+            continue;
+        }
+        if (used + 1 >= capacity) {
+            valid = false;
+            break;
+        }
+        bytes[used] = octet as u8;
+        used += 1;
+    }
+    wr_string_release(js);
+    if (!valid) {
+        fail(ctx, ex, 2, "buffer byte limit exceeded");
+        return -1;
+    }
+    bytes[used] = 0;
+    return used;
+}
+
+pub fun decode_bytes(ctx: ptr<u8>, bytes: ptr<u8>, length: i64, code: i32, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var capacity: i64 = length * 2 + 4;
+    var units: ptr<u16> = mem_alloc(capacity * 2) as ptr<u16>;
+    if (units == null) {
+        fail(ctx, ex, 2, "cannot allocate decoded buffer");
+        return wr_undefined(ctx);
+    }
+    var used: i64 = 0;
+    var at: i64 = 0;
+    var alphabet: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (code == 3) {
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    }
+    var hex: str = "0123456789abcdef";
+    while (at < length) {
+        var octet: u32 = bytes[at] as u32;
+        if (code == 1) {
+            units[used] = hex[(octet / 16) as i64] as u16;
+            units[used + 1] = hex[(octet % 16) as i64] as u16;
+            used += 2;
+            at += 1;
+        } else if (code == 2 || code == 3) {
+            var remaining: i64 = length - at;
+            var bits: u32 = octet << 16;
+            if (remaining > 1) {
+                bits = bits | ((bytes[at + 1] as u32) << 8);
+            }
+            if (remaining > 2) {
+                bits = bits | (bytes[at + 2] as u32);
+            }
+            units[used] = alphabet[((bits >> 18) & 63) as i64] as u16;
+            units[used + 1] = alphabet[((bits >> 12) & 63) as i64] as u16;
+            used += 2;
+            if (remaining > 1) {
+                units[used] = alphabet[((bits >> 6) & 63) as i64] as u16;
+                used += 1;
+            } else if (code == 2) {
+                units[used] = 61;
+                used += 1;
+            }
+            if (remaining > 2) {
+                units[used] = alphabet[(bits & 63) as i64] as u16;
+                used += 1;
+            } else if (code == 2) {
+                units[used] = 61;
+                used += 1;
+            }
+            at += 3;
+        } else if (code == 4 || code == 5) {
+            if (code == 5) {
+                octet = octet & 127;
+            }
+            units[used] = octet as u16;
+            used += 1;
+            at += 1;
+        } else if (code == 6) {
+            if (at + 1 >= length) {
+                break;
+            }
+            units[used] = (octet | ((bytes[at + 1] as u32) << 8)) as u16;
+            used += 1;
+            at += 2;
+        } else {
+            var width: i64 = 1;
+            var cp: u32 = octet;
+            var valid: bool = true;
+            if (octet >= 194 && octet <= 223) {
+                width = 2;
+                cp = cp & 31;
+            } else if (octet >= 224 && octet <= 239) {
+                width = 3;
+                cp = cp & 15;
+            } else if (octet >= 240 && octet <= 244) {
+                width = 4;
+                cp = cp & 7;
+            } else if (octet >= 128) {
+                valid = false;
+            }
+            var consumed: i64 = 1;
+            for (var j: i64 = 1; j < width && valid; j++) {
+                if (at + j >= length) {
+                    valid = false;
+                    break;
+                }
+                var next: u32 = bytes[at + j] as u32;
+                if (next < 128 || next > 191 || (j == 1 && ((octet == 224 && next < 160) || (octet == 237 && next >= 160) || (octet == 240 && next < 144) || (octet == 244 && next >= 144)))) {
+                    valid = false;
+                    break;
+                }
+                cp = (cp << 6) | (next & 63);
+                consumed += 1;
+            }
+            at += consumed;
+            if (!valid) {
+                cp = 65533;
+            }
+            if (cp >= 65536) {
+                cp -= 65536;
+                units[used] = (55296 + (cp >> 10)) as u16;
+                used += 1;
+                units[used] = (56320 + (cp & 1023)) as u16;
+                used += 1;
+            } else {
+                units[used] = cp as u16;
+                used += 1;
+            }
+        }
+    }
+    var js: ptr<u8> = wr_string_utf16(units, used);
+    mem_free(units as ptr<u8>, capacity * 2);
+    var result: ptr<u8> = wr_string_value(ctx, js);
+    wr_string_release(js);
+    return result;
+}

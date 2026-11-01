@@ -1,0 +1,34 @@
+// CommonJS records and context-local ownership. No filesystem or execution policy.
+import("./context_state")::{owned_context_slot};
+import("std::mem::layout")::{size_of};
+
+pub struct ModulesState {
+    modules: ptr<Module>;
+    count: i64;
+    depth: i64;
+    eval_entry: bool;
+    main_source: ptr<u8>;
+    define_fn: ptr<u8>;
+    descriptor_fn: ptr<u8>;
+    parse_fn: ptr<u8>;
+    keys_fn: ptr<u8>;
+    constructors: array<ptr<u8>, 4>;
+    builtins: array<ptr<u8>, 21>;
+    import_depth: i64;
+    esm_resolving: bool;
+}
+
+pub fun modules_storage(ctx: ptr<u8>) -> ptr<ModulesState> {
+    return owned_context_slot(ctx, 17, size_of<ModulesState>() as i64) as ptr<ModulesState>;
+}
+
+pub const PATH_CAP: i64 = 8192;
+
+pub struct Module {
+    path: ptr<u8>;
+    directory: ptr<u8>;
+    object: ptr<u8>;
+    require_fn: ptr<u8>;
+    resolve_fn: ptr<u8>;
+    cached: bool;
+}

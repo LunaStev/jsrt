@@ -1,0 +1,165 @@
+// CommonJS file probing and package main/index lookup. No code execution.
+import("./module_state")::{modules_storage, ModulesState, PATH_CAP};
+import("./module_support")::{text, own_get, error, annotate};
+import("./system")::{read_text_file, copy_host_path};
+import("std::fs::file")::{Metadata, metadata};
+import("std::path::copy")::{path_join2};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::ops")::{mem_copy};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+extern(c, "realpath") fun realpath(path: str, result: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_undefined") fun wr_undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun wr_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_protect") fun wr_protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_to_string") fun wr_to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_utf16") fun wr_string_utf16(text: ptr<u16>, count: i64) -> ptr<u8>;
+extern(c, "wr_string_length") fun wr_string_length(text: ptr<u8>) -> i64;
+extern(c, "wr_string_characters") fun wr_string_characters(text: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_value") fun wr_string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_call") fun wr_call(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+
+pub fun ends(path: str, suffix: str) -> bool {
+    var a: i64 = mem_len_cstr(path);
+    var b: i64 = mem_len_cstr(suffix);
+    if (a < b) {
+        return false;
+    }
+    return mem_eq_cstr(((path as ptr<u8>) + a - b) as str, suffix);
+}
+
+pub fun append(buffer: ptr<u8>, path: str, suffix: str) -> bool {
+    var a: i64 = mem_len_cstr(path);
+    var b: i64 = mem_len_cstr(suffix);
+    if (a + b >= PATH_CAP) {
+        return false;
+    }
+    mem_copy(buffer, path as ptr<u8>, a);
+    mem_copy(buffer + a, suffix as ptr<u8>, b + 1);
+    return true;
+}
+
+pub fun canonical(path: str) -> ptr<u8> {
+    var result: ptr<u8> = mem_alloc(PATH_CAP);
+    if (result == null) {
+        return null;
+    }
+    if (realpath(path, result) == null) {
+        mem_free(result, PATH_CAP);
+        return null;
+    }
+    return result;
+}
+
+pub fun file(path: str) -> ptr<u8> {
+    var info: Metadata;
+    if (metadata(path, &info) == 0 && info.is_file) {
+        return canonical(path);
+    }
+    return null;
+}
+
+pub fun parsed_file(ctx: ptr<u8>, path: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<ModulesState> = modules_storage(ctx);
+    var path_value: ptr<u8> = text(ctx, path);
+    wr_protect(ctx, path_value);
+    var value: ptr<u8> = read_text_file(ctx, path_value, ex);
+    wr_unprotect(ctx, path_value);
+    if (deref ex != null) {
+        annotate(ctx, deref ex, path);
+        return wr_undefined(ctx);
+    }
+    wr_protect(ctx, value);
+    var source: ptr<u8> = wr_to_string(ctx, value, ex);
+    var chars: ptr<u16> = wr_string_characters(source);
+    var length: i64 = wr_string_length(source);
+    var first: i64 = 0;
+    if (length > 0 && chars[0] == 65279) {
+        first = 1;
+    }
+    var trimmed: ptr<u8> = wr_string_utf16(chars + first, length - first);
+    var args: array<ptr<u8>, 1> = [wr_string_value(ctx, trimmed)];
+    wr_protect(ctx, args[0]);
+    var result: ptr<u8> = wr_call(ctx, (deref host_state.parse_fn), null, 1, &args[0], ex);
+    wr_unprotect(ctx, args[0]);
+    wr_string_release(trimmed);
+    wr_string_release(source);
+    wr_unprotect(ctx, value);
+    if (deref ex != null) {
+        annotate(ctx, deref ex, path);
+    }
+    return result;
+}
+
+// Exact file, extensions, package main, then index. Failed lookups never execute JS.
+pub fun candidate(ctx: ptr<u8>, path: str, nesting: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (nesting > 16) {
+        error(ctx, ex, 2, "package main resolution limit exceeded", "ERR_MODULE_LIMIT");
+        return null;
+    }
+    var result: ptr<u8> = file(path);
+    if (result != null) {
+        return result;
+    }
+    var scratch: array<u8, 8192>;
+    var extensions: array<str, 4> = [".js", ".cjs", ".json", ".node"];
+    for (var i: i64 = 0; i < 4; i++) {
+        if (append(&scratch[0], path, extensions[i])) {
+            result = file(&scratch[0] as str);
+            if (result != null) {
+                return result;
+            }
+        }
+    }
+    var info: Metadata;
+    if (metadata(path, &info) < 0 || !info.is_directory) {
+        return null;
+    }
+    var manifest: array<u8, 8192>;
+    if (path_join2(&manifest[0], 8192, path, "package.json") < 0) {
+        return null;
+    }
+    if (metadata(&manifest[0] as str, &info) == 0 && info.is_file) {
+        var package: ptr<u8> = parsed_file(ctx, &manifest[0] as str, ex);
+        if (deref ex != null) {
+            return null;
+        }
+        wr_protect(ctx, package);
+        if (wr_type(ctx, package) != 5) {
+            error(ctx, ex, 1, "package.json must contain an object", "ERR_INVALID_PACKAGE_CONFIG");
+        } else {
+            var entry: ptr<u8> = own_get(ctx, package, "main", ex);
+            if (deref ex == null && wr_type(ctx, entry) == 4) {
+                var requested: array<u8, 8192>;
+                if (copy_host_path(ctx, entry, &requested[0], PATH_CAP, ex) >= 0 && requested[0] != 0) {
+                    if (requested[0] == 47) {
+                        error(ctx, ex, 1, "package main must be relative", "ERR_INVALID_PACKAGE_CONFIG");
+                    } else if (path_join2(&scratch[0], 8192, path, &requested[0] as str) >= 0) {
+                        // Self-referential main falls back to index without recursion.
+                        var self: bool = mem_eq_cstr(&requested[0] as str, ".") || mem_eq_cstr(&requested[0] as str,
+                            "./");
+                        if (!self) {
+                            result = candidate(ctx, &scratch[0] as str, nesting + 1, ex);
+                        }
+                    }
+                }
+            }
+        }
+        wr_unprotect(ctx, package);
+        if (result != null || deref ex != null) {
+            return result;
+        }
+    }
+    var indexes: array<str, 4> = ["index.js", "index.cjs", "index.json", "index.node"];
+    for (var i: i64 = 0; i < 4; i++) {
+        if (path_join2(&scratch[0], 8192, path, indexes[i]) >= 0) {
+            result = file(&scratch[0] as str);
+            if (result != null) {
+                return result;
+            }
+        }
+    }
+    return null;
+}

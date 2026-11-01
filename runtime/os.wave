@@ -1,0 +1,149 @@
+import("./context_state")::{owned_context_slot, active_context};
+import("std::mem::layout")::{size_of};
+struct OsState {
+    exports: ptr<u8>;
+    methods: array<ptr<u8>, 13>;
+}
+
+fun os_storage(ctx: ptr<u8>) -> ptr<OsState> {
+    return owned_context_slot(ctx, 19, size_of<OsState>() as i64) as ptr<OsState>;
+}
+
+// OS APIs reuse libuv and Wave std, without shell commands or JS bootstrap.
+import("std::env::environ")::{env_get};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("./values")::{text, plain, define, fail};
+extern(c, "uv_os_uname") fun uname(bytes: ptr<u8>) -> i32;
+extern(c, "uv_os_gethostname") fun hostname(bytes: ptr<u8>, size: ptr<i64>) -> i32;
+extern(c, "uv_os_homedir") fun homedir(bytes: ptr<u8>, size: ptr<i64>) -> i32;
+extern(c, "uv_uptime") fun uptime(seconds: ptr<f64>) -> i32;
+extern(c, "uv_get_total_memory") fun total_memory() -> u64;
+extern(c, "uv_get_free_memory") fun free_memory() -> u64;
+extern(c, "uv_available_parallelism") fun parallelism() -> u32;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "jsrt_os_callback") fun callback() -> ptr<u8>;
+
+export(c) fun jsrt_os_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<OsState> = os_storage(ctx);
+    if (equal(ctx, fn, (deref host_state.methods)[0])) {
+        return text(ctx, "linux");
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[9])) {
+        return number(ctx, total_memory() as f64);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[10])) {
+        return number(ctx, free_memory() as f64);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[11])) {
+        return number(ctx, parallelism() as f64);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[12])) {
+        var marker: u16 = 1;
+        if (deref(&marker as ptr<u8>) == 1) {
+            return text(ctx, "LE");
+        }
+        return text(ctx, "BE");
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[8])) {
+        var seconds: f64 = 0.0;
+        if (uptime(&seconds) < 0) {
+            fail(ctx, ex, 0, "cannot read OS uptime");
+            return undefined(ctx);
+        }
+        return number(ctx, seconds);
+    }
+    var bytes: array<u8, 16384>;
+    var capacity: i64 = 16384;
+    if (equal(ctx, fn, (deref host_state.methods)[5]) || equal(ctx, fn, (deref host_state.methods)[6])) {
+        var status: i32 = 0;
+        if (equal(ctx, fn, (deref host_state.methods)[5])) {
+            status = hostname(&bytes[0], &capacity);
+        } else {
+            status = homedir(&bytes[0], &capacity);
+        }
+        if (status < 0) {
+            fail(ctx, ex, 0, "cannot read OS directory or host name");
+            return undefined(ctx);
+        }
+        return text(ctx, &bytes[0] as str);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[7])) {
+        var n: i64 = env_get("TMPDIR", &bytes[0], 16384);
+        if (n <= 0) {
+            return text(ctx, "/tmp");
+        }
+        n = mem_len_cstr(&bytes[0] as str);
+        while (n > 1 && bytes[n - 1] == 47) {
+            n -= 1;
+        }
+        bytes[n] = 0;
+        return text(ctx, &bytes[0] as str);
+    }
+    // uv_utsname_t is four fixed 256-byte character arrays in the pinned uv ABI.
+    if (uname(&bytes[0]) < 0) {
+        fail(ctx, ex, 0, "cannot read OS identity");
+        return undefined(ctx);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[1])) {
+        var machine: str = &bytes[768] as str;
+        if (mem_eq_cstr(machine, "x86_64")) {
+            return text(ctx, "x64");
+        }
+        if (mem_eq_cstr(machine, "aarch64")) {
+            return text(ctx, "arm64");
+        }
+        return text(ctx, machine);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[2])) {
+        return text(ctx, &bytes[0] as str);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[3])) {
+        return text(ctx, &bytes[256] as str);
+    }
+    return text(ctx, &bytes[512] as str);
+}
+
+pub fun install_os(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var host_state: ptr<OsState> = os_storage(ctx);
+    (deref host_state.exports) = plain(ctx);
+    protect(ctx, (deref host_state.exports));
+    var names: array<str, 13> = ["platform", "arch", "type", "release", "version", "hostname", "homedir",
+        "tmpdir", "uptime", "totalmem", "freemem", "availableParallelism", "endianness"];
+    for (var i: i64 = 0; i < 13; i++) {
+        var name: ptr<u8> = utf8(names[i]);
+        (deref host_state.methods)[i] = function(ctx, name, callback());
+        release(name);
+        protect(ctx, (deref host_state.methods)[i]);
+        define(ctx, (deref host_state.exports), names[i], (deref host_state.methods)[i], ex, false);
+    }
+    define(ctx, (deref host_state.exports), "EOL", text(ctx, "\n"), ex, true);
+    define(ctx, (deref host_state.exports), "devNull", text(ctx, "/dev/null"), ex, true);
+    return deref ex == null;
+}
+
+pub fun os_module() -> ptr<u8> {
+    var host_state: ptr<OsState> = os_storage(active_context());
+    return(deref host_state.exports);
+}
+
+pub fun shutdown_os(ctx: ptr<u8>) {
+    var host_state: ptr<OsState> = os_storage(ctx);
+    if ((deref host_state.exports) != null) {
+        unprotect(ctx, (deref host_state.exports));
+        (deref host_state.exports) = null;
+    }
+    for (var i: i64 = 0; i < 13; i++) {
+        if ((deref host_state.methods)[i] != null) {
+            unprotect(ctx, (deref host_state.methods)[i]);
+            (deref host_state.methods)[i] = null;
+        }
+    }
+}

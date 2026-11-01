@@ -1,0 +1,919 @@
+import("./context_state")::{owned_context_slot, active_context};
+struct HttpServerState {
+    module_object: ptr<u8>;
+    transport_failure: i32;
+    next_connection: i64;
+}
+
+fun http_server_storage(ctx: ptr<u8>) -> ptr<HttpServerState> {
+    return owned_context_slot(ctx, 14, size_of<HttpServerState>() as i64) as ptr<HttpServerState>;
+}
+
+// HTTP server API and libuv transport callbacks. JS handlers run only in dispatch_http.
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::mem::ops")::{mem_zero};
+import("std::time::clock")::{time_now_monotonic_ns};
+import("./network_deadlines")::{connection_deadline, earliest};
+import("./buffer")::{buffer_integer};
+import("./config")::{HTTP_HEADERS_TIMEOUT_MS, HTTP_REQUEST_TIMEOUT_MS, HTTP_IDLE_TIMEOUT_MS, HTTP_KEEP_ALIVE_TIMEOUT_MS};
+import("./http_keepalive")::{recycle_connection};
+import("std::net::address")::{Ipv4ParseResult, ipv4_parse, Ipv6ParseResult, ipv6_parse};
+import("./events")::{event_parent, add_listener, emit_named};
+import("./config")::{HTTP_SERVER_LIMIT, HTTP_CONNECTION_LIMIT};
+import("./network")::{initialize_network, network_loop, poll_network, network_active, shutdown_network};
+import("./http_state")::{HttpServer, HttpConnection, allocate_http_state, server_for, server_connections,
+    free_connection_bytes, release_http_state, http_state_storage, HttpHostState};
+import("./http_protocol")::{HttpRequest, HttpHeader, new_request, feed_request, request_method, queue_request_bytes};
+import("./http_response")::{send_bytes, dispatch_response_write};
+import("./http_headers")::{install_response_headers};
+import("./streams")::{create_stream, stream_invoke};
+import("./stream_state")::{stream_state};
+import("./collections")::{integer, flag, set_flag};
+import("./values")::{get, define, fail};
+import("./http_response_bytes")::{HttpOutput, encode_response};
+import("./http_values")::{http_object, http_text, http_latin1, http_put, http_define, http_native, initialize_http_values,
+    shutdown_http_values};
+import("./system")::{system_fail, system_type_fail, encode_host_text};
+import("./buffer_core")::{buffer_from_bytes};
+
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, value: ptr<u8>, parent: ptr<u8>);
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_number") fun js_number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_type") fun value_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_to_boolean") fun equal_boolean(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_to_number") fun number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, argc: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "jsrt_uv_tcp_size") fun tcp_size() -> i64;
+extern(c, "jsrt_uv_write_size") fun write_size() -> i64;
+extern(c, "uv_tcp_init") fun tcp_init(loop: ptr<u8>, handle: ptr<u8>) -> i32;
+extern(c, "uv_handle_set_data") fun set_data(handle: ptr<u8>, data: ptr<u8>);
+extern(c, "uv_handle_get_data") fun get_data(handle: ptr<u8>) -> ptr<u8>;
+extern(c, "uv_req_get_data") fun get_request_data(request: ptr<u8>) -> ptr<u8>;
+extern(c, "jsrt_uv_listen") fun listen_tcp(handle: ptr<u8>, backlog: i32) -> i32;
+extern(c, "jsrt_uv_bind") fun bind_tcp(handle: ptr<u8>, host: str, port: i32, family: i32) -> i32;
+extern(c, "jsrt_uv_address") fun tcp_address(handle: ptr<u8>, host: ptr<u8>, cap: i64, port: ptr<i32>,
+    family: ptr<i32>) -> i32;
+extern(c, "jsrt_uv_close") fun close_handle(handle: ptr<u8>);
+extern(c, "jsrt_uv_read_start") fun read_start(handle: ptr<u8>) -> i32;
+extern(c, "uv_read_stop") fun read_stop(handle: ptr<u8>) -> i32;
+extern(c, "uv_accept") fun accept_tcp(server: ptr<u8>, client: ptr<u8>) -> i32;
+extern(c, "uv_err_name") fun error_name(code: i32) -> str;
+
+fun valid_callback(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    return value_type(ctx, value) == 5 && callable(ctx, value);
+}
+
+fun io_error(ctx: ptr<u8>, ex: ptr<ptr<u8>>, code: i32, operation: str) {
+    system_fail(ctx, ex, false, "HTTP socket operation failed");
+    var error: ptr<u8> = deref ex;
+    protect(ctx, error);
+    var nested: ptr<u8> = null;
+    http_define(ctx, error, "code", http_text(ctx, error_name(code)), &nested);
+    http_define(ctx, error, "errno", js_number(ctx, code as f64), &nested);
+    http_define(ctx, error, "syscall", http_text(ctx, operation), &nested);
+    unprotect(ctx, error);
+}
+
+fun close_client(client: ptr<HttpConnection>) {
+    if (deref client.handle != null && !deref client.closing) {
+        deref client.closing = true;
+        read_stop(deref client.handle);
+        close_handle(deref client.handle);
+    }
+}
+
+fun close_server(server: ptr<HttpServer>) {
+    if (deref server.handle != null && !deref server.closing) {
+        deref server.closing = true;
+        deref server.listening = false;
+        deref server.accept_pending = false;
+        deref server.listen_pending = false;
+        close_handle(deref server.handle);
+    }
+}
+
+fun reject_client(client: ptr<HttpConnection>, status: i32) {
+    if (deref client.ending || deref client.closing) {
+        return;
+    }
+    read_stop(deref client.handle);
+    var result: HttpOutput = encode_response(status, null, 0, null, 0, false);
+    if (!send_bytes(client, result)) {
+        close_client(client);
+    }
+}
+
+export(c) fun jsrt_net_allocate(handle: ptr<u8>, suggested: i64, bytes: ptr<ptr<u8>>, length: ptr<i64>) {
+    deref bytes = mem_alloc(65536);
+    deref length = 0;
+    if (deref bytes != null) {
+        deref length = 65536;
+    }
+}
+
+export(c) fun jsrt_net_read(handle: ptr<u8>, length: i64, bytes: ptr<u8>) {
+    var client: ptr<HttpConnection> = get_data(handle) as ptr<HttpConnection>;
+    if (!deref client.closing && (!deref client.ending || deref client.keep_alive) && length > 0) {
+        deref client.activity_at = time_now_monotonic_ns();
+        var request: ptr<HttpRequest> = deref client.request;
+        if (deref request.complete) {
+            if (!deref request.allow_pipeline || !queue_request_bytes(request, bytes, length)) {
+                close_client(client);
+            } else {
+                read_stop(handle);
+                deref client.read_paused = true;
+            }
+        } else if (!feed_request(request, bytes, length)) {
+            reject_client(client, deref request.status);
+        } else if (deref request.headers_done) {
+            read_stop(handle);
+            deref client.read_paused = true;
+        }
+    } else if (length < 0 && !deref client.closing) {
+        var request: ptr<HttpRequest> = deref client.request;
+        if (request != null && deref request.wire_bytes > 0 && !deref request.complete) {
+            reject_client(client, 400);
+        } else if (deref client.ending || deref client.end_requested) {
+            // Finish a queued final response after peer FIN; never reuse that transport.
+            deref client.keep_alive = false;
+            read_stop(handle);
+            if (deref client.response_finished && deref client.write_request == null && deref client.write_done == null) {
+                close_client(client);
+            }
+        } else {
+            close_client(client);
+        }
+    }
+    if (bytes != null) {
+        mem_free(bytes, 65536);
+    }
+}
+
+export(c) fun jsrt_net_written(request: ptr<u8>, status: i32) {
+    var client: ptr<HttpConnection> = get_request_data(request) as ptr<HttpConnection>;
+    deref client.activity_at = time_now_monotonic_ns();
+    mem_free(request, write_size());
+    deref client.write_request = null;
+    if (deref client.write_done == null) {
+        close_client(client);
+    } else {
+        deref client.write_complete = true;
+        deref client.write_status = status;
+    }
+}
+
+export(c) fun jsrt_net_closed(handle: ptr<u8>) {
+    var data: ptr<u8> = get_data(handle);
+    var tag: ptr<i32> = data as ptr<i32>;
+    if (deref tag == 1) {
+        var server: ptr<HttpServer> = data as ptr<HttpServer>;
+        deref server.handle = null;
+        deref server.close_pending = true;
+    } else {
+        var client: ptr<HttpConnection> = data as ptr<HttpConnection>;
+        deref client.handle = null;
+        deref client.closed = true;
+    }
+    mem_free(handle, tcp_size());
+}
+
+export(c) fun jsrt_net_connection(handle: ptr<u8>, status: i32) {
+    var host_state: ptr<HttpServerState> = http_server_storage(active_context());
+    var http_state_roots: ptr<HttpHostState> = http_state_storage(active_context());
+    if (status < 0) {
+        (deref host_state.transport_failure) = status;
+        return;
+    }
+    var server: ptr<HttpServer> = get_data(handle) as ptr<HttpServer>;
+    var client: ptr<HttpConnection> = null;
+    for (var i: i64 = 0; i < HTTP_CONNECTION_LIMIT; i++) {
+        var candidate: ptr<HttpConnection> = (deref http_state_roots.connections) + i;
+        if (deref candidate.kind == 0) {
+            client = candidate;
+            break;
+        }
+    }
+    // libuv retains its pending accept and pauses this listener until uv_accept.
+    if (client == null) {
+        deref server.accept_pending = true;
+        return;
+    }
+    deref server.accept_pending = false;
+    deref client.kind = 2;
+    deref client.server = server;
+    deref client.handle = mem_alloc_zeroed(tcp_size());
+    if (deref client.handle == null) {
+        deref client.kind = 0;
+        (deref host_state.transport_failure) = -12;
+        return;
+    }
+    status = tcp_init(network_loop(), deref client.handle);
+    if (status < 0) {
+        mem_free(deref client.handle, tcp_size());
+        mem_zero(client as ptr<u8>, size_of<HttpConnection>() as i64);
+        (deref host_state.transport_failure) = status;
+        return;
+    }
+    set_data(deref client.handle, client as ptr<u8>);
+    status = accept_tcp(handle, deref client.handle);
+    if (status < 0) {
+        close_client(client);
+        return;
+    }
+    deref client.accepted_at = time_now_monotonic_ns();
+    deref client.activity_at = deref client.accepted_at;
+    deref client.request = new_request();
+    if (deref client.request != null) {
+        var request: ptr<HttpRequest> = deref client.request;
+        deref request.streaming = true;
+        deref request.allow_pipeline = deref server.keep_alive;
+    }
+    if (deref client.request == null) {
+        close_client(client);
+        return;
+    }
+    status = read_start(deref client.handle);
+    if (status < 0) {
+        close_client(client);
+    }
+}
+
+export(c) fun jsrt_http_create(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var http_state_roots: ptr<HttpHostState> = http_state_storage(ctx);
+    var handler: ptr<u8> = null;
+    var options: ptr<u8> = null;
+    if (count > 2) {
+        system_type_fail(ctx, ex, "createServer accepts options and an optional request handler");
+        return undefined(ctx);
+    }
+    if (count > 0) {
+        if (valid_callback(ctx, args[0])) {
+            handler = args[0];
+            if (count > 1) {
+                system_type_fail(ctx, ex, "invalid createServer arguments");
+                return undefined(ctx);
+            }
+        } else if (value_type(ctx, args[0]) == 5) {
+            options = args[0];
+            if (count > 1) {
+                handler = args[1];
+            }
+        } else {
+            system_type_fail(ctx, ex, "invalid createServer options");
+            return undefined(ctx);
+        }
+    }
+    if (handler != null && !valid_callback(ctx, handler)) {
+        system_type_fail(ctx, ex, "invalid request handler");
+        return undefined(ctx);
+    }
+    var headers_ms: i64 = HTTP_HEADERS_TIMEOUT_MS;
+    var request_ms: i64 = HTTP_REQUEST_TIMEOUT_MS;
+    var idle_ms: i64 = HTTP_IDLE_TIMEOUT_MS;
+    var keep_alive: bool = false;
+    var keep_alive_ms: i64 = HTTP_KEEP_ALIVE_TIMEOUT_MS;
+    if (options != null) {
+        var setting: ptr<u8> = get(ctx, options, "headersTimeout", ex);
+        if (value_type(ctx, setting) != 0) {
+            headers_ms = buffer_integer(ctx, setting, 0, 2147483647, ex);
+        }
+        setting = get(ctx, options, "requestTimeout", ex);
+        if (value_type(ctx, setting) != 0) {
+            request_ms = buffer_integer(ctx, setting, 0, 2147483647, ex);
+        }
+        setting = get(ctx, options, "timeout", ex);
+        if (value_type(ctx, setting) != 0) {
+            idle_ms = buffer_integer(ctx, setting, 0, 2147483647, ex);
+        }
+        setting = get(ctx, options, "keepAlive", ex);
+        if (value_type(ctx, setting) != 0) {
+            if (value_type(ctx, setting) != 2) {
+                system_type_fail(ctx, ex, "keepAlive must be boolean");
+            } else {
+                keep_alive = value_type(ctx, setting) == 2 && equal_boolean(ctx, setting);
+            }
+        }
+        setting = get(ctx, options, "keepAliveTimeout", ex);
+        if (value_type(ctx, setting) != 0) {
+            keep_alive_ms = buffer_integer(ctx, setting, 1, 2147483647, ex);
+        }
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var server: ptr<HttpServer> = null;
+    for (var i: i64 = 0; i < HTTP_SERVER_LIMIT; i++) {
+        var candidate: ptr<HttpServer> = (deref http_state_roots.servers) + i;
+        if (deref candidate.kind == 0) {
+            server = candidate;
+            break;
+        }
+    }
+    if (server == null) {
+        system_fail(ctx, ex, true, "HTTP server record limit exceeded");
+        return undefined(ctx);
+    }
+    deref server.kind = 1;
+    deref server.object = http_object(ctx);
+    protect(ctx, deref server.object);
+    deref server.headers_timeout = headers_ms;
+    deref server.request_timeout = request_ms;
+    deref server.idle_timeout = idle_ms;
+    deref server.keep_alive = keep_alive;
+    deref server.keep_alive_timeout = keep_alive_ms;
+    http_put(ctx, deref server.object, "listen", http_native(ctx, "listen", 1), ex);
+    http_put(ctx, deref server.object, "address", http_native(ctx, "address", 2), ex);
+    http_put(ctx, deref server.object, "close", http_native(ctx, "close", 3), ex);
+    http_put(ctx, deref server.object, "listening", boolean(ctx, false), ex);
+    http_put(ctx, deref server.object, "closeAllConnections", http_native(ctx, "closeAllConnections",
+        11), ex);
+    prototype(ctx, deref server.object, event_parent(ctx));
+    if (handler != null) {
+        add_listener(ctx, deref server.object, http_text(ctx, "request"), handler, false, false, ex);
+    }
+    return deref server.object;
+}
+
+export(c) fun jsrt_http_listen(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var server: ptr<HttpServer> = server_for(receiver);
+    if (server == null) {
+        system_type_fail(ctx, ex, "invalid HTTP server receiver");
+        return undefined(ctx);
+    }
+    if (deref server.handle != null || deref server.closing) {
+        system_fail(ctx, ex, false, "HTTP server already started or closing");
+        return undefined(ctx);
+    }
+    if (count < 1 || count > 3 || value_type(ctx, args[0]) != 3) {
+        system_type_fail(ctx, ex, "listen requires a numeric port");
+        return undefined(ctx);
+    }
+    var port: f64 = number(ctx, args[0], ex);
+    if (port != port || port < 0.0 || port > 65535.0 || (port as i32) as f64 != port) {
+        system_fail(ctx, ex, true, "port must be an integer from 0 to 65535");
+        return undefined(ctx);
+    }
+    var host: str = "127.0.0.1";
+    var host_buffer: array<u8, 64>;
+    var listener: ptr<u8> = null;
+    if (count >= 2) {
+        if (value_type(ctx, args[1]) == 4) {
+            var size: i64 = encode_host_text(ctx, args[1], &host_buffer[0], 64, ex);
+            if (size < 0) {
+                return undefined(ctx);
+            }
+            host = &host_buffer[0] as str;
+            if (count == 3) {
+                listener = args[2];
+            }
+        } else if (count == 2) {
+            listener = args[1];
+        } else {
+            system_type_fail(ctx, ex, "invalid listen arguments");
+            return undefined(ctx);
+        }
+    }
+    if (listener != null && !valid_callback(ctx, listener)) {
+        system_type_fail(ctx, ex, "listen callback must be a function");
+        return undefined(ctx);
+    }
+    var parsed: Ipv4ParseResult = ipv4_parse(host);
+    var family: i32 = 4;
+    if (!parsed.ok) {
+        var parsed6: Ipv6ParseResult = ipv6_parse(host);
+        if (!parsed6.ok) {
+            system_type_fail(ctx, ex, "listen host must be a literal IPv4 or IPv6 address");
+            return undefined(ctx);
+        }
+        family = 6;
+    }
+    var status: i32 = initialize_network();
+    if (status < 0) {
+        io_error(ctx, ex, status, "uv_loop_init");
+        return undefined(ctx);
+    }
+    var handle: ptr<u8> = mem_alloc_zeroed(tcp_size());
+    if (handle == null) {
+        system_fail(ctx, ex, true, "cannot allocate TCP server");
+        return undefined(ctx);
+    }
+    status = tcp_init(network_loop(), handle);
+    if (status < 0) {
+        mem_free(handle, tcp_size());
+        io_error(ctx, ex, status, "uv_tcp_init");
+        return undefined(ctx);
+    }
+    deref server.handle = handle;
+    set_data(handle, server as ptr<u8>);
+    status = bind_tcp(handle, host, port as i32, family);
+    if (status == 0) {
+        status = listen_tcp(handle, 128);
+    }
+    if (status < 0) {
+        close_server(server);
+        io_error(ctx, ex, status, "listen");
+        return undefined(ctx);
+    }
+    deref server.listening = true;
+    http_define(ctx, receiver, "listening", boolean(ctx, true), ex);
+    if (deref ex != null) {
+        close_server(server);
+        return undefined(ctx);
+    }
+    deref server.listen_pending = true;
+    if (listener != null) {
+        deref server.listen_callback = listener;
+        protect(ctx, listener);
+    }
+    return receiver;
+}
+
+export(c) fun jsrt_http_address(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var server: ptr<HttpServer> = server_for(receiver);
+    if (server == null) {
+        system_type_fail(ctx, ex, "invalid HTTP server receiver");
+        return undefined(ctx);
+    }
+    if (!deref server.listening) {
+        return js_null(ctx);
+    }
+    var host: array<u8, 64>;
+    var port: i32 = 0;
+    var family: i32 = 4;
+    var status: i32 = tcp_address(deref server.handle, &host[0], 64, &port, &family);
+    if (status < 0) {
+        io_error(ctx, ex, status, "getsockname");
+        return undefined(ctx);
+    }
+    var result: ptr<u8> = http_object(ctx);
+    protect(ctx, result);
+    http_put(ctx, result, "address", http_text(ctx, &host[0] as str), ex);
+    http_put(ctx, result, "port", js_number(ctx, port as f64), ex);
+    var family_name: str = "IPv4";
+    if (family == 6) {
+        family_name = "IPv6";
+    }
+    http_put(ctx, result, "family", http_text(ctx, family_name), ex);
+    unprotect(ctx, result);
+    return result;
+}
+
+export(c) fun jsrt_http_close(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var http_state_roots: ptr<HttpHostState> = http_state_storage(ctx);
+    var server: ptr<HttpServer> = server_for(receiver);
+    if (server == null) {
+        system_type_fail(ctx, ex, "invalid HTTP server receiver");
+        return undefined(ctx);
+    }
+    if (count > 1 || (count == 1 && !valid_callback(ctx, args[0]))) {
+        system_type_fail(ctx, ex, "close accepts an optional callback");
+        return undefined(ctx);
+    }
+    if (!deref server.listening) {
+        system_fail(ctx, ex, false, "HTTP server is not listening");
+        return undefined(ctx);
+    }
+    if (count == 1) {
+        deref server.close_callback = args[0];
+        protect(ctx, args[0]);
+    }
+    close_server(server);
+    for (var i: i64 = 0; i < HTTP_CONNECTION_LIMIT; i++) {
+        var client: ptr<HttpConnection> = (deref http_state_roots.connections) + i;
+        var request: ptr<HttpRequest> = deref client.request;
+        if (deref client.server == server && request != null && deref client.reused && deref request.wire_bytes == 0) {
+            close_client(client);
+        }
+    }
+    http_define(ctx, receiver, "listening", boolean(ctx, false), ex);
+    return receiver;
+}
+
+export(c) fun jsrt_http_close_all(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var http_state_roots: ptr<HttpHostState> = http_state_storage(ctx);
+    var server: ptr<HttpServer> = server_for(receiver);
+    if (server == null) {
+        system_type_fail(ctx, ex, "invalid HTTP server receiver");
+        return undefined(ctx);
+    }
+    for (var i: i64 = 0; i < HTTP_CONNECTION_LIMIT; i++) {
+        var client: ptr<HttpConnection> = (deref http_state_roots.connections) + i;
+        if (deref client.server == server) {
+            close_client(client);
+        }
+    }
+    return undefined(ctx);
+}
+
+fun collect_closed(ctx: ptr<u8>, notify: bool, ex: ptr<ptr<u8>>) {
+    var http_state_roots: ptr<HttpHostState> = http_state_storage(ctx);
+    if ((deref http_state_roots.connections) == null) {
+        return;
+    }
+    for (var i: i64 = 0; i < HTTP_CONNECTION_LIMIT; i++) {
+        var client: ptr<HttpConnection> = (deref http_state_roots.connections) + i;
+        if (deref client.closed) {
+            if (deref client.response_destroy_done != null) {
+                var done: ptr<u8> = deref client.response_destroy_done;
+                deref client.response_destroy_done = null;
+                if (notify && deref ex == null) {
+                    call(ctx, done, deref client.response, 0, null, ex);
+                }
+                unprotect(ctx, done);
+            }
+            if (deref client.incoming_destroy_done != null) {
+                var done: ptr<u8> = deref client.incoming_destroy_done;
+                deref client.incoming_destroy_done = null;
+                if (notify && deref ex == null) {
+                    call(ctx, done, deref client.incoming, 0, null, ex);
+                }
+                unprotect(ctx, done);
+            }
+            if (notify && deref client.response != null) {
+                var state: ptr<u8> = stream_state(ctx, deref client.response, 0, ex);
+                if (!flag(ctx, state, "destroyed", ex)) {
+                    var error: ptr<u8> = undefined(ctx);
+                    if (!flag(ctx, state, "finished", ex)) {
+                        var problem: ptr<u8> = null;
+                        fail(ctx, &problem, 0, "HTTP connection closed before response completion");
+                        error = problem;
+                    }
+                    var args: array<ptr<u8>, 1> = [error];
+                    stream_invoke(ctx, deref client.response, 6, 1, &args[0], ex);
+                }
+            }
+            if (notify && deref client.incoming != null) {
+                var state: ptr<u8> = stream_state(ctx, deref client.incoming, 0, ex);
+                if (!flag(ctx, state, "destroyed", ex)) {
+                    var error: ptr<u8> = undefined(ctx);
+                    var request: ptr<HttpRequest> = deref client.request;
+                    if (!deref request.complete) {
+                        var problem: ptr<u8> = null;
+                        fail(ctx, &problem, 0, "HTTP request aborted");
+                        error = problem;
+                    }
+                    var args: array<ptr<u8>, 1> = [error];
+                    stream_invoke(ctx, deref client.incoming, 6, 1, &args[0], ex);
+                }
+            }
+            if (deref client.response != null) {
+                unprotect(ctx, deref client.response);
+            }
+            if (deref client.incoming != null) {
+                unprotect(ctx, deref client.incoming);
+            }
+            if (deref client.write_done != null) {
+                unprotect(ctx, deref client.write_done);
+            }
+            if (deref client.write_request != null) {
+                mem_free(deref client.write_request, write_size());
+            }
+            free_connection_bytes(client);
+            mem_zero(client as ptr<u8>, size_of<HttpConnection>() as i64);
+        }
+    }
+}
+
+fun request_object(ctx: ptr<u8>, request: ptr<HttpRequest>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var object: ptr<u8> = create_stream(ctx, 1, ex);
+    protect(ctx, object);
+    // Request EOF is message completion, not destruction of the shared socket.
+    // collect_closed/recycle_connection own normal HTTP stream teardown.
+    var state: ptr<u8> = stream_state(ctx, object, 1, ex);
+    if (state != null && deref ex == null) {
+        set_flag(ctx, state, "autoDestroy", false, ex);
+    }
+    http_define(ctx, object, "method", http_text(ctx, request_method(request)), ex);
+    http_define(ctx, object, "url", http_latin1(ctx, deref request.url, deref request.url_length), ex);
+    var version: str = "1.1";
+    if (deref request.minor == 0) {
+        version = "1.0";
+    }
+    http_define(ctx, object, "httpVersion", http_text(ctx, version), ex);
+    var headers: ptr<u8> = http_object(ctx);
+    protect(ctx, headers);
+    for (var i: i64 = 0; i < deref request.header_count; i++) {
+        var field: ptr<HttpHeader> = deref request.fields + i;
+        http_put(ctx, headers, (deref request.headers + deref field.name) as str, http_latin1(ctx, deref request.headers + deref field.value,
+            deref field.length), ex);
+    }
+    http_define(ctx, object, "headers", headers, ex);
+    unprotect(ctx, headers);
+    unprotect(ctx, object);
+    return object;
+}
+
+export(c) fun jsrt_http_stream_read(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var http_state_roots: ptr<HttpHostState> = http_state_storage(ctx);
+    for (var i: i64 = 0; i < HTTP_CONNECTION_LIMIT; i++) {
+        var client: ptr<HttpConnection> = (deref http_state_roots.connections) + i;
+        if (deref client.incoming != receiver || deref client.closing || deref client.ending) {
+            continue;
+        }
+        var request: ptr<HttpRequest> = deref client.request;
+        if (deref client.read_paused && !deref request.complete) {
+            deref client.read_paused = false;
+            var status: i32 = read_start(deref client.handle);
+            if (status < 0) {
+                io_error(ctx, ex, status, "read");
+            }
+        }
+        break;
+    }
+    return undefined(ctx);
+}
+
+fun deliver_body(ctx: ptr<u8>, client: ptr<HttpConnection>, ex: ptr<ptr<u8>>) {
+    var request: ptr<HttpRequest> = deref client.request;
+    if (deref client.incoming == null || deref client.incoming_eof) {
+        return;
+    }
+    if (deref request.body_length > 0) {
+        var body: ptr<u8> = buffer_from_bytes(ctx, deref request.body, deref request.body_length, ex);
+        protect(ctx, body);
+        deref request.body_length = 0;
+        var args: array<ptr<u8>, 1> = [body];
+        stream_invoke(ctx, deref client.incoming, 0, 1, &args[0], ex);
+        unprotect(ctx, body);
+    }
+    if (deref request.complete && deref ex == null) {
+        deref client.incoming_eof = true;
+        var args: array<ptr<u8>, 1> = [js_null(ctx)];
+        stream_invoke(ctx, deref client.incoming, 0, 1, &args[0], ex);
+        // Pausing after parsing EOF hid a client's FIN while a response was
+        // pending, leaving cancelled requests alive until the idle deadline.
+        if (deref client.read_paused && deref ex == null && !deref client.closing && !deref client.ending) {
+            deref client.read_paused = false;
+            var status: i32 = read_start(deref client.handle);
+            if (status < 0) {
+                io_error(ctx, ex, status, "read");
+            }
+        }
+    } else if (deref client.read_paused && deref ex == null && !deref client.closing) {
+        var state: ptr<u8> = stream_state(ctx, deref client.incoming, 0, ex);
+        if (integer(ctx, state, "rbytes", ex) < integer(ctx, state, "high", ex)) {
+            jsrt_http_stream_read(ctx, null, deref client.incoming, 0, null, ex);
+        }
+    }
+}
+
+// -1: fatal exception, 0: idle, 1: performed work; poll libuv again before waiting.
+fun deadline_for(client: ptr<HttpConnection>) -> i64 {
+    if (deref client.kind == 0 || deref client.closing || deref client.closed || deref client.request == null) {
+        return -1;
+    }
+    var request: ptr<HttpRequest> = deref client.request;
+    var server: ptr<HttpServer> = deref client.server;
+    var deadline: i64 = connection_deadline(deref client.accepted_at, deref client.activity_at, deref request.headers_done,
+        deref request.complete, deref server.headers_timeout, deref server.request_timeout, deref server.idle_timeout);
+    if (deref client.reused && deref request.wire_bytes == 0) {
+        deadline = earliest(deadline, connection_deadline(deref client.activity_at, deref client.activity_at,
+            true, true, 0, 0, deref server.keep_alive_timeout));
+    }
+    return deadline;
+}
+
+pub fun http_deadline() -> i64 {
+    var http_state_roots: ptr<HttpHostState> = http_state_storage(active_context());
+    var result: i64 = -1;
+    for (var i: i64 = 0; (deref http_state_roots.connections) != null && i < HTTP_CONNECTION_LIMIT; i++) {
+        result = earliest(result, deadline_for((deref http_state_roots.connections) + i));
+    }
+    return result;
+}
+
+pub fun dispatch_http(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> i32 {
+    var http_state_roots: ptr<HttpHostState> = http_state_storage(ctx);
+    var host_state: ptr<HttpServerState> = http_server_storage(ctx);
+    var now: i64 = time_now_monotonic_ns();
+    for (var i: i64 = 0; (deref http_state_roots.connections) != null && i < HTTP_CONNECTION_LIMIT; i++) {
+        var client: ptr<HttpConnection> = (deref http_state_roots.connections) + i;
+        var deadline: i64 = deadline_for(client);
+        if (deadline >= 0 && now >= deadline) {
+            close_client(client);
+        }
+    }
+    var wrote: bool = false;
+    for (var i: i64 = 0; (deref http_state_roots.connections) != null && i < HTTP_CONNECTION_LIMIT; i++) {
+        if (dispatch_response_write(ctx, (deref http_state_roots.connections) + i, ex)) {
+            if (deref ex != null) {
+                return -1;
+            }
+            wrote = true;
+        }
+    }
+    for (var i: i64 = 0; (deref http_state_roots.connections) != null && i < HTTP_CONNECTION_LIMIT; i++) {
+        if (recycle_connection(ctx, (deref http_state_roots.connections) + i, ex)) {
+            wrote = true;
+        }
+        if (deref ex != null) {
+            return -1;
+        }
+    }
+    collect_closed(ctx, true, ex);
+    if (deref ex != null) {
+        return -1;
+    }
+    if ((deref host_state.transport_failure) != 0) {
+        io_error(ctx, ex, (deref host_state.transport_failure), "accept");
+        return -1;
+    }
+    if ((deref http_state_roots.servers) == null) {
+        return 0;
+    }
+    var resumed: bool = false;
+    for (var i: i64 = 0; i < HTTP_SERVER_LIMIT; i++) {
+        var server: ptr<HttpServer> = (deref http_state_roots.servers) + i;
+        if (deref server.accept_pending && deref server.listening && !deref server.closing) {
+            jsrt_net_connection(deref server.handle, 0);
+            if (!deref server.accept_pending) {
+                resumed = true;
+            }
+        }
+    }
+    if ((deref host_state.transport_failure) != 0) {
+        io_error(ctx, ex, (deref host_state.transport_failure), "accept");
+        return -1;
+    }
+    for (var i: i64 = 0; i < HTTP_SERVER_LIMIT; i++) {
+        var server: ptr<HttpServer> = (deref http_state_roots.servers) + i;
+        var callback: ptr<u8> = null;
+        var event_name: str = "close";
+        var selected: bool = false;
+        if (deref server.listen_pending) {
+            event_name = "listening";
+            selected = true;
+            callback = deref server.listen_callback;
+            deref server.listen_callback = null;
+            deref server.listen_pending = false;
+        } else if (deref server.close_pending && server_connections(server) == 0) {
+            selected = true;
+            deref server.close_pending = false;
+            deref server.closing = false;
+            callback = deref server.close_callback;
+            deref server.close_callback = null;
+            if (deref server.listen_callback != null) {
+                unprotect(ctx, deref server.listen_callback);
+                deref server.listen_callback = null;
+            }
+        }
+        if (selected) {
+            emit_named(ctx, deref server.object, event_name, 0, null, ex);
+            if (callback != null) {
+                if (deref ex == null) {
+                    call(ctx, callback, deref server.object, 0, null, ex);
+                }
+                unprotect(ctx, callback);
+            }
+            if (deref ex != null) {
+                return -1;
+            }
+            return 1;
+        }
+    }
+    for (var offset: i64 = 0; offset < HTTP_CONNECTION_LIMIT; offset++) {
+        var i: i64 = ((deref host_state.next_connection) + offset) % HTTP_CONNECTION_LIMIT;
+        var client: ptr<HttpConnection> = (deref http_state_roots.connections) + i;
+        var request: ptr<HttpRequest> = deref client.request;
+        if (request != null && deref client.dispatched && !deref client.closing && deref client.read_paused && (deref request.body_length > 0 || (deref request.complete && !deref client.incoming_eof))) {
+            (deref host_state.next_connection) = (i + 1) % HTTP_CONNECTION_LIMIT;
+            deliver_body(ctx, client, ex);
+            if (deref ex != null) {
+                return -1;
+            }
+            return 1;
+        }
+        if (request != null && deref request.headers_done && !deref client.dispatched && !deref client.closing && !deref client.ending) {
+            (deref host_state.next_connection) = (i + 1) % HTTP_CONNECTION_LIMIT;
+            deref client.dispatched = true;
+            var server: ptr<HttpServer> = deref client.server;
+            var nested: ptr<u8> = null;
+            var req: ptr<u8> = request_object(ctx, request, &nested);
+            if (nested != null) {
+                reject_client(client, 400);
+                continue;
+            }
+            protect(ctx, req);
+            deref client.incoming = req;
+            define(ctx, req, "_read", http_native(ctx, "readHTTP", 10), ex, false);
+            define(ctx, req, "_destroy", http_native(ctx, "destroyHTTP", 8), ex, false);
+            deref client.response = create_stream(ctx, 2, ex);
+            protect(ctx, deref client.response);
+            // Writable finish must not close a keep-alive transport. Explicit
+            // destroy still reaches the native HTTP destroy hook below.
+            var response_state: ptr<u8> = stream_state(ctx, deref client.response, 2, ex);
+            if (response_state != null && deref ex == null) {
+                set_flag(ctx, response_state, "autoDestroy", false, ex);
+            }
+            http_define(ctx, deref client.response, "statusCode", js_number(ctx, 200.0), ex);
+            http_define(ctx, deref client.response, "headersSent", boolean(ctx, false), ex);
+            http_define(ctx, deref client.response, "setHeader", http_native(ctx, "setHeader", 5), ex);
+            install_response_headers(ctx, deref client.response, ex);
+            http_define(ctx, deref client.response, "end", http_native(ctx, "end", 4), ex);
+            http_define(ctx, deref client.response, "write", http_native(ctx, "write", 9), ex);
+            define(ctx, deref client.response, "_write", http_native(ctx, "writeHTTP", 6), ex, false);
+            define(ctx, deref client.response, "_final", http_native(ctx, "finishHTTP", 7), ex, false);
+            define(ctx, deref client.response, "_destroy", http_native(ctx, "destroyHTTP", 8), ex, false);
+            deliver_body(ctx, client, ex);
+            var args: array<ptr<u8>, 2> = [req, deref client.response];
+            if (deref ex == null && !emit_named(ctx, deref server.object, "request", 2, &args[0], ex) && deref ex == null) {
+                var end_args: array<ptr<u8>, 1> = [http_text(ctx, "Not Found")];
+                http_define(ctx, deref client.response, "statusCode", js_number(ctx, 404.0), ex);
+                var end_fn: ptr<u8> = get(ctx, deref client.response, "end", ex);
+                call(ctx, end_fn, deref client.response, 1, &end_args[0], ex);
+            }
+            if (deref ex != null) {
+                return -1;
+            }
+            return 1;
+        }
+    }
+    if (resumed || wrote) {
+        return 1;
+    }
+    return 0;
+}
+
+pub fun install_http(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var host_state: ptr<HttpServerState> = http_server_storage(ctx);
+    (deref host_state.transport_failure) = 0;
+    (deref host_state.next_connection) = 0;
+    if (!allocate_http_state() || !initialize_http_values(ctx, ex)) {
+        return false;
+    }
+    (deref host_state.module_object) = http_object(ctx);
+    protect(ctx, (deref host_state.module_object));
+    var codes: ptr<u8> = http_object(ctx);
+    protect(ctx, codes);
+    var status_names: array<str, 12> = ["200", "201", "204", "301", "302", "304", "400", "401", "403", "404", "405", "500"];
+    var status_texts: array<str, 12> = ["OK", "Created", "No Content", "Moved Permanently", "Found", "Not Modified",
+        "Bad Request", "Unauthorized", "Forbidden", "Not Found", "Method Not Allowed", "Internal Server Error"];
+    for (var i: i64 = 0; i < 12; i++) {
+        http_define(ctx, codes, status_names[i], http_text(ctx, status_texts[i]), ex);
+    }
+    http_define(ctx, deref host_state.module_object, "STATUS_CODES", codes, ex);
+    unprotect(ctx, codes);
+    http_put(ctx, (deref host_state.module_object), "createServer", http_native(ctx, "createServer",
+        0), ex);
+    return deref ex == null;
+}
+
+pub fun http_module() -> ptr<u8> {
+    var host_state: ptr<HttpServerState> = http_server_storage(active_context());
+    return(deref host_state.module_object);
+}
+
+pub fun shutdown_http(ctx: ptr<u8>) -> bool {
+    var http_state_roots: ptr<HttpHostState> = http_state_storage(ctx);
+    var host_state: ptr<HttpServerState> = http_server_storage(ctx);
+    if ((deref http_state_roots.servers) != null) {
+        for (var i: i64 = 0; i < HTTP_SERVER_LIMIT; i++) {
+            close_server((deref http_state_roots.servers) + i);
+        }
+    }
+    if ((deref http_state_roots.connections) != null) {
+        for (var i: i64 = 0; i < HTTP_CONNECTION_LIMIT; i++) {
+            close_client((deref http_state_roots.connections) + i);
+        }
+    }
+    // uv_close callbacks and cancellation completions must precede record release.
+    while (network_active()) {
+        poll_network();
+    }
+    var ignored: ptr<u8> = null;
+    collect_closed(ctx, false, &ignored);
+    if ((deref http_state_roots.servers) != null) {
+        for (var i: i64 = 0; i < HTTP_SERVER_LIMIT; i++) {
+            var server: ptr<HttpServer> = (deref http_state_roots.servers) + i;
+            if (deref server.object != null) {
+                unprotect(ctx, deref server.object);
+            }
+            if (deref server.listen_callback != null) {
+                unprotect(ctx, deref server.listen_callback);
+            }
+            if (deref server.close_callback != null) {
+                unprotect(ctx, deref server.close_callback);
+            }
+        }
+    }
+    if ((deref host_state.module_object) != null) {
+        unprotect(ctx, (deref host_state.module_object));
+        (deref host_state.module_object) = null;
+    }
+    shutdown_http_values(ctx);
+    release_http_state();
+    return shutdown_network();
+}

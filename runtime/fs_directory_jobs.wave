@@ -1,0 +1,156 @@
+// Worker-owned native directory snapshots. JS values are built by the owner only.
+import("./system")::{FileWork, complete_file};
+import("./fs_sync")::{directory_entry};
+import("./values")::{text, fail};
+import("./collections")::{set_at};
+import("./config")::{DIRECTORY_ENTRY_LIMIT, DIRECTORY_BYTES_LIMIT};
+import("std::mem::alloc")::{mem_realloc};
+import("std::mem::layout")::{size_of};
+import("std::mem::ops")::{mem_copy};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+extern(c, "opendir") fun open_directory(path: str) -> ptr<u8>;
+extern(c, "closedir") fun close_directory(directory: ptr<u8>) -> i32;
+extern(c, "jsrt_directory_next") fun next_entry(directory: ptr<u8>, name: ptr<u8>, size: i64) -> i32;
+extern(c, "jsrt_directory_mode") fun entry_mode(directory: ptr<u8>, name: str, mode: ptr<i64>) -> i32;
+extern(c, "__errno_location") fun errno_location() -> ptr<i32>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, values: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+const ALIGNMENT: i64 = 8;
+const INITIAL_CAPACITY: i64 = 4096;
+const IO_FAILURE: i32 = 1;
+const LIMIT_FAILURE: i32 = 2;
+struct Entry {
+    bytes: i64;
+    mode: i64;
+}
+
+fun stride(bytes: i64) -> i64 {
+    return ((size_of<Entry>() as i64 + bytes + 1 + ALIGNMENT - 1) / ALIGNMENT) * ALIGNMENT;
+}
+
+fun reserve(work: ptr<FileWork>, needed: i64) -> bool {
+    if (needed <= deref work.capacity) {
+        return true;
+    }
+    var maximum: i64 = DIRECTORY_BYTES_LIMIT + DIRECTORY_ENTRY_LIMIT * (size_of<Entry>() as i64 + ALIGNMENT);
+    var capacity: i64 = deref work.capacity;
+    if (capacity == 0) {
+        capacity = INITIAL_CAPACITY;
+    }
+    while (capacity < needed && capacity < maximum) {
+        capacity *= 2;
+        if (capacity > maximum) {
+            capacity = maximum;
+        }
+    }
+    if (capacity < needed) {
+        deref work.status = LIMIT_FAILURE;
+        return false;
+    }
+    var bytes: ptr<u8> = mem_realloc(deref work.bytes, deref work.capacity, capacity);
+    if (bytes == null) {
+        deref work.status = IO_FAILURE;
+        deref work.errno = -12;
+        return false;
+    }
+    deref work.bytes = bytes;
+    deref work.capacity = capacity;
+    return true;
+}
+
+pub fun perform_readdir(work: ptr<FileWork>) {
+    deref work.operation = "scandir";
+    var directory: ptr<u8> = open_directory(deref work.path as str);
+    if (directory == null) {
+        deref work.status = IO_FAILURE;
+        deref work.errno = -(deref errno_location() as i64);
+        return;
+    }
+    var name: array<u8, 256>;
+    var names_size: i64 = 0;
+    while (deref work.status == 0) {
+        var status: i32 = next_entry(directory, &name[0], 256);
+        if (status == 0) {
+            break;
+        }
+        if (status < 0) {
+            deref work.status = IO_FAILURE;
+            deref work.errno = -(deref errno_location() as i64);
+            if (deref work.errno == 0) {
+                deref work.errno = -5;
+            }
+            break;
+        }
+        if (mem_eq_cstr(&name[0] as str, ".") || mem_eq_cstr(&name[0] as str, "..")) {
+            continue;
+        }
+        var size: i64 = mem_len_cstr(&name[0] as str);
+        names_size += size;
+        if (deref work.entries >= DIRECTORY_ENTRY_LIMIT || names_size > DIRECTORY_BYTES_LIMIT) {
+            deref work.status = LIMIT_FAILURE;
+            break;
+        }
+        var mode: i64 = 0;
+        if (deref work.with_types) {
+            status = entry_mode(directory, &name[0] as str, &mode);
+            if (status < 0) {
+                deref work.operation = "lstat";
+                deref work.status = IO_FAILURE;
+                deref work.errno = status as i64;
+                break;
+            }
+        }
+        var record_size: i64 = stride(size);
+        if (!reserve(work, deref work.length + record_size)) {
+            break;
+        }
+        var record: ptr<Entry> = (deref work.bytes + deref work.length) as ptr<Entry>;
+        deref record.bytes = size;
+        deref record.mode = mode;
+        mem_copy(record as ptr<u8> + size_of<Entry>() as i64, &name[0], size + 1);
+        deref work.length += record_size;
+        deref work.entries += 1;
+    }
+    if (close_directory(directory) < 0 && deref work.status == 0) {
+        deref work.operation = "closedir";
+        deref work.status = IO_FAILURE;
+        deref work.errno = -(deref errno_location() as i64);
+    }
+}
+
+pub fun complete_readdir(ctx: ptr<u8>, work: ptr<FileWork>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (deref work.status == LIMIT_FAILURE) {
+        fail(ctx, ex, 2, "directory listing exceeds entry or byte limit");
+        return undefined(ctx);
+    }
+    if (deref work.status != 0) {
+        return complete_file(ctx, work, ex);
+    }
+    var result: ptr<u8> = array(ctx, 0, null, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    protect(ctx, result);
+    var parent: ptr<u8> = text(ctx, deref work.path as str);
+    protect(ctx, parent);
+    var offset: i64 = 0;
+    for (var i: i64 = 0; i < deref work.entries && deref ex == null; i++) {
+        var record: ptr<Entry> = (deref work.bytes + offset) as ptr<Entry>;
+        var value: ptr<u8> = text(ctx, (record as ptr<u8> + size_of<Entry>() as i64) as str);
+        if (deref work.with_types) {
+            var name: ptr<u8> = value;
+            protect(ctx, name);
+            value = directory_entry(ctx, name, parent, deref record.mode, ex);
+            unprotect(ctx, name);
+        }
+        if (deref ex == null) {
+            set_at(ctx, result, i, value, ex);
+        }
+        offset += stride(deref record.bytes);
+    }
+    unprotect(ctx, parent);
+    unprotect(ctx, result);
+    return result;
+}

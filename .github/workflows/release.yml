@@ -1,0 +1,86 @@
+name: Runtime and Linux release validation
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: jsrt-release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: [self-hosted, linux, x64, jsrt-wave-jsc]
+    timeout-minutes: 60
+    env:
+      JSRT_JSC_LIBRARY: ${{ vars.JSRT_JSC_LIBRARY }}
+      JSRT_WAVEC: ${{ vars.JSRT_WAVEC || 'wavec' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Validate build, real packages, relocated release and recovery
+        run: ./bootstrap.sh release
+      - name: Independently validate the published runtime
+        run: ./bootstrap.sh test --require-tcp --probe-worker-termination
+      - name: Check bounded Worker lifecycle with Valgrind
+        run: ./bootstrap.sh worker-leaks 256
+      - name: Sign validated archive with configured maintainer key
+        if: vars.JSRT_RELEASE_SIGNING_KEY_PATH != ''
+        env:
+          JSRT_RELEASE_SIGNING_KEY_PATH: ${{ vars.JSRT_RELEASE_SIGNING_KEY_PATH }}
+        run: |
+          for archive in target/dist/*.tar.gz; do
+            ./bootstrap.sh sign-release --archive "$archive" --key "$JSRT_RELEASE_SIGNING_KEY_PATH" --output "$archive.signatures"
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jsrt-linux-x86_64
+          path: target/dist/
+          if-no-files-found: error
+          retention-days: 14
+  linux:
+    needs: release
+    runs-on: [self-hosted, linux, x64, jsrt-wave-jsc]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['26.04', '26.10']
+    env:
+      JSRT_WAVEC: ${{ vars.JSRT_WAVEC || 'wavec' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: jsrt-linux-x86_64
+          path: target/dist
+      - name: Check actual distribution libraries and deployment
+        run: ./bootstrap.sh linux-check --image '${{ matrix.image }}'
+  native-vm:
+    needs: release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: jsrt-linux-x86_64
+          path: release
+      - name: Install distribution runtime libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libcurl4t64 libarchive13t64 libicu78 libstdc++6 libssl3t64 ca-certificates
+      - name: Verify archive before extracting
+        working-directory: release
+        run: sha256sum --check -- *.sha256
+      - name: Extract validated archive
+        working-directory: release
+        run: |
+          set -- *.tar.gz
+          test "$#" -eq 1
+          tar --no-same-owner -xzf "$1"
+      - name: Check deployment on an independent VM kernel
+        working-directory: release
+        run: |
+          chmod u+x jsrt-linux-x86_64/bin/jsrt jsrt-linux-x86_64/bin/jsrt-deploy
+          jsrt-linux-x86_64/bin/jsrt-deploy check --bundle "$PWD/jsrt-linux-x86_64"

@@ -1,0 +1,222 @@
+// Fixed payload allowlist and copied-stage verification precede activation.
+import("./support")::{join, spawn, wait};
+import("./private_files")::{copy_regular};
+import("std::mem::alloc")::{mem_alloc};
+import("std::mem::ops")::{mem_copy, mem_eq};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("std::fs::file")::{create, fs_read_all};
+import("std::sys::fs")::{open, fstat, fsync, Stat, mkdir};
+import("std::io::fd")::{io_close, io_write_all};
+extern(c, "openat") fun open_at(fd: i32, path: str, flags: i32, mode: i32) -> i32;
+extern(c, "fdopendir") fun directory_open(fd: i32) -> ptr<u8>;
+extern(c, "closedir") fun directory_close(directory: ptr<u8>) -> i32;
+extern(c, "jsrt_directory_next") fun directory_next(directory: ptr<u8>, name: ptr<u8>, capacity: i64) -> i32;
+pub const PAYLOAD_COUNT: i64 = 18;
+pub const MARKER: str = "jsrt-release-v1\n";
+const DIRECTORY_FLAGS: i32 = 720896;
+const REGULAR_FLAGS: i32 = 657408;
+pub const PAYLOAD: array<str, 18> = ["bin/jsrt", "bin/jsrt-deploy", "lib/libJavaScriptCore.so.1",
+    "LICENSE", "README.md", "runtime-info.json", "licenses/JavaScriptCore-COPYING.LIB",
+    "licenses/libuv-LICENSE", "licenses/llhttp-LICENSE-MIT", "licenses/wjson-LICENSE",
+    "licenses/libuv-LICENSE-extra", "engine-source/webkitgtk-2.54.1.patch",
+    "engine-source/module-output.patch", "engine-source/synthetic-modules.patch",
+    "engine-source/webkitgtk-2.54.1.sha256", "checks/probe.js", "checks/probe.mjs", "engine-source/BUILD.md"];
+const DIRECTORIES: array<str, 5> = ["bin", "lib", "licenses", "engine-source", "checks"];
+
+pub fun hex_digest(value: ptr<u8>) -> bool {
+    for (var i: i64 = 0; i < 64; i++) {
+        var c: u8 = value[i];
+        if (!(c >= 48 && c <= 57) && !(c >= 97 && c <= 102)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fun capture(arguments: ptr<str>, count: i64, destination: str) -> bool {
+    var fd: i64 = create(destination);
+    if (fd < 0) {
+        return false;
+    }
+    var pid: i64 = spawn(arguments, count, fd, -1);
+    io_close(fd);
+    return wait(pid, 0) == 0;
+}
+
+pub fun digest(path: str, scratch: str) -> ptr<u8> {
+    var command: array<str, 3> = ["/usr/bin/sha256sum", "--", path];
+    var file: str = join(scratch, "digest-output") as str;
+    if (!capture(&command[0], 3, file)) {
+        return null;
+    }
+    var bytes: array<u8, 8192>;
+    var n: i64 = fs_read_all(file, &bytes[0], 8192);
+    if (n < 67 || !hex_digest(&bytes[0]) || bytes[64] != 32 || bytes[65] != 32) {
+        return null;
+    }
+    var result: ptr<u8> = mem_alloc(65);
+    if (result != null) {
+        mem_copy(result, &bytes[0], 64);
+        result[64] = 0;
+    }
+    return result;
+}
+
+pub fun payload_directories(root: str) -> bool {
+    for (var i: i64 = 0; i < 5; i++) {
+        if (mkdir(join(root, DIRECTORIES[i]) as str, 493) < 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fun directory_entries(fd: i32) -> i64 {
+    var scan: i32 = open_at(fd, ".", DIRECTORY_FLAGS, 0);
+    if (scan < 0) {
+        return -1;
+    }
+    var d: ptr<u8> = directory_open(scan);
+    if (d == null) {
+        io_close(scan as i64);
+        return -1;
+    }
+    var count: i64 = 0;
+    var name: array<u8, 256>;
+    while (true) {
+        var status: i32 = directory_next(d, &name[0], 256);
+        if (status <= 0) {
+            if (status < 0) {
+                count = -1;
+            }
+            break;
+        }
+        if (!mem_eq_cstr(&name[0] as str, ".") && !mem_eq_cstr(&name[0] as str, "..")) {
+            count += 1;
+        }
+    }
+    directory_close(d);
+    return count;
+}
+
+fun parent_index(path: str) -> i64 {
+    for (var i: i64 = 0; i < 5; i++) {
+        var n: i64 = mem_len_cstr(DIRECTORIES[i]);
+        if (mem_len_cstr(path) > n && mem_eq(path as ptr<u8>, DIRECTORIES[i] as ptr<u8>, n) && path[n] == 47) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+pub fun payload_shape(root: str) -> bool {
+    var fd: i64 = open(root, DIRECTORY_FLAGS, 0);
+    if (fd < 0) {
+        return false;
+    }
+    var counts: array<i64, 6> = [0, 0, 0, 0, 0, 0];
+    var children: array<i32, 5> = [-1, -1, -1, -1, -1];
+    var ok: bool = true;
+    for (var i: i64 = 0; i < 5; i++) {
+        children[i] = open_at(fd as i32, DIRECTORIES[i], DIRECTORY_FLAGS, 0);
+        ok = children[i] >= 0 && ok;
+    }
+    for (var i: i64 = 0; i <= PAYLOAD_COUNT && ok; i++) {
+        var name: str = "SHA256SUMS";
+        if (i < PAYLOAD_COUNT) {
+            name = PAYLOAD[i];
+        }
+        var group: i64 = parent_index(name);
+        var parent: i32 = fd as i32;
+        var leaf: str = name;
+        if (group >= 0) {
+            parent = children[group];
+            leaf = (name as ptr<u8> + mem_len_cstr(DIRECTORIES[group]) + 1) as str;
+            counts[group] += 1;
+        } else {
+            counts[5] += 1;
+        }
+        var file: i32 = open_at(parent, leaf, REGULAR_FLAGS, 0);
+        var info: Stat;
+        ok = file >= 0 && fstat(file as i64, &info) == 0 && (info.mode & 61440) == 32768 &&
+            info.size >= 0 && info.size <= 536870912 && info.nlink == 1;
+        if (file >= 0) {
+            io_close(file as i64);
+        }
+    }
+    for (var i: i64 = 0; i < 5; i++) {
+        if (children[i] >= 0) {
+            ok = directory_entries(children[i]) == counts[i] && ok;
+            io_close(children[i] as i64);
+        }
+    }
+    ok = directory_entries(fd as i32) == counts[5] + 5 && ok;
+    io_close(fd);
+    return ok;
+}
+
+pub fun write_checksums(root: str, scratch: str) -> bool {
+    var fd: i64 = create(join(root, "SHA256SUMS") as str);
+    if (fd < 0) {
+        return false;
+    }
+    var ok: bool = true;
+    for (var i: i64 = 0; i < PAYLOAD_COUNT && ok; i++) {
+        var hash: ptr<u8> = digest(join(root, PAYLOAD[i]) as str, scratch);
+        ok = hash != null;
+        if (ok) {
+            ok = io_write_all(fd, hash, 64) == 64 && io_write_all(fd, "  " as ptr<u8>, 2) == 2 &&
+                io_write_all(fd, PAYLOAD[i] as ptr<u8>, mem_len_cstr(PAYLOAD[i])) == mem_len_cstr(PAYLOAD[i]) &&
+                io_write_all(fd, "\n" as ptr<u8>, 1) == 1;
+        }
+    }
+    ok = ok && fsync(fd) == 0;
+    io_close(fd);
+    return ok;
+}
+
+pub fun verify_payload(root: str, scratch: str) -> bool {
+    if (!payload_shape(root)) {
+        println("Invalid release file layout, link, or unexpected entry");
+        return false;
+    }
+    var bytes: array<u8, 8192>;
+    var n: i64 = fs_read_all(join(root, "SHA256SUMS") as str, &bytes[0], 8192);
+    var offset: i64 = 0;
+    for (var i: i64 = 0; i < PAYLOAD_COUNT; i++) {
+        var width: i64 = mem_len_cstr(PAYLOAD[i]);
+        if (offset + 67 + width > n || !hex_digest(&bytes[offset]) || bytes[offset + 64] != 32 ||
+            bytes[offset + 65] != 32 || !mem_eq(&bytes[offset + 66], PAYLOAD[i] as ptr<u8>, width) ||
+            bytes[offset + 66 + width] != 10) {
+            println("Invalid release checksum manifest");
+            return false;
+        }
+        var actual: ptr<u8> = digest(join(root, PAYLOAD[i]) as str, scratch);
+        if (actual == null || !mem_eq(&bytes[offset], actual, 64)) {
+            println("Release checksum mismatch: {}", PAYLOAD[i]);
+            return false;
+        }
+        offset += 67 + width;
+    }
+    return offset == n;
+}
+
+pub fun copy_payload(source: str, destination: str) -> bool {
+    if (!payload_directories(destination)) {
+        return false;
+    }
+    for (var i: i64 = 0; i <= PAYLOAD_COUNT; i++) {
+        var name: str = "SHA256SUMS";
+        var mode: i32 = 420;
+        if (i < PAYLOAD_COUNT) {
+            name = PAYLOAD[i];
+        }
+        if (i < 2) {
+            mode = 493;
+        }
+        if (!copy_regular(join(source, name) as str, join(destination, name) as str, mode)) {
+            return false;
+        }
+    }
+    return true;
+}
