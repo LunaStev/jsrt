@@ -220,6 +220,8 @@ extern JSValue jsrt_console_error(const void *, void *, void *, size_t, const JS
 extern JSValue jsrt_set_timeout(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 extern JSValue jsrt_set_interval(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 extern JSValue jsrt_clear_timer(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+extern JSValue jsrt_set_immediate(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+extern JSValue jsrt_timer_method(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 extern JSValue jsrt_queue_microtask(const void *, void *, void *, size_t, const JSValue *,
                                     JSValue *);
 extern JSValue jsrt_run_microtask(const void *, void *, void *, size_t, const JSValue *, JSValue *);
@@ -269,6 +271,10 @@ JSCallback jsrt_timer_callback(int32_t kind) {
         return jsrt_run_microtask;
     case 5:
         return jsrt_unhandled_rejection;
+    case 6:
+        return jsrt_set_immediate;
+    case 7:
+        return jsrt_timer_method;
     default:
         return NULL;
     }
@@ -532,6 +538,10 @@ JSCallback jsrt_os_callback(void) {
 extern JSValue jsrt_util_api(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 JSCallback jsrt_util_callback(void) {
     return jsrt_util_api;
+}
+extern JSValue jsrt_extras_api(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+JSCallback jsrt_extras_callback(void) {
+    return jsrt_extras_api;
 }
 extern JSValue jsrt_assert_api(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 JSCallback jsrt_assert_callback(void) {

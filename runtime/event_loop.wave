@@ -2,7 +2,7 @@
 import("std::time::clock")::{time_now_monotonic_ns};
 import("std::time::sleep")::{time_sleep_ns};
 import("./async_fs")::{async_pending, file_completions_ready, drain_files, wait_for_files};
-import("./timers")::{timers_ready, report_job_failure, next_timer_deadline, run_due_timer};
+import("./timers")::{timers_ready, timers_refed, report_job_failure, next_timer_deadline, run_due_timer};
 import("./network")::{network_active, poll_network, wait_network};
 import("./http_server")::{dispatch_http, http_deadline};
 import("./network_deadlines")::{earliest};
@@ -16,6 +16,16 @@ import("./system")::{system_exit_status};
 import("./process_io")::{poll_process_io, process_io_pending};
 extern(c, "wr_bind_context") fun bind_context(ctx: ptr<u8>);
 extern(c, "wr_checkpoint") fun checkpoint(ctx: ptr<u8>, ex: ptr<ptr<u8>>);
+
+fun http_deadline_pending(context: ptr<u8>) -> bool {
+    return http_deadline() >= 0;
+}
+
+// Work other than timers that must complete before the loop may exit.
+fun other_work_pending(context: ptr<u8>) -> bool {
+    return async_pending(context) > 0 || network_active() || clients_pending() ||
+        children_pending(context) || workers_pending(context) || process_io_pending(context);
+}
 
 pub fun run_event_loop(context: ptr<u8>, exception: ptr<ptr<u8>>) -> bool {
     bind_context(context);
@@ -94,6 +104,11 @@ pub fun run_event_loop(context: ptr<u8>, exception: ptr<ptr<u8>>) -> bool {
                 return false;
             }
             deadline = earliest(deadline, child_now + 10000000);
+        }
+        // Unref'd timers still fire while other work keeps the loop alive, but
+        // they alone do not: with nothing else pending the loop may finish.
+        if (deadline >= 0 && !timers_refed(context) && !http_deadline_pending(context) && !other_work_pending(context)) {
+            deadline = -1;
         }
         if (deadline < 0) {
             if (dispatched > 0) {

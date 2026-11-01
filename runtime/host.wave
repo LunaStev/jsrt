@@ -26,6 +26,8 @@ import("./abort")::{install_abort, shutdown_abort};
 import("./path")::{install_path, shutdown_path};
 import("./os")::{install_os, shutdown_os};
 import("./util")::{install_util, shutdown_util};
+import("./inspect")::{install_inspect, shutdown_inspect};
+import("./process_extras")::{install_process_extras, shutdown_process_extras};
 import("./assert")::{install_assert, shutdown_assert};
 import("./crypto")::{install_crypto, shutdown_crypto};
 import("./url")::{install_url, shutdown_url};
@@ -87,7 +89,7 @@ pub fun install_host(context: ptr<u8>, source_index: i32, eval_mode: bool, path:
         !install_web_objects(context, exception) || !install_client(context, http_module(), exception)) {
         write_text(2, "cannot install HTTP client APIs\n");
         return false;
-    } else if ( !install_path(context, exception) || !install_os(context, exception) || !install_util(context,
+    } else if ( !install_path(context, exception) || !install_os(context, exception) || !install_inspect(context, exception) || !install_util(context,
         exception) || !install_assert(context, exception) || !install_crypto(context, exception) || !install_addons(context) || !install_workers(context, exception) || !install_modules(context,
         path, eval_mode, exception)) {
         write_text(2, "cannot install CommonJS module loader\n");
@@ -95,12 +97,14 @@ pub fun install_host(context: ptr<u8>, source_index: i32, eval_mode: bool, path:
     }
     install_next_ticks(context, exception);
     install_process_events(context, get(context, process_global(context), "process", exception), exception);
-    return deref exception == null && install_clone(context, exception) && install_esm(context, exception);
+    return deref exception == null && install_clone(context, exception) && install_esm(context, exception) &&
+        install_process_extras(context, exception);
 }
 
 pub fun shutdown_host(context: ptr<u8>) -> bool {
     bind_context(context);
     var workers_ok: bool = shutdown_workers(context);
+    shutdown_process_extras(context);
     shutdown_esm(context);
     shutdown_clone(context);
     shutdown_next_ticks(context);
@@ -129,6 +133,7 @@ pub fun shutdown_host(context: ptr<u8>) -> bool {
     shutdown_path(context);
     shutdown_os(context);
     shutdown_util(context);
+    shutdown_inspect(context);
     shutdown_assert(context);
     shutdown_body_collect(context);
     shutdown_web_objects(context);

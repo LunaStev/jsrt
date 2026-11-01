@@ -318,7 +318,7 @@ pub fun json_tests() {
 pub fun core_tests() {
     var suite: ptr<TestState> = test_state();
     test("real JavaScript classes, BigInt and regex", "class Counter { #value=40; next(){return ++this.#value;} } const c=new Counter(); console.log(JSON.stringify([c.next(),c.next()]), 2n**64n, /(?<word>hello)/u.exec('hello').groups.word); console.log(new Map([['a',7]]).get('a'), typeof Promise, typeof WeakRef);",
-        "[41,42] 18446744073709551616 hello\n7 function function\n", 0, "");
+        "[41,42] 18446744073709551616n hello\n7 function function\n", 0, "");
     test("Unicode and primitive console values", "console.log('한글 🌊', true, null, undefined); console.log();",
         "한글 🌊 true null undefined\n\n", 0, "");
     var nul_command: array<str, 3> = [(deref suite.binary) as str, "-e", "console.log('A\\0B');"];
@@ -332,8 +332,10 @@ pub fun core_tests() {
     check("exception stack contains function and source", contains((deref suite.errors), (deref suite.error_count), "fail") && contains((deref suite.errors),
         (deref suite.error_count), "<eval>"));
     test("primitive exception", "throw 'plain failure';", "", 1, "plain failure");
-    test("console conversion exception", "console.log({toString(){throw new Error('conversion failure');}});",
+    test("console conversion exception", "console.log('%s', {toString(){throw new Error('conversion failure');}});",
         "", 1, "conversion failure");
+    test("console inspection never calls user toString", "console.log({toString(){throw new Error('must not run');}});",
+        "{ toString: [Function: toString] }\n", 0, "");
     test("stack getter preserves original error", "throw {toString(){return 'original failure';},get stack(){throw new Error('getter failed');}};",
         "", 1, "original failure");
 

@@ -84,6 +84,9 @@ pub fun stream_tests() {
     var correctness_command: array<str, 3> = [(deref suite.binary) as str, "run", "tests/web_regressions.js"];
     expect("Web API correctness regressions", &correctness_command[0], 3, null, -1, 0, "");
     check("Web correctness regressions completed", contains((deref suite.output), (deref suite.output_count), "Web correctness checks passed"));
+    var core_command: array<str, 3> = [(deref suite.binary) as str, "run", "tests/core_globals.js"];
+    expect("Core inspect, format, timer and process regressions", &core_command[0], 3, null, -1, 0, "");
+    check("Core global regressions completed", contains((deref suite.output), (deref suite.output_count), "Core global checks passed"));
     test("Request fetch preserves TLS refusal and first throwing option getter", "const q=new Request('https://example.test/',{method:'POST',body:'x'}),r=new Request('https://example.test/'),reason={};let later=false;Promise.all([fetch(q,{rejectUnauthorized:false}).catch(e=>console.log(e.message.includes('cannot be disabled'))),fetch(r,{get method(){throw reason},get headers(){later=true}}).catch(e=>console.log(e===reason,later))]);",
         "true\ntrue false\n", 0, "");
     test("FormData and Blob uploads preserve pre-aborted fetch reasons", "const c=new AbortController,reason={};c.abort(reason);const f=new FormData;f.append('name','value');Promise.all([f,new Blob(['x'])].map(body=>fetch('https://example.test/',{method:'POST',body,signal:c.signal}).catch(e=>console.log(e===reason))));",
@@ -400,7 +403,7 @@ pub fun binary_io_tests() {
     test("Buffer floats known IEEE bytes NaN infinity and negative zero", "const b=Buffer.from('0000803f000000000000f03f','hex');console.log(b.readFloatLE(),b.readDoubleLE(4));const a=Buffer.alloc(16);a.writeFloatBE(-0);a.writeDoubleBE(Infinity,4);console.log(a.toString('hex'));a.writeDoubleLE(NaN);console.log(Number.isNaN(a.readDoubleLE()),Object.is(b.writeFloatLE(-0),4),Object.is(b.readFloatLE(),-0));",
         "1 1\n800000007ff000000000000000000000\ntrue true true\n", 0, "");
     test("Buffer BigInt known bytes and unsigned aliases", "const b=Buffer.alloc(16);console.log(b.writeBigInt64LE(-9223372036854775808n),b.writeBigUint64BE(18446744073709551615n,8));console.log(b.toString('hex'));console.log(b.readBigInt64LE(),b.readBigUInt64BE(8),b.readBigUint64BE===b.readBigUInt64BE);",
-        "8 16\n0000000000000080ffffffffffffffff\n-9223372036854775808 18446744073709551615 true\n", 0,
+        "8 16\n0000000000000080ffffffffffffffff\n-9223372036854775808n 18446744073709551615n true\n", 0,
         "");
     test("Buffer BigInt validates exact range without truncating or mutating", "const b=Buffer.alloc(8,42);let n=0;for(const [m,v] of [['writeBigUInt64LE',-1n],['writeBigUInt64LE',18446744073709551616n],['writeBigInt64BE',9223372036854775808n],['writeBigInt64LE',-9223372036854775809n]])try{b[m](v)}catch(e){if(e instanceof RangeError)n++}for(const v of [1,'1',Object(1n)])try{b.writeBigInt64LE(v)}catch(e){if(e instanceof TypeError)n++}console.log(n,b.toString('hex'));",
         "7 2a2a2a2a2a2a2a2a\n", 0, "");

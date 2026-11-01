@@ -8,24 +8,20 @@ extern(c, "wr_to_string") fun wr_to_string(context: ptr<u8>, value: ptr<u8>, exc
 extern(c, "wr_string_utf8_capacity") fun wr_string_utf8_capacity(text: ptr<u8>) -> i64;
 extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
 extern(c, "wr_string_copy_utf8") fun wr_string_copy_utf8(text: ptr<u8>, output: ptr<u8>, capacity: i64) -> i64;
+extern(c, "wr_string_utf16") fun wr_string_utf16(text: ptr<u16>, length: i64) -> ptr<u8>;
 
 pub fun write_text(fd: i64, text: str) {
     io_write_all(fd, text as ptr<u8>, mem_len_cstr(text));
 }
 
-pub fun print_value(context: ptr<u8>, value: ptr<u8>, fd: i64, exception: ptr<ptr<u8>>) -> bool {
-    var text: ptr<u8> = wr_to_string(context, value, exception);
-    if (text == null) {
-        return false;
-    }
+// Writes an engine string handle as UTF-8. The caller keeps ownership.
+fun write_engine_string(text: ptr<u8>, fd: i64) -> bool {
     var capacity: i64 = wr_string_utf8_capacity(text);
     if (capacity <= 0 || capacity > OUTPUT_LIMIT) {
-        wr_string_release(text);
         return false;
     }
     var buffer: ptr<u8> = mem_alloc(capacity);
     if (buffer == null) {
-        wr_string_release(text);
         return false;
     }
     var written: i64 = wr_string_copy_utf8(text, buffer, capacity);
@@ -34,6 +30,31 @@ pub fun print_value(context: ptr<u8>, value: ptr<u8>, fd: i64, exception: ptr<pt
         ok = io_write_all(fd, buffer, written - 1) == written - 1;
     }
     mem_free(buffer, capacity);
+    return ok;
+}
+
+pub fun print_value(context: ptr<u8>, value: ptr<u8>, fd: i64, exception: ptr<ptr<u8>>) -> bool {
+    var text: ptr<u8> = wr_to_string(context, value, exception);
+    if (text == null) {
+        return false;
+    }
+    var ok: bool = write_engine_string(text, fd);
+    wr_string_release(text);
+    return ok;
+}
+
+// Writes UTF-16 units produced by the inspector. Lone surrogates become U+FFFD.
+pub fun write_units(fd: i64, units: ptr<u16>, length: i64) -> bool {
+    var empty: array<u16, 1> = [0];
+    if (units == null) {
+        units = &empty[0];
+        length = 0;
+    }
+    var text: ptr<u8> = wr_string_utf16(units, length);
+    if (text == null) {
+        return false;
+    }
+    var ok: bool = write_engine_string(text, fd);
     wr_string_release(text);
     return ok;
 }

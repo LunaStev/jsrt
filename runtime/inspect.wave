@@ -1,0 +1,2353 @@
+// Node-style value inspection shared by util.inspect, util.format and console.
+// Properties are read through captured engine intrinsics. Accessors are
+// reported as [Getter]/[Setter] and never invoked. Only documented user hooks
+// run: [util.inspect.custom], Symbol.toStringTag and constructor names.
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::mem::cstr")::{mem_len_cstr};
+import("std::math::float")::{float_to_bits_f64};
+import("./context_state")::{allocate_context_slot, context_slot, release_context_slot, INSPECT_SLOT};
+import("./config")::{INSPECT_OUTPUT_LIMIT, INSPECT_NESTING_LIMIT};
+import("./values")::{get, fail, coerce_number};
+
+extern(c, "wr_type") fun wr_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun wr_callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_is_array") fun wr_is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_equal") fun wr_equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_to_boolean") fun wr_to_boolean(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_to_number") fun wr_to_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_to_string") fun wr_to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_number") fun wr_number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_undefined") fun wr_undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun wr_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_boolean") fun wr_boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_object") fun wr_object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun wr_set_prototype(ctx: ptr<u8>, object: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_get_prototype") fun wr_get_prototype(ctx: ptr<u8>, object: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_get_index") fun wr_get_index(ctx: ptr<u8>, obj: ptr<u8>, index: u32, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_call") fun wr_call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun wr_protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_utf16") fun wr_string_utf16(text: ptr<u16>, length: i64) -> ptr<u8>;
+extern(c, "wr_string_value") fun wr_string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_characters") fun wr_string_characters(text: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_length") fun wr_string_length(text: ptr<u8>) -> i64;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_context_global") fun wr_context_global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_typed_type") fun wr_typed_type(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i32;
+extern(c, "wr_typed_length") fun wr_typed_length(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64;
+extern(c, "wr_typed_offset") fun wr_typed_offset(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64;
+extern(c, "wr_typed_bytes") fun wr_typed_bytes(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_array_buffer_length") fun wr_array_buffer_length(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64;
+extern(c, "wr_array_buffer_bytes") fun wr_array_buffer_bytes(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+
+// JSValueGetType results.
+const JS_UNDEFINED: i32 = 0;
+const JS_NULL: i32 = 1;
+const JS_BOOLEAN: i32 = 2;
+const JS_NUMBER: i32 = 3;
+const JS_STRING: i32 = 4;
+const JS_OBJECT: i32 = 5;
+const JS_SYMBOL: i32 = 6;
+const JS_BIGINT: i32 = 7;
+
+// JSTypedArrayType results used by the formatter.
+const TYPED_UINT8: i32 = 3;
+const TYPED_FLOAT64: i32 = 8;
+const TYPED_ARRAY_BUFFER: i32 = 9;
+const TYPED_NONE: i32 = 10;
+const TYPED_BIGINT64: i32 = 11;
+const TYPED_BIGUINT64: i32 = 12;
+
+// Captured intrinsic slots. User changes to globals after startup do not
+// affect inspection.
+const I_OWN_KEYS: i64 = 0;
+const I_DESCRIPTOR: i64 = 1;
+const I_REFLECT_GET: i64 = 2;
+const I_OBJECT_TO_STRING: i64 = 3;
+const I_FUNCTION_TO_STRING: i64 = 4;
+const I_MAP_ENTRIES: i64 = 5;
+const I_MAP_NEXT: i64 = 6;
+const I_SET_VALUES: i64 = 7;
+const I_SET_NEXT: i64 = 8;
+const I_MAP_SIZE: i64 = 9;
+const I_SET_SIZE: i64 = 10;
+const I_DATE_TIME: i64 = 11;
+const I_DATE_ISO: i64 = 12;
+const I_DATE_STRING: i64 = 13;
+const I_REGEXP_STRING: i64 = 14;
+const I_REGEXP_SOURCE: i64 = 15;
+const I_ERROR_PROTOTYPE: i64 = 16;
+const I_SYMBOL_STRING: i64 = 17;
+const I_SYMBOL_VALUE: i64 = 18;
+const I_NUMBER_VALUE: i64 = 19;
+const I_STRING_VALUE: i64 = 20;
+const I_BOOLEAN_VALUE: i64 = 21;
+const I_BIGINT_VALUE: i64 = 22;
+const I_BUFFER_PROTOTYPE: i64 = 23;
+const I_TAG_SYMBOL: i64 = 24;
+const I_CUSTOM_SYMBOL: i64 = 25;
+const I_WEAKMAP_HAS: i64 = 26;
+const I_WEAKSET_HAS: i64 = 27;
+const I_JSON_STRINGIFY: i64 = 28;
+const I_PARSE_INT: i64 = 29;
+const I_PARSE_FLOAT: i64 = 30;
+const I_STRING: i64 = 31;
+const I_INSPECT: i64 = 32;
+const I_FUNCTION_PROTOTYPE: i64 = 33;
+const I_GET_PROTOTYPE: i64 = 34;
+const INTRINSIC_COUNT: i64 = 35;
+
+// Node defaults for util.inspect.
+const DEFAULT_DEPTH: i64 = 2;
+const UNLIMITED_DEPTH: i64 = 1099511627776;
+const DEFAULT_BREAK_LENGTH: i64 = 80;
+const DEFAULT_ARRAY_LIMIT: i64 = 100;
+const DEFAULT_STRING_LIMIT: i64 = 10000;
+const COMPACT_LEVELS: i64 = 3;
+const MIN_LINE_WIDTH: i64 = 16;
+const BUFFER_INSPECT_BYTES: i64 = 50;
+const GROUP_MINIMUM_ENTRIES: i64 = 6;
+const GROUP_COLUMN_LIMIT: i64 = 15;
+const ARRAY_INDEX_LIMIT: f64 = 4294967295.0;
+
+// Property formatting modes from Node's formatProperty.
+const PROPERTY_OBJECT: i32 = 0;
+const PROPERTY_ARRAY: i32 = 1;
+const PROPERTY_ARRAY_EXTRA: i32 = 2;
+
+struct InspectState {
+    values: array<ptr<u8>, 35>;
+}
+
+pub struct Text {
+    data: ptr<u16>;
+    length: i64;
+    capacity: i64;
+}
+
+struct Entries {
+    items: ptr<ptr<Text>>;
+    count: i64;
+    capacity: i64;
+}
+
+struct Seen {
+    value: ptr<u8>;
+    reference: i64;
+}
+
+pub struct Inspector {
+    ctx: ptr<u8>;
+    ex: ptr<ptr<u8>>;
+    depth: i64;
+    break_length: i64;
+    max_array: i64;
+    max_string: i64;
+    indentation: i64;
+    current_depth: i64;
+    circular: i64;
+    seen: ptr<Seen>;
+    seen_count: i64;
+    overflow: bool;
+    options: ptr<u8>;
+}
+
+fun state(ctx: ptr<u8>) -> ptr<InspectState> {
+    return context_slot(ctx, INSPECT_SLOT) as ptr<InspectState>;
+}
+
+fun intrinsic(ctx: ptr<u8>, index: i64) -> ptr<u8> {
+    var s: ptr<InspectState> = state(ctx);
+    if (s == null) {
+        return null;
+    }
+    return (deref s.values)[index];
+}
+
+
+// Prototype lookup goes through Reflect.getPrototypeOf so Proxy objects report
+// their target's prototype; the raw C API returns null for them.
+fun prototype_of(ins: ptr<Inspector>, value: ptr<u8>) -> ptr<u8> {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var args: array<ptr<u8>, 1> = [value];
+    var ignored: ptr<u8> = null;
+    var result: ptr<u8> = wr_call(ctx, intrinsic(ctx, I_GET_PROTOTYPE), null, 1, &args[0], &ignored);
+    if (ignored != null) {
+        if (deref deref ins.ex == null) {
+            deref deref ins.ex = ignored;
+        }
+        return null;
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// UTF-16 text buffers
+
+fun text_new(ins: ptr<Inspector>) -> ptr<Text> {
+    var t: ptr<Text> = mem_alloc_zeroed(size_of<Text>() as i64) as ptr<Text>;
+    if (t == null) {
+        deref ins.overflow = true;
+    }
+    return t;
+}
+
+fun text_free(t: ptr<Text>) {
+    if (t == null) {
+        return;
+    }
+    if (deref t.data != null) {
+        mem_free(deref t.data as ptr<u8>, deref t.capacity * 2);
+    }
+    mem_free(t as ptr<u8>, size_of<Text>() as i64);
+}
+
+fun text_reserve(ins: ptr<Inspector>, t: ptr<Text>, extra: i64) -> bool {
+    if (deref ins.overflow || t == null) {
+        return false;
+    }
+    var needed: i64 = deref t.length + extra;
+    if (needed > INSPECT_OUTPUT_LIMIT) {
+        deref ins.overflow = true;
+        return false;
+    }
+    if (needed <= deref t.capacity) {
+        return true;
+    }
+    var next: i64 = deref t.capacity * 2;
+    if (next < 64) {
+        next = 64;
+    }
+    while (next < needed) {
+        next = next * 2;
+    }
+    if (next > INSPECT_OUTPUT_LIMIT) {
+        next = INSPECT_OUTPUT_LIMIT;
+    }
+    var data: ptr<u16> = mem_alloc(next * 2) as ptr<u16>;
+    if (data == null) {
+        deref ins.overflow = true;
+        return false;
+    }
+    if (deref t.data != null) {
+        for (var i: i64 = 0; i < deref t.length; i++) {
+            data[i] = (deref t.data)[i];
+        }
+        mem_free(deref t.data as ptr<u8>, deref t.capacity * 2);
+    }
+    deref t.data = data;
+    deref t.capacity = next;
+    return true;
+}
+
+fun text_unit(ins: ptr<Inspector>, t: ptr<Text>, unit: u16) {
+    if (!text_reserve(ins, t, 1)) {
+        return;
+    }
+    (deref t.data)[deref t.length] = unit;
+    deref t.length = deref t.length + 1;
+}
+
+fun text_ascii(ins: ptr<Inspector>, t: ptr<Text>, value: str) {
+    var length: i64 = mem_len_cstr(value);
+    if (!text_reserve(ins, t, length)) {
+        return;
+    }
+    for (var i: i64 = 0; i < length; i++) {
+        (deref t.data)[deref t.length + i] = value[i] as u16;
+    }
+    deref t.length = deref t.length + length;
+}
+
+fun text_units(ins: ptr<Inspector>, t: ptr<Text>, units: ptr<u16>, length: i64) {
+    if (length <= 0 || !text_reserve(ins, t, length)) {
+        return;
+    }
+    for (var i: i64 = 0; i < length; i++) {
+        (deref t.data)[deref t.length + i] = units[i];
+    }
+    deref t.length = deref t.length + length;
+}
+
+fun text_append(ins: ptr<Inspector>, t: ptr<Text>, other: ptr<Text>) {
+    if (other == null) {
+        return;
+    }
+    text_units(ins, t, deref other.data, deref other.length);
+}
+
+fun text_spaces(ins: ptr<Inspector>, t: ptr<Text>, count: i64) {
+    for (var i: i64 = 0; i < count; i++) {
+        text_unit(ins, t, 32);
+    }
+}
+
+fun text_integer(ins: ptr<Inspector>, t: ptr<Text>, value: i64) {
+    var digits: array<u8, 24>;
+    var used: i64 = 0;
+    var n: i64 = value;
+    if (n < 0) {
+        text_unit(ins, t, 45);
+        n = 0 - n;
+    }
+    if (n == 0) {
+        text_unit(ins, t, 48);
+        return;
+    }
+    while (n > 0 && used < 24) {
+        digits[used] = (48 + n % 10) as u8;
+        n = n / 10;
+        used += 1;
+    }
+    while (used > 0) {
+        used -= 1;
+        text_unit(ins, t, digits[used] as u16);
+    }
+}
+
+fun text_contains(t: ptr<Text>, unit: u16) -> bool {
+    if (t == null) {
+        return false;
+    }
+    for (var i: i64 = 0; i < deref t.length; i++) {
+        if ((deref t.data)[i] == unit) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fun text_equals_ascii(t: ptr<Text>, value: str) -> bool {
+    var length: i64 = mem_len_cstr(value);
+    if (t == null || deref t.length != length) {
+        return false;
+    }
+    for (var i: i64 = 0; i < length; i++) {
+        if ((deref t.data)[i] != value[i] as u16) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fun text_equals(a: ptr<Text>, b: ptr<Text>) -> bool {
+    if (deref a.length != deref b.length) {
+        return false;
+    }
+    for (var i: i64 = 0; i < deref a.length; i++) {
+        if ((deref a.data)[i] != (deref b.data)[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Appends text and indents each following line, as Node does for nested hooks.
+fun text_indented(ins: ptr<Inspector>, t: ptr<Text>, units: ptr<u16>, length: i64) {
+    for (var i: i64 = 0; i < length; i++) {
+        text_unit(ins, t, units[i]);
+        if (units[i] == 10) {
+            text_spaces(ins, t, deref ins.indentation);
+        }
+    }
+}
+
+pub fun text_to_value(ctx: ptr<u8>, t: ptr<Text>) -> ptr<u8> {
+    var empty: array<u16, 1> = [0];
+    var units: ptr<u16> = &empty[0];
+    var length: i64 = 0;
+    if (t != null && deref t.data != null) {
+        units = deref t.data;
+        length = deref t.length;
+    }
+    var js: ptr<u8> = wr_string_utf16(units, length);
+    var result: ptr<u8> = wr_string_value(ctx, js);
+    wr_string_release(js);
+    return result;
+}
+
+// Appends the engine's ToString result. Exceptions remain in ins.ex.
+fun text_js(ins: ptr<Inspector>, t: ptr<Text>, value: ptr<u8>) {
+    if (deref deref ins.ex != null) {
+        return;
+    }
+    var js: ptr<u8> = wr_to_string(deref ins.ctx, value, deref ins.ex);
+    if (js == null) {
+        return;
+    }
+    text_units(ins, t, wr_string_characters(js), wr_string_length(js));
+    wr_string_release(js);
+}
+
+// ---------------------------------------------------------------------------
+// Entry lists
+
+fun entries_push(ins: ptr<Inspector>, list: ptr<Entries>, item: ptr<Text>) {
+    if (item == null) {
+        return;
+    }
+    if (deref list.count == deref list.capacity) {
+        var next: i64 = deref list.capacity * 2;
+        if (next < 8) {
+            next = 8;
+        }
+        var items: ptr<ptr<Text>> = mem_alloc(next * 8) as ptr<ptr<Text>>;
+        if (items == null) {
+            deref ins.overflow = true;
+            text_free(item);
+            return;
+        }
+        for (var i: i64 = 0; i < deref list.count; i++) {
+            items[i] = (deref list.items)[i];
+        }
+        if (deref list.items != null) {
+            mem_free(deref list.items as ptr<u8>, deref list.capacity * 8);
+        }
+        deref list.items = items;
+        deref list.capacity = next;
+    }
+    (deref list.items)[deref list.count] = item;
+    deref list.count = deref list.count + 1;
+}
+
+fun entries_free(list: ptr<Entries>) {
+    for (var i: i64 = 0; i < deref list.count; i++) {
+        text_free((deref list.items)[i]);
+    }
+    if (deref list.items != null) {
+        mem_free(deref list.items as ptr<u8>, deref list.capacity * 8);
+    }
+    deref list.items = null;
+    deref list.count = 0;
+    deref list.capacity = 0;
+}
+
+fun push_ascii(ins: ptr<Inspector>, list: ptr<Entries>, value: str) {
+    var item: ptr<Text> = text_new(ins);
+    text_ascii(ins, item, value);
+    entries_push(ins, list, item);
+}
+
+fun push_remaining(ins: ptr<Inspector>, list: ptr<Entries>, remaining: i64, noun: str) {
+    var item: ptr<Text> = text_new(ins);
+    text_ascii(ins, item, "... ");
+    text_integer(ins, item, remaining);
+    text_ascii(ins, item, " more ");
+    text_ascii(ins, item, noun);
+    if (remaining > 1) {
+        text_unit(ins, item, 115);
+    }
+    entries_push(ins, list, item);
+}
+
+fun push_empty_items(ins: ptr<Inspector>, list: ptr<Entries>, count: i64) {
+    var item: ptr<Text> = text_new(ins);
+    text_unit(ins, item, 60);
+    text_integer(ins, item, count);
+    text_ascii(ins, item, " empty item");
+    if (count > 1) {
+        text_unit(ins, item, 115);
+    }
+    text_unit(ins, item, 62);
+    entries_push(ins, list, item);
+}
+
+// ---------------------------------------------------------------------------
+// Engine helpers
+
+fun failed(ins: ptr<Inspector>) -> bool {
+    return deref deref ins.ex != null || deref ins.overflow;
+}
+
+fun call0(ins: ptr<Inspector>, fn: ptr<u8>, receiver: ptr<u8>) -> ptr<u8> {
+    if (failed(ins) || fn == null) {
+        return wr_undefined(deref ins.ctx);
+    }
+    var result: ptr<u8> = wr_call(deref ins.ctx, fn, receiver, 0, null, deref ins.ex);
+    if (result == null) {
+        return wr_undefined(deref ins.ctx);
+    }
+    return result;
+}
+
+fun call2(ins: ptr<Inspector>, fn: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> ptr<u8> {
+    if (failed(ins) || fn == null) {
+        return wr_undefined(deref ins.ctx);
+    }
+    var args: array<ptr<u8>, 2> = [a, b];
+    var result: ptr<u8> = wr_call(deref ins.ctx, fn, null, 2, &args[0], deref ins.ex);
+    if (result == null) {
+        return wr_undefined(deref ins.ctx);
+    }
+    return result;
+}
+
+// Brand probe: a captured intrinsic accepts only its own receiver type. The
+// probe's TypeError is deliberately discarded.
+fun probe(ins: ptr<Inspector>, index: i64, value: ptr<u8>, result: ptr<ptr<u8>>) -> bool {
+    var fn: ptr<u8> = intrinsic(deref ins.ctx, index);
+    if (fn == null) {
+        return false;
+    }
+    var ignored: ptr<u8> = null;
+    var output: ptr<u8> = wr_call(deref ins.ctx, fn, value, 0, null, &ignored);
+    if (ignored != null || output == null) {
+        return false;
+    }
+    if (result != null) {
+        deref result = output;
+    }
+    return true;
+}
+
+fun descriptor(ins: ptr<Inspector>, object: ptr<u8>, key: ptr<u8>) -> ptr<u8> {
+    return call2(ins, intrinsic(deref ins.ctx, I_DESCRIPTOR), object, key);
+}
+
+fun reflect_get(ins: ptr<Inspector>, object: ptr<u8>, key: ptr<u8>) -> ptr<u8> {
+    return call2(ins, intrinsic(deref ins.ctx, I_REFLECT_GET), object, key);
+}
+
+fun is_undefined(ins: ptr<Inspector>, value: ptr<u8>) -> bool {
+    return value == null || wr_type(deref ins.ctx, value) == JS_UNDEFINED;
+}
+
+fun ascii_value(ins: ptr<Inspector>, value: str) -> ptr<u8> {
+    var js: ptr<u8> = wr_string_utf8(value);
+    var result: ptr<u8> = wr_string_value(deref ins.ctx, js);
+    wr_string_release(js);
+    return result;
+}
+
+// Returns true when the prototype chain contains `target` within a bound.
+fun chain_contains(ins: ptr<Inspector>, value: ptr<u8>, target: ptr<u8>) -> bool {
+    var ctx: ptr<u8> = deref ins.ctx;
+    if (target == null || wr_type(ctx, target) != JS_OBJECT) {
+        return false;
+    }
+    var current: ptr<u8> = prototype_of(ins, value);
+    for (var i: i64 = 0; i < 256; i++) {
+        if (current == null || wr_type(ctx, current) != JS_OBJECT) {
+            return false;
+        }
+        if (wr_equal(ctx, current, target)) {
+            return true;
+        }
+        current = prototype_of(ins, current);
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Primitive formatting
+
+fun format_number(ins: ptr<Inspector>, dest: ptr<Text>, value: ptr<u8>) {
+    var number: f64 = wr_to_number(deref ins.ctx, value, deref ins.ex);
+    if (number == 0.0 && (float_to_bits_f64(number) >> 63) == 1) {
+        text_ascii(ins, dest, "-0");
+        return;
+    }
+    text_js(ins, dest, value);
+}
+
+fun format_bigint(ins: ptr<Inspector>, dest: ptr<Text>, value: ptr<u8>) {
+    text_js(ins, dest, value);
+    text_unit(ins, dest, 110);
+}
+
+fun format_symbol(ins: ptr<Inspector>, dest: ptr<Text>, value: ptr<u8>) {
+    var result: ptr<u8> = call0(ins, intrinsic(deref ins.ctx, I_SYMBOL_STRING), value);
+    if (!failed(ins)) {
+        text_js(ins, dest, result);
+    }
+}
+
+fun hex_unit(value: i64) -> u16 {
+    if (value < 10) {
+        return (48 + value) as u16;
+    }
+    return (55 + value) as u16;
+}
+
+fun lower_hex_unit(value: i64) -> u16 {
+    if (value < 10) {
+        return (48 + value) as u16;
+    }
+    return (87 + value) as u16;
+}
+
+fun is_high_surrogate(unit: u16) -> bool {
+    return unit >= 55296 && unit <= 56319;
+}
+
+fun is_low_surrogate(unit: u16) -> bool {
+    return unit >= 56320 && unit <= 57343;
+}
+
+// Node's strEscape: choose ', " or ` and escape control and lone surrogate units.
+fun escape_units(ins: ptr<Inspector>, dest: ptr<Text>, units: ptr<u16>, length: i64) {
+    var has_single: bool = false;
+    var has_double: bool = false;
+    var has_backtick: bool = false;
+    for (var i: i64 = 0; i < length; i++) {
+        if (units[i] == 39) {
+            has_single = true;
+        } else if (units[i] == 34) {
+            has_double = true;
+        } else if (units[i] == 96) {
+            has_backtick = true;
+        } else if (units[i] == 36 && i + 1 < length && units[i + 1] == 123) {
+            has_backtick = true;
+        }
+    }
+    var quote: u16 = 39;
+    if (has_single) {
+        if (!has_double) {
+            quote = 34;
+        } else if (!has_backtick) {
+            quote = 96;
+        }
+    }
+    text_unit(ins, dest, quote);
+    for (var i: i64 = 0; i < length; i++) {
+        var unit: u16 = units[i];
+        if (unit == 39 && quote == 39) {
+            text_ascii(ins, dest, "\\'");
+        } else if (unit == 92) {
+            text_ascii(ins, dest, "\\\\");
+        } else if (unit == 8) {
+            text_ascii(ins, dest, "\\b");
+        } else if (unit == 9) {
+            text_ascii(ins, dest, "\\t");
+        } else if (unit == 10) {
+            text_ascii(ins, dest, "\\n");
+        } else if (unit == 12) {
+            text_ascii(ins, dest, "\\f");
+        } else if (unit == 13) {
+            text_ascii(ins, dest, "\\r");
+        } else if (unit < 32 || (unit >= 127 && unit <= 159)) {
+            text_ascii(ins, dest, "\\x");
+            text_unit(ins, dest, hex_unit((unit / 16) as i64));
+            text_unit(ins, dest, hex_unit((unit % 16) as i64));
+        } else if (is_high_surrogate(unit) && (i + 1 >= length || !is_low_surrogate(units[i + 1]))) {
+            escape_surrogate(ins, dest, unit);
+        } else if (is_low_surrogate(unit) && (i == 0 || !is_high_surrogate(units[i - 1]))) {
+            escape_surrogate(ins, dest, unit);
+        } else {
+            text_unit(ins, dest, unit);
+        }
+    }
+    text_unit(ins, dest, quote);
+}
+
+fun escape_surrogate(ins: ptr<Inspector>, dest: ptr<Text>, unit: u16) {
+    text_ascii(ins, dest, "\\u");
+    var value: i64 = unit as i64;
+    text_unit(ins, dest, lower_hex_unit((value / 4096) % 16));
+    text_unit(ins, dest, lower_hex_unit((value / 256) % 16));
+    text_unit(ins, dest, lower_hex_unit((value / 16) % 16));
+    text_unit(ins, dest, lower_hex_unit(value % 16));
+}
+
+fun format_string(ins: ptr<Inspector>, dest: ptr<Text>, value: ptr<u8>) {
+    if (failed(ins)) {
+        return;
+    }
+    var js: ptr<u8> = wr_to_string(deref ins.ctx, value, deref ins.ex);
+    if (js == null) {
+        return;
+    }
+    var units: ptr<u16> = wr_string_characters(js);
+    var length: i64 = wr_string_length(js);
+    var remaining: i64 = 0;
+    if (length > deref ins.max_string) {
+        remaining = length - deref ins.max_string;
+        length = deref ins.max_string;
+    }
+    var width: i64 = deref ins.break_length - deref ins.indentation - 4;
+    if (length > MIN_LINE_WIDTH && length > width) {
+        // Long strings are split after each newline and joined with " +".
+        var start: i64 = 0;
+        var first: bool = true;
+        for (var i: i64 = 0; i < length; i++) {
+            if (units[i] == 10 || i == length - 1) {
+                if (!first) {
+                    text_ascii(ins, dest, " +\n");
+                    text_spaces(ins, dest, deref ins.indentation + 2);
+                }
+                escape_units(ins, dest, units + start, i + 1 - start);
+                start = i + 1;
+                first = false;
+            }
+        }
+    } else {
+        escape_units(ins, dest, units, length);
+    }
+    wr_string_release(js);
+    if (remaining > 0) {
+        text_ascii(ins, dest, "... ");
+        text_integer(ins, dest, remaining);
+        text_ascii(ins, dest, " more character");
+        if (remaining > 1) {
+            text_unit(ins, dest, 115);
+        }
+    }
+}
+
+fun is_identifier(units: ptr<u16>, length: i64) -> bool {
+    if (length == 0) {
+        return false;
+    }
+    for (var i: i64 = 0; i < length; i++) {
+        var unit: u16 = units[i];
+        var letter: bool = (unit >= 65 && unit <= 90) || (unit >= 97 && unit <= 122) || unit == 95;
+        var digit: bool = unit >= 48 && unit <= 57;
+        if (!letter && !(digit && i > 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fun format_key(ins: ptr<Inspector>, dest: ptr<Text>, key: ptr<u8>, enumerable: bool) {
+    var ctx: ptr<u8> = deref ins.ctx;
+    if (wr_type(ctx, key) == JS_SYMBOL) {
+        if (!enumerable) {
+            text_unit(ins, dest, 91);
+        }
+        format_symbol(ins, dest, key);
+        if (!enumerable) {
+            text_unit(ins, dest, 93);
+        }
+        return;
+    }
+    var js: ptr<u8> = wr_to_string(ctx, key, deref ins.ex);
+    if (js == null) {
+        return;
+    }
+    var units: ptr<u16> = wr_string_characters(js);
+    var length: i64 = wr_string_length(js);
+    var is_proto: bool = length == 9 && units[0] == 95 && units[1] == 95 && units[2] == 112 && units[7] == 95 &&
+        units[8] == 95;
+    if (is_proto) {
+        text_ascii(ins, dest, "['__proto__']");
+    } else if (!enumerable) {
+        text_unit(ins, dest, 91);
+        text_units(ins, dest, units, length);
+        text_unit(ins, dest, 93);
+    } else if (is_identifier(units, length)) {
+        text_units(ins, dest, units, length);
+    } else {
+        escape_units(ins, dest, units, length);
+    }
+    wr_string_release(js);
+}
+
+// Canonical array index below `limit`, or -1.
+fun index_key(ins: ptr<Inspector>, key: ptr<u8>, limit: f64) -> f64 {
+    var ctx: ptr<u8> = deref ins.ctx;
+    if (wr_type(ctx, key) != JS_STRING) {
+        return -1.0;
+    }
+    var ignored: ptr<u8> = null;
+    var js: ptr<u8> = wr_to_string(ctx, key, &ignored);
+    if (js == null) {
+        return -1.0;
+    }
+    var units: ptr<u16> = wr_string_characters(js);
+    var length: i64 = wr_string_length(js);
+    var value: f64 = 0.0;
+    var valid: bool = length > 0 && length <= 10 && !(length > 1 && units[0] == 48);
+    for (var i: i64 = 0; i < length && valid; i++) {
+        if (units[i] < 48 || units[i] > 57) {
+            valid = false;
+        } else {
+            value = value * 10.0 + ((units[i] - 48) as f64);
+        }
+    }
+    wr_string_release(js);
+    if (!valid || value >= limit || value >= ARRAY_INDEX_LIMIT) {
+        return -1.0;
+    }
+    return value;
+}
+
+// ---------------------------------------------------------------------------
+// Constructor names, tags and keys
+
+// Returns 1 with a name, 0 for a null-prototype chain, -1 when no name exists.
+fun constructor_name(ins: ptr<Inspector>, value: ptr<u8>, dest: ptr<Text>) -> i32 {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var current: ptr<u8> = value;
+    var first_null: bool = false;
+    var key: ptr<u8> = ascii_value(ins, "constructor");
+    wr_protect(ctx, key);
+    var result: i32 = -1;
+    for (var depth: i64 = 0; depth < 256 && !failed(ins); depth++) {
+        if (current == null || wr_type(ctx, current) != JS_OBJECT) {
+            if (depth == 1) {
+                first_null = true;
+            }
+            break;
+        }
+        var desc: ptr<u8> = descriptor(ins, current, key);
+        if (!is_undefined(ins, desc) && !failed(ins)) {
+            var ctor: ptr<u8> = get(ctx, desc, "value", deref ins.ex);
+            if (wr_type(ctx, ctor) == JS_OBJECT && wr_callable(ctx, ctor)) {
+                var name: ptr<u8> = get(ctx, ctor, "name", deref ins.ex);
+                var prototype: ptr<u8> = get(ctx, ctor, "prototype", deref ins.ex);
+                var named: bool = wr_type(ctx, name) == JS_STRING;
+                var matches: bool = chain_contains(ins, value, prototype);
+                if (named && matches && !failed(ins)) {
+                    var before: i64 = deref dest.length;
+                    text_js(ins, dest, name);
+                    if (deref dest.length > before) {
+                        result = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        current = prototype_of(ins, current);
+    }
+    wr_unprotect(ctx, key);
+    if (result < 0 && first_null) {
+        return 0;
+    }
+    return result;
+}
+
+// Symbol.toStringTag when it is a non-empty string that is not an own
+// enumerable property and differs from the constructor name.
+fun string_tag(ins: ptr<Inspector>, value: ptr<u8>, constructor: ptr<Text>, dest: ptr<Text>) {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var symbol: ptr<u8> = intrinsic(ctx, I_TAG_SYMBOL);
+    var ignored: ptr<u8> = null;
+    var args: array<ptr<u8>, 2> = [value, symbol];
+    var tag: ptr<u8> = wr_call(ctx, intrinsic(ctx, I_REFLECT_GET), null, 2, &args[0], &ignored);
+    if (ignored != null || tag == null || wr_type(ctx, tag) != JS_STRING) {
+        return;
+    }
+    var desc: ptr<u8> = wr_call(ctx, intrinsic(ctx, I_DESCRIPTOR), null, 2, &args[0], &ignored);
+    if (ignored != null) {
+        return;
+    }
+    if (desc != null && wr_type(ctx, desc) == JS_OBJECT) {
+        if (wr_to_boolean(ctx, get(ctx, desc, "enumerable", &ignored))) {
+            return;
+        }
+    }
+    var candidate: ptr<Text> = text_new(ins);
+    text_js(ins, candidate, tag);
+    if (candidate != null && deref candidate.length > 0 && !text_equals(candidate, constructor)) {
+        text_append(ins, dest, candidate);
+    }
+    text_free(candidate);
+}
+
+struct Keys {
+    items: ptr<ptr<u8>>;
+    count: i64;
+    capacity: i64;
+    ctx: ptr<u8>;
+}
+
+fun keys_push(ins: ptr<Inspector>, keys: ptr<Keys>, key: ptr<u8>) {
+    if (deref keys.count == deref keys.capacity) {
+        var next: i64 = deref keys.capacity * 2;
+        if (next < 8) {
+            next = 8;
+        }
+        var items: ptr<ptr<u8>> = mem_alloc(next * 8) as ptr<ptr<u8>>;
+        if (items == null) {
+            deref ins.overflow = true;
+            return;
+        }
+        for (var i: i64 = 0; i < deref keys.count; i++) {
+            items[i] = (deref keys.items)[i];
+        }
+        if (deref keys.items != null) {
+            mem_free(deref keys.items as ptr<u8>, deref keys.capacity * 8);
+        }
+        deref keys.items = items;
+        deref keys.capacity = next;
+    }
+    wr_protect(deref keys.ctx, key);
+    (deref keys.items)[deref keys.count] = key;
+    deref keys.count = deref keys.count + 1;
+}
+
+fun keys_free(keys: ptr<Keys>) {
+    for (var i: i64 = 0; i < deref keys.count; i++) {
+        wr_unprotect(deref keys.ctx, (deref keys.items)[i]);
+    }
+    if (deref keys.items != null) {
+        mem_free(deref keys.items as ptr<u8>, deref keys.capacity * 8);
+    }
+    deref keys.items = null;
+    deref keys.count = 0;
+    deref keys.capacity = 0;
+}
+
+fun own_keys(ins: ptr<Inspector>, value: ptr<u8>) -> ptr<u8> {
+    var ctx: ptr<u8> = deref ins.ctx;
+    if (failed(ins)) {
+        return null;
+    }
+    var args: array<ptr<u8>, 1> = [value];
+    var result: ptr<u8> = wr_call(ctx, intrinsic(ctx, I_OWN_KEYS), null, 1, &args[0], deref ins.ex);
+    if (result == null || failed(ins)) {
+        return null;
+    }
+    return result;
+}
+
+fun list_length(ins: ptr<Inspector>, list: ptr<u8>) -> i64 {
+    if (list == null) {
+        return 0;
+    }
+    var length: f64 = wr_to_number(deref ins.ctx, get(deref ins.ctx, list, "length", deref ins.ex), deref ins.ex);
+    if (length != length || length < 0.0) {
+        return 0;
+    }
+    return length as i64;
+}
+
+// Enumerable own keys, excluding array indices below `index_limit`.
+fun collect_keys(ins: ptr<Inspector>, value: ptr<u8>, own: ptr<u8>, index_limit: f64, keys: ptr<Keys>) {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var count: i64 = list_length(ins, own);
+    for (var i: i64 = 0; i < count && !failed(ins); i++) {
+        var key: ptr<u8> = wr_get_index(ctx, own, i as u32, deref ins.ex);
+        if (failed(ins) || key == null) {
+            return;
+        }
+        if (index_limit > 0.0 && index_key(ins, key, index_limit) >= 0.0) {
+            continue;
+        }
+        var desc: ptr<u8> = descriptor(ins, value, key);
+        if (is_undefined(ins, desc) || failed(ins)) {
+            continue;
+        }
+        if (wr_to_boolean(ctx, get(ctx, desc, "enumerable", deref ins.ex))) {
+            keys_push(ins, keys, key);
+        }
+    }
+}
+
+fun keys_include(ins: ptr<Inspector>, keys: ptr<Keys>, name: str) -> bool {
+    var key: ptr<u8> = ascii_value(ins, name);
+    for (var i: i64 = 0; i < deref keys.count; i++) {
+        if (wr_equal(deref ins.ctx, (deref keys.items)[i], key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Properties
+
+fun format_property(ins: ptr<Inspector>, holder: ptr<u8>, key: ptr<u8>, recurse: i64, mode: i32) -> ptr<Text> {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var dest: ptr<Text> = text_new(ins);
+    if (dest == null) {
+        return null;
+    }
+    var desc: ptr<u8> = descriptor(ins, holder, key);
+    if (failed(ins)) {
+        return dest;
+    }
+    wr_protect(ctx, desc);
+    var enumerable: bool = true;
+    var value_text: ptr<Text> = text_new(ins);
+    if (is_undefined(ins, desc)) {
+        var value: ptr<u8> = reflect_get(ins, holder, key);
+        deref ins.indentation = deref ins.indentation + 2;
+        format_value(ins, value, recurse, value_text);
+        deref ins.indentation = deref ins.indentation - 2;
+    } else {
+        enumerable = wr_to_boolean(ctx, get(ctx, desc, "enumerable", deref ins.ex));
+        var getter: ptr<u8> = get(ctx, desc, "get", deref ins.ex);
+        var setter: ptr<u8> = get(ctx, desc, "set", deref ins.ex);
+        var data: ptr<u8> = get(ctx, desc, "value", deref ins.ex);
+        if (!is_undefined(ins, data)) {
+            deref ins.indentation = deref ins.indentation + 2;
+            format_value(ins, data, recurse, value_text);
+            deref ins.indentation = deref ins.indentation - 2;
+        } else if (!is_undefined(ins, getter)) {
+            if (!is_undefined(ins, setter)) {
+                text_ascii(ins, value_text, "[Getter/Setter]");
+            } else {
+                text_ascii(ins, value_text, "[Getter]");
+            }
+        } else if (!is_undefined(ins, setter)) {
+            text_ascii(ins, value_text, "[Setter]");
+        } else {
+            text_ascii(ins, value_text, "undefined");
+        }
+    }
+    wr_unprotect(ctx, desc);
+    if (mode != PROPERTY_ARRAY) {
+        format_key(ins, dest, key, enumerable);
+        text_ascii(ins, dest, ": ");
+    }
+    text_append(ins, dest, value_text);
+    text_free(value_text);
+    return dest;
+}
+
+// ---------------------------------------------------------------------------
+// Line layout (Node reduceToSingleString / groupArrayElements)
+
+fun sqrt_f64(value: f64) -> f64 {
+    if (value <= 0.0) {
+        return 0.0;
+    }
+    var guess: f64 = value;
+    if (guess < 1.0) {
+        guess = 1.0;
+    }
+    for (var i: i64 = 0; i < 64; i++) {
+        guess = (guess + value / guess) / 2.0;
+    }
+    return guess;
+}
+
+fun round_f64(value: f64) -> i64 {
+    return (value + 0.5) as i64;
+}
+
+fun group_elements(ins: ptr<Inspector>, output: ptr<Entries>, has_more: bool, numeric: bool) {
+    var total_length: i64 = 0;
+    var max_length: i64 = 0;
+    var output_length: i64 = deref output.count;
+    if (has_more) {
+        output_length -= 1;
+    }
+    var separator: i64 = 2;
+    for (var i: i64 = 0; i < output_length; i++) {
+        var length: i64 = deref (deref output.items)[i].length;
+        total_length += length + separator;
+        if (max_length < length) {
+            max_length = length;
+        }
+    }
+    var actual_max: i64 = max_length + separator;
+    if (actual_max * 3 + deref ins.indentation >= deref ins.break_length) {
+        return;
+    }
+    if (!((total_length as f64) / (actual_max as f64) > 5.0 || max_length <= 6)) {
+        return;
+    }
+    var average_bias: f64 = sqrt_f64((actual_max as f64) - (total_length as f64) / (deref output.count as f64));
+    var biased_max: f64 = (actual_max as f64) - 3.0 - average_bias;
+    if (biased_max < 1.0) {
+        biased_max = 1.0;
+    }
+    var columns: i64 = round_f64(sqrt_f64(2.5 * biased_max * (output_length as f64)) / biased_max);
+    var fit: i64 = (deref ins.break_length - deref ins.indentation) / actual_max;
+    if (fit < columns) {
+        columns = fit;
+    }
+    if (COMPACT_LEVELS * 4 < columns) {
+        columns = COMPACT_LEVELS * 4;
+    }
+    if (GROUP_COLUMN_LIMIT < columns) {
+        columns = GROUP_COLUMN_LIMIT;
+    }
+    if (columns <= 1) {
+        return;
+    }
+    var widths: array<i64, 15>;
+    for (var c: i64 = 0; c < columns; c++) {
+        var line_length: i64 = 0;
+        var j: i64 = c;
+        while (j < deref output.count) {
+            var length: i64 = deref (deref output.items)[j].length;
+            if (j < output_length && length > line_length) {
+                line_length = length;
+            }
+            j += columns;
+        }
+        widths[c] = line_length + separator;
+    }
+    var grouped: Entries;
+    grouped.items = null;
+    grouped.count = 0;
+    grouped.capacity = 0;
+    var start: i64 = 0;
+    while (start < output_length) {
+        var stop: i64 = start + columns;
+        if (stop > output_length) {
+            stop = output_length;
+        }
+        var line: ptr<Text> = text_new(ins);
+        for (var j: i64 = start; j < stop; j++) {
+            var item: ptr<Text> = (deref output.items)[j];
+            var last: bool = j == stop - 1;
+            var width: i64 = widths[j - start];
+            var used: i64 = deref item.length;
+            if (!last) {
+                used += 2;
+            } else if (numeric) {
+                width -= separator;
+            }
+            if (numeric && used < width) {
+                text_spaces(ins, line, width - used);
+            }
+            text_append(ins, line, item);
+            if (!last) {
+                text_ascii(ins, line, ", ");
+                if (!numeric && used < width) {
+                    text_spaces(ins, line, width - used);
+                }
+            }
+        }
+        entries_push(ins, &grouped, line);
+        start = stop;
+    }
+    if (has_more) {
+        entries_push(ins, &grouped, (deref output.items)[deref output.count - 1]);
+        (deref output.items)[deref output.count - 1] = null;
+    }
+    entries_free(output);
+    deref output.items = grouped.items;
+    deref output.count = grouped.count;
+    deref output.capacity = grouped.capacity;
+}
+
+fun below_break_length(ins: ptr<Inspector>, output: ptr<Entries>, start: i64, base: ptr<Text>) -> bool {
+    var total: i64 = deref output.count + start;
+    if (total + deref output.count > deref ins.break_length) {
+        return false;
+    }
+    for (var i: i64 = 0; i < deref output.count; i++) {
+        total += deref (deref output.items)[i].length;
+        if (total > deref ins.break_length) {
+            return false;
+        }
+    }
+    return !text_contains(base, 10);
+}
+
+fun reduce_output(ins: ptr<Inspector>, output: ptr<Entries>, base: ptr<Text>, open: ptr<Text>, close: str,
+    array_extras: bool, recurse: i64, has_more: bool, numeric: bool, dest: ptr<Text>) {
+    var entries: i64 = deref output.count;
+    if (array_extras && entries > GROUP_MINIMUM_ENTRIES) {
+        group_elements(ins, output, has_more, numeric);
+    }
+    if (deref ins.current_depth - recurse < COMPACT_LEVELS && entries == deref output.count) {
+        var start: i64 = deref output.count + deref ins.indentation + deref open.length + deref base.length + 10;
+        if (below_break_length(ins, output, start, base)) {
+            var multiline: bool = false;
+            for (var i: i64 = 0; i < deref output.count; i++) {
+                if (text_contains((deref output.items)[i], 10)) {
+                    multiline = true;
+                }
+            }
+            if (!multiline) {
+                if (deref base.length > 0) {
+                    text_append(ins, dest, base);
+                    text_unit(ins, dest, 32);
+                }
+                text_append(ins, dest, open);
+                text_unit(ins, dest, 32);
+                for (var i: i64 = 0; i < deref output.count; i++) {
+                    if (i > 0) {
+                        text_ascii(ins, dest, ", ");
+                    }
+                    text_append(ins, dest, (deref output.items)[i]);
+                }
+                text_unit(ins, dest, 32);
+                text_ascii(ins, dest, close);
+                return;
+            }
+        }
+    }
+    if (deref base.length > 0) {
+        text_append(ins, dest, base);
+        text_unit(ins, dest, 32);
+    }
+    text_append(ins, dest, open);
+    for (var i: i64 = 0; i < deref output.count; i++) {
+        if (i > 0) {
+            text_unit(ins, dest, 44);
+        }
+        text_unit(ins, dest, 10);
+        text_spaces(ins, dest, deref ins.indentation + 2);
+        text_append(ins, dest, (deref output.items)[i]);
+    }
+    text_unit(ins, dest, 10);
+    text_spaces(ins, dest, deref ins.indentation);
+    text_ascii(ins, dest, close);
+}
+
+// ---------------------------------------------------------------------------
+// Collection formatters
+
+fun format_array_like(ins: ptr<Inspector>, value: ptr<u8>, own: ptr<u8>, length: i64, recurse: i64,
+    output: ptr<Entries>) -> bool {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var limit: i64 = length;
+    if (deref ins.max_array < limit) {
+        limit = deref ins.max_array;
+    }
+    if (limit < 0) {
+        limit = 0;
+    }
+    var index: i64 = 0;
+    var dense: bool = true;
+    var numeric: bool = true;
+    while (index < limit && !failed(ins)) {
+        var key: ptr<u8> = wr_number(ctx, index as f64);
+        var desc: ptr<u8> = descriptor(ins, value, key);
+        if (is_undefined(ins, desc)) {
+            dense = false;
+            break;
+        }
+        var element: ptr<u8> = get(ctx, desc, "value", deref ins.ex);
+        var kind: i32 = wr_type(ctx, element);
+        if (kind != JS_NUMBER && kind != JS_BIGINT) {
+            numeric = false;
+        }
+        entries_push(ins, output, format_property(ins, value, key, recurse, PROPERTY_ARRAY));
+        index += 1;
+    }
+    if (dense) {
+        if (length > limit) {
+            push_remaining(ins, output, length - limit, "item");
+        }
+        return numeric;
+    }
+    // Sparse arrays: walk enumerable own index keys in ascending order.
+    numeric = false;
+    var count: i64 = list_length(ins, own);
+    var position: i64 = 0;
+    while (position < count && deref output.count < limit && !failed(ins)) {
+        var key: ptr<u8> = wr_get_index(ctx, own, position as u32, deref ins.ex);
+        position += 1;
+        var at: f64 = index_key(ins, key, length as f64);
+        if (at < 0.0) {
+            break;
+        }
+        if ((at as i64) < index) {
+            continue;
+        }
+        if ((at as i64) > index) {
+            push_empty_items(ins, output, (at as i64) - index);
+            index = at as i64;
+            if (deref output.count == limit) {
+                break;
+            }
+        }
+        entries_push(ins, output, format_property(ins, value, key, recurse, PROPERTY_ARRAY));
+        index += 1;
+    }
+    var remaining: i64 = length - index;
+    if (deref output.count != limit) {
+        if (remaining > 0) {
+            push_empty_items(ins, output, remaining);
+        }
+    } else if (remaining > 0) {
+        push_remaining(ins, output, remaining, "item");
+    }
+    return numeric;
+}
+
+fun format_typed(ins: ptr<Inspector>, value: ptr<u8>, length: i64, output: ptr<Entries>) {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var limit: i64 = length;
+    if (deref ins.max_array < limit) {
+        limit = deref ins.max_array;
+    }
+    for (var i: i64 = 0; i < limit && !failed(ins); i++) {
+        var element: ptr<u8> = wr_get_index(ctx, value, i as u32, deref ins.ex);
+        var item: ptr<Text> = text_new(ins);
+        if (wr_type(ctx, element) == JS_BIGINT) {
+            format_bigint(ins, item, element);
+        } else {
+            format_number(ins, item, element);
+        }
+        entries_push(ins, output, item);
+    }
+    if (length > limit) {
+        push_remaining(ins, output, length - limit, "item");
+    }
+}
+
+fun hex_bytes(ins: ptr<Inspector>, dest: ptr<Text>, bytes: ptr<u8>, length: i64, limit: i64) {
+    var shown: i64 = length;
+    if (limit < shown) {
+        shown = limit;
+    }
+    for (var i: i64 = 0; i < shown; i++) {
+        if (i > 0) {
+            text_unit(ins, dest, 32);
+        }
+        var octet: i64 = bytes[i] as i64;
+        text_unit(ins, dest, lower_hex_unit(octet / 16));
+        text_unit(ins, dest, lower_hex_unit(octet % 16));
+    }
+    if (length > shown) {
+        var remaining: i64 = length - shown;
+        text_ascii(ins, dest, " ... ");
+        text_integer(ins, dest, remaining);
+        text_ascii(ins, dest, " more byte");
+        if (remaining > 1) {
+            text_unit(ins, dest, 115);
+        }
+    }
+}
+
+fun format_collection(ins: ptr<Inspector>, value: ptr<u8>, map: bool, size: i64, recurse: i64, output: ptr<Entries>) {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var start: i64 = I_SET_VALUES;
+    var next: i64 = I_SET_NEXT;
+    if (map) {
+        start = I_MAP_ENTRIES;
+        next = I_MAP_NEXT;
+    }
+    var limit: i64 = size;
+    if (deref ins.max_array < limit) {
+        limit = deref ins.max_array;
+    }
+    var iterator: ptr<u8> = call0(ins, intrinsic(ctx, start), value);
+    if (failed(ins)) {
+        return;
+    }
+    wr_protect(ctx, iterator);
+    deref ins.indentation = deref ins.indentation + 2;
+    var shown: i64 = 0;
+    while (shown < limit && !failed(ins)) {
+        var step: ptr<u8> = call0(ins, intrinsic(ctx, next), iterator);
+        if (failed(ins) || wr_to_boolean(ctx, get(ctx, step, "done", deref ins.ex))) {
+            break;
+        }
+        var entry: ptr<u8> = get(ctx, step, "value", deref ins.ex);
+        wr_protect(ctx, entry);
+        var item: ptr<Text> = text_new(ins);
+        if (map) {
+            var key: ptr<u8> = wr_get_index(ctx, entry, 0, deref ins.ex);
+            var data: ptr<u8> = wr_get_index(ctx, entry, 1, deref ins.ex);
+            format_value(ins, key, recurse, item);
+            text_ascii(ins, item, " => ");
+            format_value(ins, data, recurse, item);
+        } else {
+            format_value(ins, entry, recurse, item);
+        }
+        wr_unprotect(ctx, entry);
+        entries_push(ins, output, item);
+        shown += 1;
+    }
+    deref ins.indentation = deref ins.indentation - 2;
+    wr_unprotect(ctx, iterator);
+    if (size > limit) {
+        push_remaining(ins, output, size - limit, "item");
+    }
+}
+
+// JSC stacks list frames as "name@location". Present them as Node-style lines.
+fun format_stack_frames(ins: ptr<Inspector>, dest: ptr<Text>, stack: ptr<u8>) {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var js: ptr<u8> = wr_to_string(ctx, stack, deref ins.ex);
+    if (js == null) {
+        return;
+    }
+    var units: ptr<u16> = wr_string_characters(js);
+    var length: i64 = wr_string_length(js);
+    var start: i64 = 0;
+    while (start < length) {
+        var stop: i64 = start;
+        while (stop < length && units[stop] != 10) {
+            stop += 1;
+        }
+        if (stop > start) {
+            text_ascii(ins, dest, "\n    at ");
+            var at: i64 = -1;
+            for (var i: i64 = start; i < stop; i++) {
+                if (units[i] == 64 && at < 0) {
+                    at = i;
+                }
+            }
+            if (at > start) {
+                text_units(ins, dest, units + start, at - start);
+                text_ascii(ins, dest, " (");
+                text_units(ins, dest, units + at + 1, stop - at - 1);
+                text_unit(ins, dest, 41);
+            } else if (at == start) {
+                text_units(ins, dest, units + at + 1, stop - at - 1);
+            } else {
+                text_units(ins, dest, units + start, stop - start);
+            }
+        }
+        start = stop + 1;
+    }
+    wr_string_release(js);
+}
+
+fun format_error(ins: ptr<Inspector>, value: ptr<u8>, base: ptr<Text>) {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var ignored: ptr<u8> = null;
+    var name: ptr<u8> = get(ctx, value, "name", &ignored);
+    var message: ptr<u8> = get(ctx, value, "message", &ignored);
+    var stack: ptr<u8> = get(ctx, value, "stack", &ignored);
+    var header: ptr<Text> = text_new(ins);
+    if (wr_type(ctx, name) == JS_STRING) {
+        text_js(ins, header, name);
+    }
+    if (deref header.length == 0) {
+        text_ascii(ins, header, "Error");
+    }
+    if (wr_type(ctx, message) == JS_STRING) {
+        var text: ptr<Text> = text_new(ins);
+        text_js(ins, text, message);
+        if (deref text.length > 0) {
+            text_ascii(ins, header, ": ");
+            text_append(ins, header, text);
+        }
+        text_free(text);
+    }
+    var frames: ptr<Text> = text_new(ins);
+    if (wr_type(ctx, stack) == JS_STRING) {
+        format_stack_frames(ins, frames, stack);
+    }
+    var composed: ptr<Text> = text_new(ins);
+    if (deref frames.length == 0) {
+        text_unit(ins, composed, 91);
+        text_append(ins, composed, header);
+        text_unit(ins, composed, 93);
+    } else {
+        text_append(ins, composed, header);
+        text_append(ins, composed, frames);
+    }
+    text_indented(ins, base, deref composed.data, deref composed.length);
+    text_free(composed);
+    text_free(frames);
+    text_free(header);
+}
+
+fun format_boxed(ins: ptr<Inspector>, kind: i32, primitive: ptr<u8>, base: ptr<Text>) {
+    if (kind == JS_NUMBER) {
+        text_ascii(ins, base, "[Number: ");
+        format_number(ins, base, primitive);
+    } else if (kind == JS_STRING) {
+        text_ascii(ins, base, "[String: ");
+        format_string(ins, base, primitive);
+    } else if (kind == JS_BOOLEAN) {
+        text_ascii(ins, base, "[Boolean: ");
+        format_value(ins, primitive, 0, base);
+    } else if (kind == JS_BIGINT) {
+        text_ascii(ins, base, "[BigInt: ");
+        format_bigint(ins, base, primitive);
+    } else {
+        text_ascii(ins, base, "[Symbol: ");
+        format_symbol(ins, base, primitive);
+    }
+    text_unit(ins, base, 93);
+}
+
+fun boxed_kind(ins: ptr<Inspector>, value: ptr<u8>, primitive: ptr<ptr<u8>>) -> i32 {
+    if (probe(ins, I_NUMBER_VALUE, value, primitive)) {
+        return JS_NUMBER;
+    }
+    if (probe(ins, I_STRING_VALUE, value, primitive)) {
+        return JS_STRING;
+    }
+    if (probe(ins, I_BOOLEAN_VALUE, value, primitive)) {
+        return JS_BOOLEAN;
+    }
+    if (probe(ins, I_BIGINT_VALUE, value, primitive)) {
+        return JS_BIGINT;
+    }
+    if (probe(ins, I_SYMBOL_VALUE, value, primitive)) {
+        return JS_SYMBOL;
+    }
+    return -1;
+}
+
+fun function_base(ins: ptr<Inspector>, value: ptr<u8>, constructor: ptr<Text>, base: ptr<Text>) {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var source: ptr<u8> = call0(ins, intrinsic(ctx, I_FUNCTION_TO_STRING), value);
+    var source_text: ptr<Text> = text_new(ins);
+    text_js(ins, source_text, source);
+    var is_class: bool = deref source_text.length >= 6 && (deref source_text.data)[0] == 99 &&
+        (deref source_text.data)[1] == 108 && (deref source_text.data)[2] == 97 &&
+        (deref source_text.data)[3] == 115 && (deref source_text.data)[4] == 115 &&
+        ((deref source_text.data)[5] == 32 || (deref source_text.data)[5] == 123);
+    text_free(source_text);
+    var ignored: ptr<u8> = null;
+    var name_desc: ptr<u8> = descriptor(ins, value, ascii_value(ins, "name"));
+    var name: ptr<Text> = text_new(ins);
+    if (!is_undefined(ins, name_desc)) {
+        var data: ptr<u8> = get(ctx, name_desc, "value", &ignored);
+        if (wr_type(ctx, data) == JS_STRING) {
+            text_js(ins, name, data);
+        }
+    }
+    if (is_class) {
+        text_ascii(ins, base, "[class ");
+        if (deref name.length > 0) {
+            text_append(ins, base, name);
+        } else {
+            text_ascii(ins, base, "(anonymous)");
+        }
+        var parent: ptr<u8> = prototype_of(ins, value);
+        if (parent != null && wr_type(ctx, parent) == JS_OBJECT &&
+            !wr_equal(ctx, parent, intrinsic(ctx, I_FUNCTION_PROTOTYPE))) {
+            var parent_desc: ptr<u8> = descriptor(ins, parent, ascii_value(ins, "name"));
+            if (!is_undefined(ins, parent_desc)) {
+                var parent_name: ptr<u8> = get(ctx, parent_desc, "value", &ignored);
+                if (wr_type(ctx, parent_name) == JS_STRING) {
+                    text_ascii(ins, base, " extends ");
+                    text_js(ins, base, parent_name);
+                }
+            }
+        }
+        text_unit(ins, base, 93);
+        text_free(name);
+        return;
+    }
+    var tag_value: ptr<u8> = call0(ins, intrinsic(ctx, I_OBJECT_TO_STRING), value);
+    var tag: ptr<Text> = text_new(ins);
+    text_js(ins, tag, tag_value);
+    text_unit(ins, base, 91);
+    if (text_equals_ascii(tag, "[object AsyncFunction]")) {
+        text_ascii(ins, base, "AsyncFunction");
+    } else if (text_equals_ascii(tag, "[object GeneratorFunction]")) {
+        text_ascii(ins, base, "GeneratorFunction");
+    } else if (text_equals_ascii(tag, "[object AsyncGeneratorFunction]")) {
+        text_ascii(ins, base, "AsyncGeneratorFunction");
+    } else {
+        text_ascii(ins, base, "Function");
+    }
+    text_free(tag);
+    if (deref name.length > 0) {
+        text_ascii(ins, base, ": ");
+        text_append(ins, base, name);
+    } else {
+        text_ascii(ins, base, " (anonymous)");
+    }
+    text_unit(ins, base, 93);
+    if (deref constructor.length == 0) {
+        text_ascii(ins, base, " [null prototype]");
+    }
+    text_free(name);
+}
+
+// getPrefix(constructor, tag, fallback, size)
+fun prefix(ins: ptr<Inspector>, dest: ptr<Text>, named: i32, constructor: ptr<Text>, tag: ptr<Text>, fallback: str,
+    size: i64) {
+    if (named <= 0) {
+        text_unit(ins, dest, 91);
+        text_ascii(ins, dest, fallback);
+        if (size >= 0) {
+            text_unit(ins, dest, 40);
+            text_integer(ins, dest, size);
+            text_unit(ins, dest, 41);
+        }
+        text_ascii(ins, dest, ": null prototype] ");
+        if (deref tag.length > 0 && !text_equals_ascii(tag, fallback)) {
+            text_unit(ins, dest, 91);
+            text_append(ins, dest, tag);
+            text_ascii(ins, dest, "] ");
+        }
+        return;
+    }
+    text_append(ins, dest, constructor);
+    if (size >= 0) {
+        text_unit(ins, dest, 40);
+        text_integer(ins, dest, size);
+        text_unit(ins, dest, 41);
+    }
+    text_unit(ins, dest, 32);
+    if (deref tag.length > 0) {
+        text_unit(ins, dest, 91);
+        text_append(ins, dest, tag);
+        text_ascii(ins, dest, "] ");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Values
+
+fun try_custom(ins: ptr<Inspector>, value: ptr<u8>, recurse: i64, dest: ptr<Text>) -> bool {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var symbol: ptr<u8> = intrinsic(ctx, I_CUSTOM_SYMBOL);
+    if (symbol == null) {
+        return false;
+    }
+    var hook: ptr<u8> = reflect_get(ins, value, symbol);
+    if (failed(ins) || wr_type(ctx, hook) != JS_OBJECT || !wr_callable(ctx, hook)) {
+        return false;
+    }
+    if (wr_equal(ctx, hook, intrinsic(ctx, I_INSPECT))) {
+        return false;
+    }
+    // Prototype objects (value.constructor.prototype === value) keep the
+    // default formatting, as in Node.
+    var ignored: ptr<u8> = null;
+    var ctor: ptr<u8> = get(ctx, value, "constructor", &ignored);
+    if (ignored == null && wr_type(ctx, ctor) == JS_OBJECT) {
+        var is_proto: ptr<u8> = get(ctx, ctor, "prototype", &ignored);
+        if (ignored == null && is_proto != null && wr_equal(ctx, is_proto, value)) {
+            return false;
+        }
+    }
+    wr_protect(ctx, hook);
+    var depth: ptr<u8> = wr_null(ctx);
+    if (deref ins.depth < UNLIMITED_DEPTH) {
+        depth = wr_number(ctx, (deref ins.depth - recurse) as f64);
+    }
+    var options: ptr<u8> = deref ins.options;
+    if (options == null) {
+        options = wr_undefined(ctx);
+    }
+    var args: array<ptr<u8>, 3> = [depth, options, intrinsic(ctx, I_INSPECT)];
+    if (args[2] == null) {
+        args[2] = wr_undefined(ctx);
+    }
+    var result: ptr<u8> = wr_call(ctx, hook, value, 3, &args[0], deref ins.ex);
+    wr_unprotect(ctx, hook);
+    if (failed(ins) || result == null) {
+        return true;
+    }
+    if (wr_equal(ctx, result, value)) {
+        return false;
+    }
+    wr_protect(ctx, result);
+    if (wr_type(ctx, result) == JS_STRING) {
+        var js: ptr<u8> = wr_to_string(ctx, result, deref ins.ex);
+        if (js != null) {
+            text_indented(ins, dest, wr_string_characters(js), wr_string_length(js));
+            wr_string_release(js);
+        }
+    } else {
+        format_value(ins, result, recurse, dest);
+    }
+    wr_unprotect(ctx, result);
+    return true;
+}
+
+pub fun format_value(ins: ptr<Inspector>, value: ptr<u8>, recurse: i64, dest: ptr<Text>) {
+    if (failed(ins)) {
+        return;
+    }
+    var ctx: ptr<u8> = deref ins.ctx;
+    var kind: i32 = JS_UNDEFINED;
+    if (value != null) {
+        kind = wr_type(ctx, value);
+    }
+    if (kind == JS_UNDEFINED) {
+        text_ascii(ins, dest, "undefined");
+    } else if (kind == JS_NULL) {
+        text_ascii(ins, dest, "null");
+    } else if (kind == JS_BOOLEAN) {
+        if (wr_to_boolean(ctx, value)) {
+            text_ascii(ins, dest, "true");
+        } else {
+            text_ascii(ins, dest, "false");
+        }
+    } else if (kind == JS_NUMBER) {
+        format_number(ins, dest, value);
+    } else if (kind == JS_STRING) {
+        format_string(ins, dest, value);
+    } else if (kind == JS_SYMBOL) {
+        format_symbol(ins, dest, value);
+    } else if (kind == JS_BIGINT) {
+        format_bigint(ins, dest, value);
+    } else {
+        format_object(ins, value, recurse, dest);
+    }
+}
+
+fun circular_reference(ins: ptr<Inspector>, value: ptr<u8>, dest: ptr<Text>) -> bool {
+    for (var i: i64 = 0; i < deref ins.seen_count; i++) {
+        var entry: ptr<Seen> = deref ins.seen + i;
+        if (wr_equal(deref ins.ctx, deref entry.value, value)) {
+            if (deref entry.reference == 0) {
+                deref ins.circular = deref ins.circular + 1;
+                deref entry.reference = deref ins.circular;
+            }
+            text_ascii(ins, dest, "[Circular *");
+            text_integer(ins, dest, deref entry.reference);
+            text_unit(ins, dest, 93);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Formatter selection made by format_object before children are visited.
+const SHAPE_KEYS: i32 = 0;
+const SHAPE_ARRAY: i32 = 1;
+const SHAPE_SET: i32 = 2;
+const SHAPE_MAP: i32 = 3;
+const SHAPE_TYPED: i32 = 4;
+const SHAPE_ARRAY_BUFFER: i32 = 5;
+const SHAPE_UNKNOWN: i32 = 6;
+
+fun format_object(ins: ptr<Inspector>, value: ptr<u8>, recurse: i64, dest: ptr<Text>) {
+    var ctx: ptr<u8> = deref ins.ctx;
+    if (try_custom(ins, value, recurse, dest) || failed(ins)) {
+        return;
+    }
+    if (circular_reference(ins, value, dest)) {
+        return;
+    }
+    var constructor: ptr<Text> = text_new(ins);
+    var tag: ptr<Text> = text_new(ins);
+    var base: ptr<Text> = text_new(ins);
+    var open: ptr<Text> = text_new(ins);
+    var keys: Keys;
+    keys.items = null;
+    keys.count = 0;
+    keys.capacity = 0;
+    keys.ctx = ctx;
+    var named: i32 = constructor_name(ins, value, constructor);
+    if (named < 0) {
+        text_ascii(ins, constructor, "Object");
+        named = 1;
+    }
+    string_tag(ins, value, constructor, tag);
+    var own: ptr<u8> = own_keys(ins, value);
+    if (own != null) {
+        wr_protect(ctx, own);
+    }
+    var close: str = "}";
+    var shape: i32 = SHAPE_KEYS;
+    var array_extras: bool = false;
+    var simple: bool = false;
+    var size: i64 = 0;
+    var typed: i32 = wr_typed_type(ctx, value, deref ins.ex);
+    var buffer: bool = typed == TYPED_UINT8 && chain_contains(ins, value, intrinsic(ctx, I_BUFFER_PROTOTYPE));
+    var collection_size: ptr<u8> = null;
+    var primitive: ptr<u8> = null;
+    var to_string: ptr<Text> = text_new(ins);
+    text_js(ins, to_string, call0(ins, intrinsic(ctx, I_OBJECT_TO_STRING), value));
+    if (failed(ins)) {
+        typed = TYPED_NONE;
+    }
+    var arguments: bool = text_equals_ascii(to_string, "[object Arguments]");
+    if (wr_is_array(ctx, value) || arguments) {
+        size = list_length(ins, value);
+        collect_keys(ins, value, own, (size as f64) + 1.0, &keys);
+        if (arguments) {
+            text_ascii(ins, open, "[Arguments] [");
+        } else {
+            if (named <= 0 || !text_equals_ascii(constructor, "Array") || deref tag.length > 0) {
+                prefix(ins, open, named, constructor, tag, "Array", size);
+            }
+            text_unit(ins, open, 91);
+        }
+        close = "]";
+        shape = SHAPE_ARRAY;
+        array_extras = true;
+        simple = size == 0 && keys.count == 0;
+    } else if (buffer) {
+        // Buffer.prototype[util.inspect.custom] in Node.
+        var length: i64 = wr_typed_length(ctx, value, deref ins.ex);
+        var offset: i64 = wr_typed_offset(ctx, value, deref ins.ex);
+        var bytes: ptr<u8> = wr_typed_bytes(ctx, value, deref ins.ex);
+        // Buffer.prototype.constructor is Uint8Array in this runtime, so the
+        // label is fixed instead of read from the constructor name.
+        text_ascii(ins, base, "<Buffer");
+        if (length > 0 && bytes != null) {
+            text_unit(ins, base, 32);
+            hex_bytes(ins, base, bytes + offset, length, BUFFER_INSPECT_BYTES);
+        }
+        text_unit(ins, base, 62);
+        simple = true;
+    } else if (typed >= 0 && typed <= TYPED_FLOAT64 || typed == TYPED_BIGINT64 || typed == TYPED_BIGUINT64) {
+        // wr_typed_length reports bytes; the element count is the length property.
+        size = list_length(ins, value);
+        prefix(ins, open, named, constructor, tag, "TypedArray", size);
+        text_unit(ins, open, 91);
+        close = "]";
+        shape = SHAPE_TYPED;
+        array_extras = true;
+        simple = size == 0;
+    } else if (typed == TYPED_ARRAY_BUFFER) {
+        prefix(ins, open, named, constructor, tag, "ArrayBuffer", -1);
+        text_unit(ins, open, 123);
+        shape = SHAPE_ARRAY_BUFFER;
+        collect_keys(ins, value, own, 0.0, &keys);
+    } else if (probe(ins, I_SET_SIZE, value, &collection_size)) {
+        size = wr_to_number(ctx, collection_size, deref ins.ex) as i64;
+        collect_keys(ins, value, own, 0.0, &keys);
+        prefix(ins, open, named, constructor, tag, "Set", size);
+        text_unit(ins, open, 123);
+        shape = SHAPE_SET;
+        simple = size == 0 && keys.count == 0;
+    } else if (probe(ins, I_MAP_SIZE, value, &collection_size)) {
+        size = wr_to_number(ctx, collection_size, deref ins.ex) as i64;
+        collect_keys(ins, value, own, 0.0, &keys);
+        prefix(ins, open, named, constructor, tag, "Map", size);
+        text_unit(ins, open, 123);
+        shape = SHAPE_MAP;
+        simple = size == 0 && keys.count == 0;
+    } else {
+        var boxed: i32 = boxed_kind(ins, value, &primitive);
+        var index_limit: f64 = 0.0;
+        if (boxed == JS_STRING) {
+            index_limit = (list_length(ins, value) as f64) + 1.0;
+        }
+        collect_keys(ins, value, own, index_limit, &keys);
+        var empty: bool = keys.count == 0;
+        var time: ptr<u8> = null;
+        if (wr_callable(ctx, value)) {
+            function_base(ins, value, constructor, base);
+            simple = empty;
+        } else if (probe(ins, I_REGEXP_SOURCE, value, null) && !text_equals_ascii(to_string, "[object Object]")) {
+            text_js(ins, base, call0(ins, intrinsic(ctx, I_REGEXP_STRING), value));
+            simple = empty || (deref ins.depth < recurse);
+        } else if (probe(ins, I_DATE_TIME, value, &time)) {
+            var stamp: f64 = wr_to_number(ctx, time, deref ins.ex);
+            if (stamp != stamp) {
+                text_ascii(ins, base, "Invalid Date");
+            } else {
+                text_js(ins, base, call0(ins, intrinsic(ctx, I_DATE_ISO), value));
+            }
+            simple = empty;
+        } else if (chain_contains(ins, value, intrinsic(ctx, I_ERROR_PROTOTYPE))) {
+            format_error(ins, value, base);
+            var cause_key: ptr<u8> = ascii_value(ins, "cause");
+            if (!keys_include(ins, &keys, "cause") && !is_undefined(ins, descriptor(ins, value, cause_key))) {
+                keys_push(ins, &keys, cause_key);
+            }
+            var errors_key: ptr<u8> = ascii_value(ins, "errors");
+            var errors_desc: ptr<u8> = descriptor(ins, value, errors_key);
+            if (!keys_include(ins, &keys, "errors") && !is_undefined(ins, errors_desc)) {
+                if (wr_is_array(ctx, get(ctx, errors_desc, "value", deref ins.ex))) {
+                    keys_push(ins, &keys, errors_key);
+                }
+            }
+            simple = keys.count == 0;
+        } else if (text_equals_ascii(to_string, "[object Promise]")) {
+            prefix(ins, open, named, constructor, tag, "Promise", -1);
+            text_unit(ins, open, 123);
+            shape = SHAPE_UNKNOWN;
+        } else if (probe(ins, I_WEAKMAP_HAS, value, null)) {
+            prefix(ins, open, named, constructor, tag, "WeakMap", -1);
+            text_unit(ins, open, 123);
+            shape = SHAPE_UNKNOWN;
+        } else if (probe(ins, I_WEAKSET_HAS, value, null)) {
+            prefix(ins, open, named, constructor, tag, "WeakSet", -1);
+            text_unit(ins, open, 123);
+            shape = SHAPE_UNKNOWN;
+        } else if (boxed >= 0) {
+            format_boxed(ins, boxed, primitive, base);
+            text_unit(ins, open, 123);
+            simple = empty;
+        } else if (named > 0 && text_equals_ascii(constructor, "Object")) {
+            if (deref tag.length > 0) {
+                prefix(ins, open, named, constructor, tag, "Object", -1);
+            }
+            text_unit(ins, open, 123);
+            if (empty) {
+                text_append(ins, base, open);
+                text_unit(ins, base, 125);
+                simple = true;
+            }
+        } else {
+            prefix(ins, open, named, constructor, tag, "Object", -1);
+            text_unit(ins, open, 123);
+            if (empty) {
+                text_append(ins, base, open);
+                text_unit(ins, base, 125);
+                simple = true;
+            }
+        }
+    }
+    text_free(to_string);
+    // Bases such as functions, dates and errors take braces only when they
+    // also have own enumerable properties.
+    if (deref open.length == 0 && deref base.length > 0 && !simple) {
+        text_unit(ins, open, 123);
+    }
+    if (simple && !failed(ins)) {
+        if (deref base.length > 0) {
+            text_append(ins, dest, base);
+        } else {
+            text_append(ins, dest, open);
+            text_ascii(ins, dest, close);
+        }
+    } else if (!failed(ins)) {
+        format_children(ins, value, own, recurse, shape, size, named, constructor, tag, base, open, close,
+            array_extras, &keys, dest);
+    }
+    keys_free(&keys);
+    if (own != null) {
+        wr_unprotect(ctx, own);
+    }
+    text_free(open);
+    text_free(base);
+    text_free(tag);
+    text_free(constructor);
+}
+
+fun depth_name(ins: ptr<Inspector>, named: i32, constructor: ptr<Text>, tag: ptr<Text>, dest: ptr<Text>) {
+    var name: ptr<Text> = text_new(ins);
+    prefix(ins, name, named, constructor, tag, "Object", -1);
+    if (deref name.length > 0) {
+        deref name.length = deref name.length - 1;
+    }
+    if (named > 0) {
+        text_unit(ins, dest, 91);
+        text_append(ins, dest, name);
+        text_unit(ins, dest, 93);
+    } else {
+        text_append(ins, dest, name);
+    }
+    text_free(name);
+}
+
+fun format_children(ins: ptr<Inspector>, value: ptr<u8>, own: ptr<u8>, recurse: i64, shape: i32, size: i64,
+    named: i32, constructor: ptr<Text>, tag: ptr<Text>, base: ptr<Text>, open: ptr<Text>, close: str,
+    array_extras: bool, keys: ptr<Keys>, dest: ptr<Text>) {
+    var ctx: ptr<u8> = deref ins.ctx;
+    if (recurse > deref ins.depth || deref ins.seen_count >= INSPECT_NESTING_LIMIT) {
+        if (shape == SHAPE_ARRAY && text_equals_ascii(constructor, "Array")) {
+            text_ascii(ins, dest, "[Array]");
+        } else {
+            depth_name(ins, named, constructor, tag, dest);
+        }
+        return;
+    }
+    var level: i64 = recurse + 1;
+    var entry: ptr<Seen> = deref ins.seen + deref ins.seen_count;
+    deref entry.value = value;
+    deref entry.reference = 0;
+    wr_protect(ctx, value);
+    deref ins.seen_count = deref ins.seen_count + 1;
+    deref ins.current_depth = level;
+    var output: Entries;
+    output.items = null;
+    output.count = 0;
+    output.capacity = 0;
+    var numeric: bool = false;
+    var has_more: bool = false;
+    if (shape == SHAPE_ARRAY) {
+        numeric = format_array_like(ins, value, own, size, level, &output);
+        has_more = size > deref ins.max_array;
+        if (keys.count > 0) {
+            numeric = false;
+        }
+    } else if (shape == SHAPE_TYPED) {
+        format_typed(ins, value, size, &output);
+        numeric = true;
+        has_more = size > deref ins.max_array;
+    } else if (shape == SHAPE_SET) {
+        format_collection(ins, value, false, size, level, &output);
+    } else if (shape == SHAPE_MAP) {
+        format_collection(ins, value, true, size, level, &output);
+    } else if (shape == SHAPE_ARRAY_BUFFER) {
+        var length: i64 = wr_array_buffer_length(ctx, value, deref ins.ex);
+        var bytes: ptr<u8> = wr_array_buffer_bytes(ctx, value, deref ins.ex);
+        var contents: ptr<Text> = text_new(ins);
+        text_ascii(ins, contents, "[Uint8Contents]: <");
+        if (bytes != null) {
+            hex_bytes(ins, contents, bytes, length, deref ins.max_array);
+        }
+        text_unit(ins, contents, 62);
+        entries_push(ins, &output, contents);
+        var byte_length: ptr<Text> = text_new(ins);
+        text_ascii(ins, byte_length, "[byteLength]: ");
+        text_integer(ins, byte_length, length);
+        entries_push(ins, &output, byte_length);
+    } else if (shape == SHAPE_UNKNOWN) {
+        if (text_contains(open, 80)) {
+            push_ascii(ins, &output, "<unknown>");
+        } else {
+            push_ascii(ins, &output, "<items unknown>");
+        }
+    }
+    var mode: i32 = PROPERTY_OBJECT;
+    if (array_extras) {
+        mode = PROPERTY_ARRAY_EXTRA;
+    }
+    for (var i: i64 = 0; i < deref keys.count && !failed(ins); i++) {
+        entries_push(ins, &output, format_property(ins, value, (deref keys.items)[i], level, mode));
+    }
+    deref ins.seen_count = deref ins.seen_count - 1;
+    wr_unprotect(ctx, value);
+    var reference: i64 = deref entry.reference;
+    var composed_base: ptr<Text> = text_new(ins);
+    if (reference > 0) {
+        text_ascii(ins, composed_base, "<ref *");
+        text_integer(ins, composed_base, reference);
+        text_unit(ins, composed_base, 62);
+        if (deref base.length > 0) {
+            text_unit(ins, composed_base, 32);
+        }
+    }
+    text_append(ins, composed_base, base);
+    if (!failed(ins)) {
+        reduce_output(ins, &output, composed_base, open, close, array_extras, level, has_more, numeric, dest);
+    }
+    text_free(composed_base);
+    entries_free(&output);
+}
+
+// ---------------------------------------------------------------------------
+// Public entry points
+
+pub fun inspector_init(ins: ptr<Inspector>, ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    deref ins.ctx = ctx;
+    deref ins.ex = ex;
+    deref ins.depth = DEFAULT_DEPTH;
+    deref ins.break_length = DEFAULT_BREAK_LENGTH;
+    deref ins.max_array = DEFAULT_ARRAY_LIMIT;
+    deref ins.max_string = DEFAULT_STRING_LIMIT;
+    deref ins.indentation = 0;
+    deref ins.current_depth = 0;
+    deref ins.circular = 0;
+    deref ins.seen_count = 0;
+    deref ins.overflow = false;
+    deref ins.options = null;
+    deref ins.seen = mem_alloc_zeroed(INSPECT_NESTING_LIMIT * (size_of<Seen>() as i64)) as ptr<Seen>;
+    if (deref ins.seen == null) {
+        fail(ctx, ex, 2, "cannot allocate inspection state");
+        return false;
+    }
+    return true;
+}
+
+pub fun inspector_free(ins: ptr<Inspector>) {
+    if (deref ins.seen != null) {
+        mem_free(deref ins.seen as ptr<u8>, INSPECT_NESTING_LIMIT * (size_of<Seen>() as i64));
+        deref ins.seen = null;
+    }
+    if (deref ins.options != null) {
+        wr_unprotect(deref ins.ctx, deref ins.options);
+        deref ins.options = null;
+    }
+}
+
+fun limit_option(ins: ptr<Inspector>, options: ptr<u8>, name: str, fallback: i64, nullable: bool) -> i64 {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var value: ptr<u8> = get(ctx, options, name, deref ins.ex);
+    if (failed(ins)) {
+        return fallback;
+    }
+    var kind: i32 = wr_type(ctx, value);
+    if (kind == JS_UNDEFINED) {
+        return fallback;
+    }
+    if (kind == JS_NULL && nullable) {
+        return UNLIMITED_DEPTH;
+    }
+    if (kind != JS_NUMBER) {
+        fail(ctx, deref ins.ex, 1, "inspect option must be a number");
+        return fallback;
+    }
+    var number: f64 = wr_to_number(ctx, value, deref ins.ex);
+    if (number != number) {
+        fail(ctx, deref ins.ex, 2, "inspect option must not be NaN");
+        return fallback;
+    }
+    if (number >= UNLIMITED_DEPTH as f64) {
+        return UNLIMITED_DEPTH;
+    }
+    if (number < 0.0) {
+        if (nullable) {
+            return -1;
+        }
+        return 0;
+    }
+    return number as i64;
+}
+
+// Reads the supported options: depth, breakLength, maxArrayLength and
+// maxStringLength. Other Node options such as colors are accepted and ignored.
+pub fun inspector_options(ins: ptr<Inspector>, options: ptr<u8>) {
+    var ctx: ptr<u8> = deref ins.ctx;
+    if (options == null || wr_type(ctx, options) != JS_OBJECT) {
+        return;
+    }
+    deref ins.depth = limit_option(ins, options, "depth", deref ins.depth, true);
+    deref ins.break_length = limit_option(ins, options, "breakLength", deref ins.break_length, false);
+    deref ins.max_array = limit_option(ins, options, "maxArrayLength", deref ins.max_array, true);
+    deref ins.max_string = limit_option(ins, options, "maxStringLength", deref ins.max_string, true);
+    if (deref ins.max_array < 0) {
+        deref ins.max_array = 0;
+    }
+    if (deref ins.max_string < 0) {
+        deref ins.max_string = 0;
+    }
+    if (deref ins.options == null) {
+        wr_protect(ctx, options);
+        deref ins.options = options;
+    }
+}
+
+pub fun inspector_depth(ins: ptr<Inspector>, depth: i64) {
+    deref ins.depth = depth;
+}
+
+pub fun inspector_finish(ins: ptr<Inspector>) -> bool {
+    if (deref deref ins.ex != null) {
+        return false;
+    }
+    if (deref ins.overflow) {
+        fail(deref ins.ctx, deref ins.ex, 2, "inspect output limit exceeded (4 Mi units)");
+        return false;
+    }
+    return true;
+}
+
+pub fun text_create(ins: ptr<Inspector>) -> ptr<Text> {
+    return text_new(ins);
+}
+
+pub fun text_release(t: ptr<Text>) {
+    text_free(t);
+}
+
+pub fun text_add_ascii(ins: ptr<Inspector>, t: ptr<Text>, value: str) {
+    text_ascii(ins, t, value);
+}
+
+pub fun text_add_units(ins: ptr<Inspector>, t: ptr<Text>, units: ptr<u16>, length: i64) {
+    text_units(ins, t, units, length);
+}
+
+pub fun text_add_js(ins: ptr<Inspector>, t: ptr<Text>, value: ptr<u8>) {
+    text_js(ins, t, value);
+}
+
+pub fun text_add_number(ins: ptr<Inspector>, t: ptr<Text>, value: ptr<u8>) {
+    if (wr_type(deref ins.ctx, value) == JS_BIGINT) {
+        format_bigint(ins, t, value);
+    } else {
+        format_number(ins, t, value);
+    }
+}
+
+pub fun inspect_failed(ins: ptr<Inspector>) -> bool {
+    return failed(ins);
+}
+
+pub fun inspect_intrinsic(ctx: ptr<u8>, index: i64) -> ptr<u8> {
+    return intrinsic(ctx, index);
+}
+
+pub const INSPECT_JSON_STRINGIFY: i64 = 28;
+pub const INSPECT_PARSE_INT: i64 = 29;
+pub const INSPECT_PARSE_FLOAT: i64 = 30;
+pub const INSPECT_STRING: i64 = 31;
+pub const INSPECT_CUSTOM: i64 = 25;
+
+// Node's hasBuiltInToString for %s: user-defined toString methods are called,
+// built-in ones are replaced by inspection at depth 0.
+pub fun builtin_to_string(ins: ptr<Inspector>, value: ptr<u8>) -> bool {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var ignored: ptr<u8> = null;
+    var method: ptr<u8> = get(ctx, value, "toString", &ignored);
+    if (ignored != null || wr_type(ctx, method) != JS_OBJECT || !wr_callable(ctx, method)) {
+        return true;
+    }
+    var key: ptr<u8> = ascii_value(ins, "toString");
+    wr_protect(ctx, key);
+    var owner: ptr<u8> = value;
+    var found: bool = false;
+    for (var i: i64 = 0; i < 256 && owner != null && wr_type(ctx, owner) == JS_OBJECT; i++) {
+        var args: array<ptr<u8>, 2> = [owner, key];
+        var desc: ptr<u8> = wr_call(ctx, intrinsic(ctx, I_DESCRIPTOR), null, 2, &args[0], &ignored);
+        if (ignored != null) {
+            break;
+        }
+        if (desc != null && wr_type(ctx, desc) == JS_OBJECT) {
+            found = true;
+            break;
+        }
+        owner = prototype_of(ins, owner);
+    }
+    wr_unprotect(ctx, key);
+    if (!found || wr_equal(ctx, owner, value)) {
+        return false;
+    }
+    var ctor_key: ptr<u8> = ascii_value(ins, "constructor");
+    var args: array<ptr<u8>, 2> = [owner, ctor_key];
+    var ctor_desc: ptr<u8> = wr_call(ctx, intrinsic(ctx, I_DESCRIPTOR), null, 2, &args[0], &ignored);
+    if (ignored != null || ctor_desc == null || wr_type(ctx, ctor_desc) != JS_OBJECT) {
+        return false;
+    }
+    var ctor: ptr<u8> = get(ctx, ctor_desc, "value", &ignored);
+    if (ignored != null || wr_type(ctx, ctor) != JS_OBJECT || !wr_callable(ctx, ctor)) {
+        return false;
+    }
+    var name: ptr<u8> = get(ctx, ctor, "name", &ignored);
+    if (ignored != null || wr_type(ctx, name) != JS_STRING) {
+        return false;
+    }
+    // A built-in owner is an intrinsic global constructor of the same name.
+    var global_ctor: ptr<u8> = null;
+    var js: ptr<u8> = wr_to_string(ctx, name, &ignored);
+    if (js == null) {
+        return false;
+    }
+    var global_args: array<ptr<u8>, 2> = [wr_context_global(ctx), wr_string_value(ctx, js)];
+    wr_string_release(js);
+    global_ctor = wr_call(ctx, intrinsic(ctx, I_REFLECT_GET), null, 2, &global_args[0], &ignored);
+    return ignored == null && global_ctor != null && wr_equal(ctx, global_ctor, ctor);
+}
+
+fun capture_path(ctx: ptr<u8>, root: ptr<u8>, first: str, second: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var object: ptr<u8> = get(ctx, root, first, ex);
+    if (deref ex != null) {
+        return null;
+    }
+    var result: ptr<u8> = get(ctx, object, second, ex);
+    if (deref ex != null || result == null) {
+        return null;
+    }
+    return result;
+}
+
+fun capture_prototype(ctx: ptr<u8>, name: str, member: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var ctor: ptr<u8> = get(ctx, wr_context_global(ctx), name, ex);
+    var is_proto: ptr<u8> = get(ctx, ctor, "prototype", ex);
+    return get(ctx, is_proto, member, ex);
+}
+
+fun capture_getter(ctx: ptr<u8>, name: str, member: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var reflect: ptr<u8> = get(ctx, wr_context_global(ctx), "Reflect", ex);
+    var describe: ptr<u8> = get(ctx, reflect, "getOwnPropertyDescriptor", ex);
+    var ctor: ptr<u8> = get(ctx, wr_context_global(ctx), name, ex);
+    var is_proto: ptr<u8> = get(ctx, ctor, "prototype", ex);
+    if (deref ex != null) {
+        return null;
+    }
+    var key: ptr<u8> = wr_string_utf8(member);
+    var args: array<ptr<u8>, 2> = [is_proto, wr_string_value(ctx, key)];
+    wr_string_release(key);
+    var desc: ptr<u8> = wr_call(ctx, describe, null, 2, &args[0], ex);
+    if (deref ex != null || desc == null) {
+        return null;
+    }
+    return get(ctx, desc, "get", ex);
+}
+
+fun store(ctx: ptr<u8>, index: i64, value: ptr<u8>) {
+    var s: ptr<InspectState> = state(ctx);
+    if (value == null || wr_type(ctx, value) == JS_UNDEFINED) {
+        (deref s.values)[index] = null;
+        return;
+    }
+    wr_protect(ctx, value);
+    (deref s.values)[index] = value;
+}
+
+// Captures intrinsics after JSON (wjson), Buffer and the global constructors
+// exist and before user code runs.
+pub fun install_inspect(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (!allocate_context_slot(ctx, INSPECT_SLOT, size_of<InspectState>() as i64)) {
+        return false;
+    }
+    var root: ptr<u8> = wr_context_global(ctx);
+    store(ctx, I_OWN_KEYS, capture_path(ctx, root, "Reflect", "ownKeys", ex));
+    store(ctx, I_DESCRIPTOR, capture_path(ctx, root, "Reflect", "getOwnPropertyDescriptor", ex));
+    store(ctx, I_REFLECT_GET, capture_path(ctx, root, "Reflect", "get", ex));
+    store(ctx, I_OBJECT_TO_STRING, capture_prototype(ctx, "Object", "toString", ex));
+    store(ctx, I_FUNCTION_TO_STRING, capture_prototype(ctx, "Function", "toString", ex));
+    store(ctx, I_MAP_ENTRIES, capture_prototype(ctx, "Map", "entries", ex));
+    store(ctx, I_SET_VALUES, capture_prototype(ctx, "Set", "values", ex));
+    store(ctx, I_MAP_SIZE, capture_getter(ctx, "Map", "size", ex));
+    store(ctx, I_SET_SIZE, capture_getter(ctx, "Set", "size", ex));
+    store(ctx, I_DATE_TIME, capture_prototype(ctx, "Date", "getTime", ex));
+    store(ctx, I_DATE_ISO, capture_prototype(ctx, "Date", "toISOString", ex));
+    store(ctx, I_DATE_STRING, capture_prototype(ctx, "Date", "toString", ex));
+    store(ctx, I_REGEXP_STRING, capture_prototype(ctx, "RegExp", "toString", ex));
+    store(ctx, I_REGEXP_SOURCE, capture_getter(ctx, "RegExp", "source", ex));
+    store(ctx, I_ERROR_PROTOTYPE, capture_path(ctx, root, "Error", "prototype", ex));
+    store(ctx, I_SYMBOL_STRING, capture_prototype(ctx, "Symbol", "toString", ex));
+    store(ctx, I_SYMBOL_VALUE, capture_prototype(ctx, "Symbol", "valueOf", ex));
+    store(ctx, I_NUMBER_VALUE, capture_prototype(ctx, "Number", "valueOf", ex));
+    store(ctx, I_STRING_VALUE, capture_prototype(ctx, "String", "valueOf", ex));
+    store(ctx, I_BOOLEAN_VALUE, capture_prototype(ctx, "Boolean", "valueOf", ex));
+    store(ctx, I_BIGINT_VALUE, capture_prototype(ctx, "BigInt", "valueOf", ex));
+    store(ctx, I_BUFFER_PROTOTYPE, capture_path(ctx, root, "Buffer", "prototype", ex));
+    store(ctx, I_TAG_SYMBOL, capture_path(ctx, root, "Symbol", "toStringTag", ex));
+    store(ctx, I_WEAKMAP_HAS, capture_prototype(ctx, "WeakMap", "has", ex));
+    store(ctx, I_WEAKSET_HAS, capture_prototype(ctx, "WeakSet", "has", ex));
+    store(ctx, I_JSON_STRINGIFY, capture_path(ctx, root, "JSON", "stringify", ex));
+    store(ctx, I_PARSE_INT, get(ctx, root, "parseInt", ex));
+    store(ctx, I_PARSE_FLOAT, get(ctx, root, "parseFloat", ex));
+    store(ctx, I_STRING, get(ctx, root, "String", ex));
+    store(ctx, I_FUNCTION_PROTOTYPE, capture_path(ctx, root, "Function", "prototype", ex));
+    store(ctx, I_GET_PROTOTYPE, capture_path(ctx, root, "Reflect", "getPrototypeOf", ex));
+    if (deref ex != null) {
+        return false;
+    }
+    // Iterator prototypes' next methods come from fresh private collections.
+    var map_ctor: ptr<u8> = get(ctx, root, "Map", ex);
+    var set_ctor: ptr<u8> = get(ctx, root, "Set", ex);
+    var construct: ptr<u8> = capture_path(ctx, root, "Reflect", "construct", ex);
+    if (deref ex != null) {
+        return false;
+    }
+    var no_values: ptr<u8> = null;
+    var list_ctor: ptr<u8> = get(ctx, root, "Array", ex);
+    no_values = wr_call(ctx, get(ctx, list_ctor, "of", ex), list_ctor, 0, null, ex);
+    if (deref ex != null || no_values == null) {
+        return false;
+    }
+    wr_protect(ctx, no_values);
+    var map_args: array<ptr<u8>, 2> = [map_ctor, no_values];
+    var map: ptr<u8> = wr_call(ctx, construct, null, 2, &map_args[0], ex);
+    var set_args: array<ptr<u8>, 2> = [set_ctor, no_values];
+    var set: ptr<u8> = wr_call(ctx, construct, null, 2, &set_args[0], ex);
+    wr_unprotect(ctx, no_values);
+    if (deref ex != null || map == null || set == null) {
+        return false;
+    }
+    var map_iterator: ptr<u8> = wr_call(ctx, intrinsic(ctx, I_MAP_ENTRIES), map, 0, null, ex);
+    var set_iterator: ptr<u8> = wr_call(ctx, intrinsic(ctx, I_SET_VALUES), set, 0, null, ex);
+    if (deref ex != null) {
+        return false;
+    }
+    store(ctx, I_MAP_NEXT, get(ctx, map_iterator, "next", ex));
+    store(ctx, I_SET_NEXT, get(ctx, set_iterator, "next", ex));
+    // util.inspect.custom is the shared registry symbol used by npm packages.
+    var symbol_ctor: ptr<u8> = get(ctx, root, "Symbol", ex);
+    var symbol_for: ptr<u8> = get(ctx, symbol_ctor, "for", ex);
+    var custom_name: ptr<u8> = wr_string_utf8("nodejs.util.inspect.custom");
+    var custom_args: array<ptr<u8>, 1> = [wr_string_value(ctx, custom_name)];
+    wr_string_release(custom_name);
+    if (deref ex == null) {
+        store(ctx, I_CUSTOM_SYMBOL, wr_call(ctx, symbol_for, symbol_ctor, 1, &custom_args[0], ex));
+    }
+    if (deref ex != null) {
+        return false;
+    }
+    for (var i: i64 = 0; i < INTRINSIC_COUNT; i++) {
+        if (i != I_INSPECT && i != I_BUFFER_PROTOTYPE && intrinsic(ctx, i) == null) {
+            fail(ctx, ex, 0, "cannot capture inspection intrinsics");
+            return false;
+        }
+    }
+    return true;
+}
+
+// util.inspect itself is excluded from custom hooks to avoid self-recursion.
+pub fun set_inspect_function(ctx: ptr<u8>, fn: ptr<u8>) {
+    store(ctx, I_INSPECT, fn);
+}
+
+pub fun shutdown_inspect(ctx: ptr<u8>) {
+    var s: ptr<InspectState> = state(ctx);
+    if (s == null) {
+        return;
+    }
+    for (var i: i64 = 0; i < INTRINSIC_COUNT; i++) {
+        if ((deref s.values)[i] != null) {
+            wr_unprotect(ctx, (deref s.values)[i]);
+            (deref s.values)[i] = null;
+        }
+    }
+    release_context_slot(ctx, INSPECT_SLOT, size_of<InspectState>() as i64);
+}

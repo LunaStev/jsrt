@@ -7,6 +7,9 @@ pub const ENGINE_PATCH: u32 = 0;
 // Compiled host limits. --info reports these same constants.
 pub const SOURCE_LIMIT: i64 = 4194304;
 pub const OUTPUT_LIMIT: i64 = 4194304;
+// util.inspect/format/console text, in UTF-16 units, and nested object frames.
+pub const INSPECT_OUTPUT_LIMIT: i64 = 4194304;
+pub const INSPECT_NESTING_LIMIT: i64 = 256;
 pub const FILE_LIMIT: i64 = 4194304;
 pub const DIRECTORY_ENTRY_LIMIT: i64 = 65536;
 pub const DIRECTORY_BYTES_LIMIT: i64 = 4194304;

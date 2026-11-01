@@ -3,7 +3,7 @@
 import("std::mem::alloc")::{mem_alloc_zeroed, mem_free};
 extern(c, "wr_context_data") fun context_data(ctx: ptr<u8>) -> ptr<u8>;
 extern(c, "wr_context_set_data") fun context_set_data(ctx: ptr<u8>, data: ptr<u8>) -> bool;
-const SLOT_COUNT: i64 = 46;
+const SLOT_COUNT: i64 = 48;
 extern(c, "wr_active_context") fun current_context() -> ptr<u8>;
 pub fun active_context() -> ptr<u8> {
     return current_context();
@@ -18,6 +18,9 @@ pub const EVENTS_SLOT: i64 = 4;
 pub const TIMERS_SLOT: i64 = 5;
 pub const ASYNC_FS_SLOT: i64 = 6;
 pub const SYSTEM_SLOT: i64 = 7;
+// Slots 8-45 are owned by their modules. 46 holds inspection intrinsics.
+pub const INSPECT_SLOT: i64 = 46;
+pub const EXTRAS_SLOT: i64 = 47;
 pub fun context_slot(ctx: ptr<u8>, index: i64) -> ptr<u8> {
     if (index < 0 || index >= SLOT_COUNT) {
         return null;

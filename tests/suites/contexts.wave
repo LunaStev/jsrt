@@ -193,8 +193,8 @@ pub fun context_isolation_tests() {
         check("timer argument errors use each context TypeError", context_result(a, "(()=>{try{setTimeout(1)}catch(e){return e instanceof TypeError}})()",
             "true") && context_result(b, "(()=>{try{setTimeout(1)}catch(e){return e instanceof TypeError}})()",
             "true"));
-        check("timer identifiers begin independently in each context", context_result(a, "globalThis.timerTicks=0;setTimeout(()=>timerTicks++,1)",
-            "1") && context_result(b, "globalThis.timerTicks=0;setTimeout(()=>timerTicks++,1)", "1"));
+        check("timer identifiers begin independently in each context", context_result(a, "globalThis.timerTicks=0;+setTimeout(()=>timerTicks++,1)",
+            "1") && context_result(b, "globalThis.timerTicks=0;+setTimeout(()=>timerTicks++,1)", "1"));
         check("clearing an identifier only removes the current context timer", context_result(a, "clearTimeout(1);true",
             "true") && next_timer_deadline(a) == -1 && next_timer_deadline(b) >= 0);
         time_sleep_ms(3);
