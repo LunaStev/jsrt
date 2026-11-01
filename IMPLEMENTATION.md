@@ -203,3 +203,24 @@ File·multipart 파싱, 추가 Node API는 남아 있다. [ROADMAP.md](ROADMAP.m
   실제 TLS 통합 검사는 60초를 쓴다.
 - build·독립 test 각각 **1058/0/0**. 이번 후속에서는 새 release를 만들지 않았으므로 최신 archive(24dd2de3…)는
   Proxy 변경과 모듈 분할 이전의 소스로 만든 것이다. 현재 runtime SHA-256은 위 release 기록과 다르다.
+
+## 2026-11-02 전체 검토·검증
+
+사용자가 전체 검토와 검증을 요청했다. 코드는 이전 단계(모듈 분할·Proxy)에서 바뀐 상태 그대로 검사했다.
+
+| 항목 | 결과 |
+| --- | --- |
+| Wave 타입 검사 | runtime/main.wave·build.wave·test.wave 모두 exit 0 |
+| 모듈 그래프 | runtime/tools/tests/suites의 Wave 모듈 159개·상대 import 782개, 누락 0·순환 0 (이전 153/816과는 세는 방법이 다르다) |
+| C/C++ 서식 | 프로젝트 C/C++/헤더 clang-format exit 0 |
+| JS 구문 | tests의 JS/MJS/CJS 전부 --check 통과 |
+| 가독성 규칙 | 새 파일 8개에서 탭·끝 공백·4칸 아닌 들여쓰기·한 줄 두 문장·긴 줄 없음 |
+| build | 1058개·실패 0·네트워크 생략 0, --require-tcp --probe-worker-termination exit 0 |
+| 독립 test | 같은 옵션으로 1058/0/0, 수명 16회 FD 기준 5, RSS KiB 53496/54980/54888 |
+| test-npm | 1058/0/0, 공개 npm HTTPS 38/0 |
+| worker-leaks 256 | Valgrind exit 0, 확정/간접 누수 0, 오류 0, possible 456바이트 |
+| Node 대조 | 두 비교 스크립트에서 문서화된 차이 외에는 같은 출력 |
+
+worker-leaks의 still reachable은 직전 기록과 같은 1,152바이트(19블록)이다. 첫 실행에서 한 번 1,808바이트(28블록)가
+나왔으나 같은 조건의 재측정 4회(이전·현재 실행 파일 각 1회, 공식 도구 2회)에서 재현되지 않았다. 원인은 조사하지 않았으며
+확정/간접 누수가 아니므로 전체 누수 부재로 확대하지 않는다.
