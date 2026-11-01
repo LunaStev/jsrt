@@ -4,7 +4,7 @@ struct UtilState {
     exports: ptr<u8>;
     originals: ptr<u8>;
     set_prototype_fn: ptr<u8>;
-    methods: array<ptr<u8>, 5>;
+    methods: array<ptr<u8>, 7>;
 }
 
 fun util_storage(ctx: ptr<u8>) -> ptr<UtilState> {
@@ -16,6 +16,8 @@ import("./values")::{get, put, plain, define, fail, capture};
 import("./collections")::{bind_one, flag, set_flag, weak_map, weak_get, weak_set};
 import("./buffer_core")::{is_byte_view};
 import("./config")::{ARGUMENT_LIMIT};
+import("./format")::{format_to_value, inspect_to_value};
+import("./inspect")::{set_inspect_function, inspect_intrinsic, INSPECT_CUSTOM};
 extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
 extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
 extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
@@ -33,9 +35,22 @@ extern(c, "wr_promise") fun promise(ctx: ptr<u8>, resolve: ptr<ptr<u8>>, reject:
 extern(c, "jsrt_util_callback") fun callback() -> ptr<u8>;
 extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
 
+fun format_result(ctx: ptr<u8>, value: ptr<u8>) -> ptr<u8> {
+    if (value == null) {
+        return undefined(ctx);
+    }
+    return value;
+}
+
 export(c) fun jsrt_util_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
     ex: ptr<ptr<u8>>) -> ptr<u8> {
     var host_state: ptr<UtilState> = util_storage(ctx);
+    if (equal(ctx, fn, (deref host_state.methods)[5])) {
+        return format_result(ctx, format_to_value(ctx, count, args, ex));
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[6])) {
+        return format_result(ctx, inspect_to_value(ctx, count, args, ex));
+    }
     if (equal(ctx, fn, (deref host_state.methods)[4])) {
         if (count != 2 || kind(ctx, args[0]) != 5 || kind(ctx, args[1]) != 5 ||
             !callable(ctx, args[0]) || !callable(ctx, args[1])) {
@@ -159,8 +174,8 @@ pub fun install_util(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     protect(ctx, (deref host_state.originals));
     (deref host_state.exports) = plain(ctx);
     protect(ctx, (deref host_state.exports));
-    var names: array<str, 5> = ["promisify", "promisified", "completion", "isUint8Array", "inherits"];
-    for (var i: i64 = 0; i < 5; i++) {
+    var names: array<str, 7> = ["promisify", "promisified", "completion", "isUint8Array", "inherits", "format", "inspect"];
+    for (var i: i64 = 0; i < 7; i++) {
         var name: ptr<u8> = utf8(names[i]);
         (deref host_state.methods)[i] = function(ctx, name, callback());
         release(name);
@@ -168,6 +183,10 @@ pub fun install_util(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     }
     define(ctx, (deref host_state.exports), "promisify", (deref host_state.methods)[0], ex, false);
     define(ctx, (deref host_state.exports), "inherits", (deref host_state.methods)[4], ex, false);
+    define(ctx, (deref host_state.exports), "format", (deref host_state.methods)[5], ex, false);
+    define(ctx, (deref host_state.exports), "inspect", (deref host_state.methods)[6], ex, false);
+    define(ctx, (deref host_state.methods)[6], "custom", inspect_intrinsic(ctx, INSPECT_CUSTOM), ex, false);
+    set_inspect_function(ctx, (deref host_state.methods)[6]);
     var types: ptr<u8> = plain(ctx);
     protect(ctx, types);
     define(ctx, types, "isUint8Array", (deref host_state.methods)[3], ex, false);
@@ -195,7 +214,7 @@ pub fun shutdown_util(ctx: ptr<u8>) {
         unprotect(ctx, (deref host_state.exports));
         (deref host_state.exports) = null;
     }
-    for (var i: i64 = 0; i < 5; i++) {
+    for (var i: i64 = 0; i < 7; i++) {
         if ((deref host_state.methods)[i] != null) {
             unprotect(ctx, (deref host_state.methods)[i]);
             (deref host_state.methods)[i] = null;

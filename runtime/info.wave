@@ -5,7 +5,7 @@ import("wjson")::{JsonWriter, json_writer_new, json_writer_finish, json_writer_l
 import("std::io::fd")::{io_write_all};
 import("./wjson_platform")::{prepare_wjson};
 import("./config")::{PROCESS_PIPE_LIMIT, PROCESS_PIPE_CHUNK, NEXT_TICK_LIMIT, FORM_DATA_ENTRY_LIMIT,
-    STREAM_CORK_LIMIT, BLOB_TYPE_LIMIT};
+    STREAM_CORK_LIMIT, BLOB_TYPE_LIMIT, INSPECT_OUTPUT_LIMIT, INSPECT_NESTING_LIMIT};
 import("./config")::{ENGINE_MAJOR, ENGINE_MINOR, ENGINE_MICRO, ENGINE_PATCH, SOURCE_LIMIT, OUTPUT_LIMIT,
     FILE_LIMIT, DIRECTORY_ENTRY_LIMIT, DIRECTORY_BYTES_LIMIT, TIMER_LIMIT, ARGUMENT_LIMIT, MODULE_LIMIT,
     DEPTH_LIMIT, JOB_LIMIT, FILE_WORKERS, FILE_HANDLE_LIMIT, STREAM_OBJECT_HIGH_WATER_MARK, TEST_FILE_LIMIT, CHILD_LIMIT, CHILD_ARGUMENT_LIMIT, ADDON_LIMIT, ADDON_FUNCTION_LIMIT,
@@ -113,7 +113,8 @@ pub fun write_runtime_info(major: u32, minor: u32, micro: u32, patch: u32, compa
             "packageRegistryVersions", PACKAGE_REGISTRY_VERSION_LIMIT) && json_field_i64(&w, "packageDepth",
             PACKAGE_DEPTH_LIMIT) && json_field_i64(&w, "packagePathBytes", PACKAGE_PATH_CAP - 1) && json_field_i64(&w,
             "hashUpdateBytes", BUFFER_LIMIT) && json_field_i64(&w, "sourceBytes", SOURCE_LIMIT) && json_field_i64(&w,
-            "consoleUtf8Capacity", OUTPUT_LIMIT) && json_field_i64(&w, "fileBytes", FILE_LIMIT) && json_field_i64(&w,
+            "consoleUtf8Capacity", OUTPUT_LIMIT) && json_field_i64(&w, "inspectUnits", INSPECT_OUTPUT_LIMIT) &&
+            json_field_i64(&w, "inspectNesting", INSPECT_NESTING_LIMIT) && json_field_i64(&w, "fileBytes", FILE_LIMIT) && json_field_i64(&w,
             "directoryEntries", DIRECTORY_ENTRY_LIMIT) && json_field_i64(&w, "directoryNameBytes", DIRECTORY_BYTES_LIMIT) && json_field_i64(&w,
             "timers", TIMER_LIMIT) && json_field_i64(&w, "nextTicks", NEXT_TICK_LIMIT) &&
             json_field_i64(&w, "timerArguments", ARGUMENT_LIMIT) && json_field_i64(&w,

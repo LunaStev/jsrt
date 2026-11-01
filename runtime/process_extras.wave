@@ -1,0 +1,569 @@
+// Small process, clock and base64 globals: process.exit/hrtime/uptime/memoryUsage/pid,
+// global, performance.now, atob and btoa. Each native function is identified by
+// comparing the engine function object against the handles stored in this
+// context's state, so one C callback serves all of them.
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::time::clock")::{time_now_monotonic_ns, time_now_realtime_ns};
+import("std::process::core")::{proc_exit, proc_getpid, proc_getppid};
+import("std::sys::fs")::{open, FS_O_RDONLY};
+import("std::io::fd")::{io_read_at_most, io_close};
+import("./context_state")::{owned_context_slot, release_context_slot, EXTRAS_SLOT};
+import("./config")::{OUTPUT_LIMIT};
+import("./values")::{get, put, define, fail, plain, coerce_number};
+import("./system")::{system_exit_status, set_system_exit_status};
+import("./process_events")::{emit_process_exit};
+import("./child_process")::{shutdown_children};
+import("./workers")::{shutdown_workers};
+import("./worker_state")::{worker_state, WorkerState};
+
+extern(c, "wr_type") fun wr_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_equal") fun wr_equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun wr_undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_number") fun wr_number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_array") fun wr_array(ctx: ptr<u8>, count: i64, values: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_get_index") fun wr_get_index(ctx: ptr<u8>, obj: ptr<u8>, index: u32, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_is_array") fun wr_is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_to_number") fun wr_to_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_to_string") fun wr_to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_function") fun wr_function(ctx: ptr<u8>, name: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_construct") fun wr_construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_call") fun wr_call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun wr_protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_utf16") fun wr_string_utf16(text: ptr<u16>, length: i64) -> ptr<u8>;
+extern(c, "wr_string_value") fun wr_string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_characters") fun wr_string_characters(text: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_length") fun wr_string_length(text: ptr<u8>) -> i64;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_context_global") fun wr_context_global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "jsrt_extras_callback") fun jsrt_extras_callback() -> ptr<u8>;
+
+// Error constructors in values.wave: 0 Error, 1 TypeError, 2 RangeError.
+const ERROR_TYPE: i32 = 1;
+const ERROR_RANGE: i32 = 2;
+const JS_UNDEFINED: i32 = 0;
+const JS_NUMBER: i32 = 3;
+
+const NANOS_PER_SECOND: i64 = 1000000000;
+const NANOS_PER_MILLI: f64 = 1000000.0;
+const MAX_EXIT_CODE: f64 = 255.0;
+const STATM_CAPACITY: i64 = 128;
+const PAGE_SIZE: i64 = 4096;
+const MAX_PROCESS_EXIT_DEPTH: i64 = 1;
+
+// Function handles held in ExtrasState.functions.
+const FN_EXIT: i64 = 0;
+const FN_HRTIME: i64 = 1;
+const FN_HRTIME_BIGINT: i64 = 2;
+const FN_UPTIME: i64 = 3;
+const FN_MEMORY_USAGE: i64 = 4;
+const FN_MEMORY_RSS: i64 = 5;
+const FN_PERFORMANCE_NOW: i64 = 6;
+const FN_ATOB: i64 = 7;
+const FN_BTOA: i64 = 8;
+const FUNCTION_COUNT: i64 = 9;
+
+struct ExtrasState {
+    functions: array<ptr<u8>, 9>;
+    start_monotonic: i64;
+    start_realtime: i64;
+    bigint: ptr<u8>;
+    dom_exception: ptr<u8>;
+    exiting: i64;
+}
+
+fun extras_state(ctx: ptr<u8>) -> ptr<ExtrasState> {
+    return owned_context_slot(ctx, EXTRAS_SLOT, size_of<ExtrasState>() as i64) as ptr<ExtrasState>;
+}
+
+fun elapsed_nanos(ctx: ptr<u8>) -> i64 {
+    var s: ptr<ExtrasState> = extras_state(ctx);
+    var now: i64 = time_now_monotonic_ns();
+    if (now < deref s.start_monotonic) {
+        return 0;
+    }
+    return now - deref s.start_monotonic;
+}
+
+// ---------------------------------------------------------------------------
+// process.exit
+
+fun worker_context(ctx: ptr<u8>) -> bool {
+    var workers: ptr<WorkerState> = worker_state(ctx);
+    return workers != null && deref workers.parent != null;
+}
+
+// Validates the optional code. Returns -1 and sets ex on failure; -2 for "keep
+// the current process.exitCode".
+fun exit_argument(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> i32 {
+    if (count == 0 || wr_type(ctx, args[0]) == JS_UNDEFINED) {
+        return -2;
+    }
+    if (wr_type(ctx, args[0]) != JS_NUMBER) {
+        fail(ctx, ex, ERROR_TYPE, "exit code must be a number");
+        return -1;
+    }
+    var number: f64 = wr_to_number(ctx, args[0], ex);
+    if (deref ex != null) {
+        return -1;
+    }
+    if (number != number || number < 0.0 || number > MAX_EXIT_CODE || (number as i32) as f64 != number) {
+        fail(ctx, ex, ERROR_RANGE, "exit code must be an integer from 0 to 255");
+        return -1;
+    }
+    return number as i32;
+}
+
+// Order matters: validate, publish the code, run 'exit' listeners (which may
+// change process.exitCode), reap owned children and workers, then leave. The
+// stdout/stderr writers are synchronous, so nothing is left to flush.
+fun process_exit(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<ExtrasState> = extras_state(ctx);
+    if (worker_context(ctx)) {
+        fail(ctx, ex, 0, "process.exit() is not supported in Workers; set process.exitCode and return");
+        return wr_undefined(ctx);
+    }
+    var requested: i32 = exit_argument(ctx, count, args, ex);
+    if (requested == -1) {
+        return wr_undefined(ctx);
+    }
+    if (requested >= 0) {
+        set_system_exit_status(ctx, requested);
+    }
+    // A throwing or re-entrant exit listener must not run the listeners twice.
+    if (deref s.exiting >= MAX_PROCESS_EXIT_DEPTH) {
+        return wr_undefined(ctx);
+    }
+    deref s.exiting = deref s.exiting + 1;
+    emit_process_exit(ctx, system_exit_status(ctx), ex);
+    if (deref ex != null) {
+        deref s.exiting = deref s.exiting - 1;
+        return wr_undefined(ctx);
+    }
+    var status: i32 = system_exit_status(ctx);
+    var workers_ok: bool = shutdown_workers(ctx);
+    var children_ok: bool = shutdown_children(ctx);
+    if (!workers_ok || !children_ok) {
+        status = 1;
+    }
+    proc_exit(status);
+    return wr_undefined(ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Clocks and memory
+
+fun hrtime_pair(ctx: ptr<u8>, nanos: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var pair: array<ptr<u8>, 2> = [wr_number(ctx, (nanos / NANOS_PER_SECOND) as f64), wr_number(ctx,
+        (nanos % NANOS_PER_SECOND) as f64)];
+    return wr_array(ctx, 2, &pair[0], ex);
+}
+
+fun hrtime(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var now: i64 = time_now_monotonic_ns();
+    if (now < 0) {
+        fail(ctx, ex, 0, "cannot read the monotonic clock");
+        return wr_undefined(ctx);
+    }
+    if (count > 0 && wr_type(ctx, args[0]) != JS_UNDEFINED) {
+        if (!wr_is_array(ctx, args[0])) {
+            fail(ctx, ex, ERROR_TYPE, "hrtime argument must be a [seconds, nanoseconds] array");
+            return wr_undefined(ctx);
+        }
+        var seconds: f64 = wr_to_number(ctx, wr_get_index(ctx, args[0], 0, ex), ex);
+        var nanos: f64 = wr_to_number(ctx, wr_get_index(ctx, args[0], 1, ex), ex);
+        if (deref ex != null) {
+            return wr_undefined(ctx);
+        }
+        if (seconds != seconds || nanos != nanos || seconds < 0.0 || nanos < 0.0 || seconds > 9000000000.0) {
+            fail(ctx, ex, ERROR_RANGE, "hrtime argument must hold finite non-negative values");
+            return wr_undefined(ctx);
+        }
+        var previous: i64 = (seconds as i64) * NANOS_PER_SECOND + (nanos as i64);
+        var delta: i64 = now - previous;
+        if (delta < 0) {
+            delta = 0;
+        }
+        return hrtime_pair(ctx, delta, ex);
+    }
+    return hrtime_pair(ctx, now, ex);
+}
+
+// Decimal digits keep the full 64-bit range; a double would lose precision after 2^53.
+fun hrtime_bigint(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<ExtrasState> = extras_state(ctx);
+    var now: i64 = time_now_monotonic_ns();
+    if (now < 0) {
+        fail(ctx, ex, 0, "cannot read the monotonic clock");
+        return wr_undefined(ctx);
+    }
+    // Least significant digit first, then reversed into UTF-16 text.
+    var digits: array<u8, 24>;
+    var used: i64 = 0;
+    var rest: i64 = now;
+    if (rest == 0) {
+        digits[0] = 48;
+        used = 1;
+    }
+    while (rest > 0 && used < 23) {
+        digits[used] = (48 + rest % 10) as u8;
+        rest = rest / 10;
+        used += 1;
+    }
+    var text: array<u16, 24>;
+    for (var i: i64 = 0; i < used; i++) {
+        text[i] = digits[used - 1 - i] as u16;
+    }
+    var js: ptr<u8> = wr_string_utf16(&text[0], used);
+    var argument: array<ptr<u8>, 1> = [wr_string_value(ctx, js)];
+    wr_string_release(js);
+    return wr_call(ctx, deref s.bigint, null, 1, &argument[0], ex);
+}
+
+// Resident set size from /proc/self/statm (second field, in pages).
+fun resident_bytes() -> i64 {
+    var fd: i64 = open("/proc/self/statm", FS_O_RDONLY, 0);
+    if (fd < 0) {
+        return 0;
+    }
+    var buffer: array<u8, 128>;
+    var length: i64 = io_read_at_most(fd, &buffer[0], STATM_CAPACITY - 1);
+    io_close(fd);
+    if (length <= 0) {
+        return 0;
+    }
+    var index: i64 = 0;
+    while (index < length && buffer[index] != 32) {
+        index += 1;
+    }
+    index += 1;
+    var pages: i64 = 0;
+    while (index < length && buffer[index] >= 48 && buffer[index] <= 57) {
+        pages = pages * 10 + ((buffer[index] - 48) as i64);
+        index += 1;
+    }
+    return pages * PAGE_SIZE;
+}
+
+// JavaScriptCore's C API exposes no heap statistics, so only rss is measured.
+// The other Node fields are present for compatibility and report 0.
+fun memory_usage(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var usage: ptr<u8> = plain(ctx);
+    wr_protect(ctx, usage);
+    put(ctx, usage, "rss", wr_number(ctx, resident_bytes() as f64), ex);
+    put(ctx, usage, "heapTotal", wr_number(ctx, 0.0), ex);
+    put(ctx, usage, "heapUsed", wr_number(ctx, 0.0), ex);
+    put(ctx, usage, "external", wr_number(ctx, 0.0), ex);
+    put(ctx, usage, "arrayBuffers", wr_number(ctx, 0.0), ex);
+    wr_unprotect(ctx, usage);
+    return usage;
+}
+
+// ---------------------------------------------------------------------------
+// atob / btoa
+
+fun invalid_character(ctx: ptr<u8>, ex: ptr<ptr<u8>>, message: str) {
+    if (deref ex != null) {
+        return;
+    }
+    var s: ptr<ExtrasState> = extras_state(ctx);
+    var text: ptr<u8> = wr_string_utf8(message);
+    var name: ptr<u8> = wr_string_utf8("InvalidCharacterError");
+    var args: array<ptr<u8>, 2> = [wr_string_value(ctx, text), wr_string_value(ctx, name)];
+    wr_string_release(text);
+    wr_string_release(name);
+    if (deref s.dom_exception == null) {
+        fail(ctx, ex, 0, message);
+        return;
+    }
+    var nested: ptr<u8> = null;
+    var error: ptr<u8> = wr_construct(ctx, deref s.dom_exception, 2, &args[0], &nested);
+    if (nested != null) {
+        error = nested;
+    }
+    deref ex = error;
+}
+
+fun base64_value(unit: u16) -> i64 {
+    if (unit >= 65 && unit <= 90) {
+        return (unit - 65) as i64;
+    }
+    if (unit >= 97 && unit <= 122) {
+        return (unit - 71) as i64;
+    }
+    if (unit >= 48 && unit <= 57) {
+        return (unit + 4) as i64;
+    }
+    if (unit == 43) {
+        return 62;
+    }
+    if (unit == 47) {
+        return 63;
+    }
+    return -1;
+}
+
+fun ascii_whitespace(unit: u16) -> bool {
+    return unit == 9 || unit == 10 || unit == 12 || unit == 13 || unit == 32;
+}
+
+fun btoa(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0) {
+        fail(ctx, ex, ERROR_TYPE, "btoa requires a string");
+        return wr_undefined(ctx);
+    }
+    var js: ptr<u8> = wr_to_string(ctx, args[0], ex);
+    if (js == null) {
+        return wr_undefined(ctx);
+    }
+    var units: ptr<u16> = wr_string_characters(js);
+    var length: i64 = wr_string_length(js);
+    if (length > OUTPUT_LIMIT) {
+        wr_string_release(js);
+        fail(ctx, ex, ERROR_RANGE, "btoa input exceeds the output limit");
+        return wr_undefined(ctx);
+    }
+    for (var i: i64 = 0; i < length; i++) {
+        if (units[i] > 255) {
+            wr_string_release(js);
+            invalid_character(ctx, ex, "The string to be encoded contains characters outside of the Latin1 range.");
+            return wr_undefined(ctx);
+        }
+    }
+    var alphabet: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    var capacity: i64 = ((length + 2) / 3) * 4 + 1;
+    var output: ptr<u16> = mem_alloc(capacity * 2) as ptr<u16>;
+    if (output == null) {
+        wr_string_release(js);
+        fail(ctx, ex, ERROR_RANGE, "cannot allocate btoa output");
+        return wr_undefined(ctx);
+    }
+    var used: i64 = 0;
+    for (var at: i64 = 0; at < length; at += 3) {
+        var remaining: i64 = length - at;
+        var bits: u32 = (units[at] as u32) << 16;
+        if (remaining > 1) {
+            bits = bits | ((units[at + 1] as u32) << 8);
+        }
+        if (remaining > 2) {
+            bits = bits | (units[at + 2] as u32);
+        }
+        output[used] = alphabet[((bits >> 18) & 63) as i64] as u16;
+        output[used + 1] = alphabet[((bits >> 12) & 63) as i64] as u16;
+        if (remaining > 1) {
+            output[used + 2] = alphabet[((bits >> 6) & 63) as i64] as u16;
+        } else {
+            output[used + 2] = 61;
+        }
+        if (remaining > 2) {
+            output[used + 3] = alphabet[(bits & 63) as i64] as u16;
+        } else {
+            output[used + 3] = 61;
+        }
+        used += 4;
+    }
+    wr_string_release(js);
+    var encoded: ptr<u8> = wr_string_utf16(output, used);
+    mem_free(output as ptr<u8>, capacity * 2);
+    var result: ptr<u8> = wr_string_value(ctx, encoded);
+    wr_string_release(encoded);
+    return result;
+}
+
+// Forgiving-base64 decode from the HTML Standard: ASCII whitespace is removed,
+// one or two trailing '=' are allowed when the length is a multiple of four.
+fun atob(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0) {
+        fail(ctx, ex, ERROR_TYPE, "atob requires a string");
+        return wr_undefined(ctx);
+    }
+    var js: ptr<u8> = wr_to_string(ctx, args[0], ex);
+    if (js == null) {
+        return wr_undefined(ctx);
+    }
+    var units: ptr<u16> = wr_string_characters(js);
+    var length: i64 = wr_string_length(js);
+    if (length > OUTPUT_LIMIT) {
+        wr_string_release(js);
+        fail(ctx, ex, ERROR_RANGE, "atob input exceeds the output limit");
+        return wr_undefined(ctx);
+    }
+    var data: ptr<u16> = mem_alloc((length + 1) * 2) as ptr<u16>;
+    if (data == null) {
+        wr_string_release(js);
+        fail(ctx, ex, ERROR_RANGE, "cannot allocate atob input");
+        return wr_undefined(ctx);
+    }
+    var kept: i64 = 0;
+    for (var i: i64 = 0; i < length; i++) {
+        if (!ascii_whitespace(units[i])) {
+            data[kept] = units[i];
+            kept += 1;
+        }
+    }
+    wr_string_release(js);
+    if (kept % 4 == 0 && kept > 0 && data[kept - 1] == 61) {
+        kept -= 1;
+        if (data[kept - 1] == 61) {
+            kept -= 1;
+        }
+    }
+    var valid: bool = kept % 4 != 1;
+    for (var i: i64 = 0; i < kept && valid; i++) {
+        if (base64_value(data[i]) < 0) {
+            valid = false;
+        }
+    }
+    if (!valid) {
+        mem_free(data as ptr<u8>, (length + 1) * 2);
+        invalid_character(ctx, ex, "The string to be decoded is not correctly encoded.");
+        return wr_undefined(ctx);
+    }
+    var output: ptr<u16> = mem_alloc((kept + 1) * 2) as ptr<u16>;
+    if (output == null) {
+        mem_free(data as ptr<u8>, (length + 1) * 2);
+        fail(ctx, ex, ERROR_RANGE, "cannot allocate atob output");
+        return wr_undefined(ctx);
+    }
+    var used: i64 = 0;
+    var bits: u32 = 0;
+    var available: i64 = 0;
+    for (var i: i64 = 0; i < kept; i++) {
+        bits = ((bits << 6) | (base64_value(data[i]) as u32)) & 65535;
+        available += 6;
+        if (available >= 8) {
+            available -= 8;
+            output[used] = ((bits >> available) & 255) as u16;
+            used += 1;
+        }
+    }
+    mem_free(data as ptr<u8>, (length + 1) * 2);
+    var decoded: ptr<u8> = wr_string_utf16(output, used);
+    mem_free(output as ptr<u8>, (kept + 1) * 2);
+    var result: ptr<u8> = wr_string_value(ctx, decoded);
+    wr_string_release(decoded);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch and installation
+
+export(c) fun jsrt_extras_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<ExtrasState> = extras_state(ctx);
+    if (wr_equal(ctx, fn, (deref s.functions)[FN_EXIT])) {
+        return process_exit(ctx, count, args, ex);
+    }
+    if (wr_equal(ctx, fn, (deref s.functions)[FN_HRTIME])) {
+        return hrtime(ctx, count, args, ex);
+    }
+    if (wr_equal(ctx, fn, (deref s.functions)[FN_HRTIME_BIGINT])) {
+        return hrtime_bigint(ctx, ex);
+    }
+    if (wr_equal(ctx, fn, (deref s.functions)[FN_UPTIME])) {
+        return wr_number(ctx, (elapsed_nanos(ctx) as f64) / (NANOS_PER_SECOND as f64));
+    }
+    if (wr_equal(ctx, fn, (deref s.functions)[FN_MEMORY_USAGE])) {
+        return memory_usage(ctx, ex);
+    }
+    if (wr_equal(ctx, fn, (deref s.functions)[FN_MEMORY_RSS])) {
+        return wr_number(ctx, resident_bytes() as f64);
+    }
+    if (wr_equal(ctx, fn, (deref s.functions)[FN_PERFORMANCE_NOW])) {
+        return wr_number(ctx, (elapsed_nanos(ctx) as f64) / NANOS_PER_MILLI);
+    }
+    if (wr_equal(ctx, fn, (deref s.functions)[FN_ATOB])) {
+        return atob(ctx, count, args, ex);
+    }
+    if (wr_equal(ctx, fn, (deref s.functions)[FN_BTOA])) {
+        return btoa(ctx, count, args, ex);
+    }
+    return wr_undefined(ctx);
+}
+
+fun make_function(ctx: ptr<u8>, index: i64, name: str) -> ptr<u8> {
+    var s: ptr<ExtrasState> = extras_state(ctx);
+    var key: ptr<u8> = wr_string_utf8(name);
+    var function: ptr<u8> = wr_function(ctx, key, jsrt_extras_callback());
+    wr_string_release(key);
+    if (function != null) {
+        wr_protect(ctx, function);
+        (deref s.functions)[index] = function;
+    }
+    return function;
+}
+
+pub fun install_process_extras(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var s: ptr<ExtrasState> = extras_state(ctx);
+    if (s == null) {
+        return false;
+    }
+    deref s.start_monotonic = time_now_monotonic_ns();
+    deref s.start_realtime = time_now_realtime_ns();
+    var root: ptr<u8> = wr_context_global(ctx);
+    var bigint: ptr<u8> = get(ctx, root, "BigInt", ex);
+    var dom: ptr<u8> = get(ctx, root, "DOMException", ex);
+    if (deref ex != null || bigint == null) {
+        return false;
+    }
+    wr_protect(ctx, bigint);
+    deref s.bigint = bigint;
+    if (dom != null && wr_type(ctx, dom) == 5) {
+        wr_protect(ctx, dom);
+        deref s.dom_exception = dom;
+    }
+    var process: ptr<u8> = get(ctx, root, "process", ex);
+    if (deref ex != null || process == null) {
+        return false;
+    }
+    wr_protect(ctx, process);
+    // global is the legacy alias of globalThis.
+    define(ctx, root, "global", root, ex, false);
+    define(ctx, root, "atob", make_function(ctx, FN_ATOB, "atob"), ex, false);
+    define(ctx, root, "btoa", make_function(ctx, FN_BTOA, "btoa"), ex, false);
+    define(ctx, process, "exit", make_function(ctx, FN_EXIT, "exit"), ex, true);
+    var hrtime_function: ptr<u8> = make_function(ctx, FN_HRTIME, "hrtime");
+    define(ctx, hrtime_function, "bigint", make_function(ctx, FN_HRTIME_BIGINT, "bigint"), ex, true);
+    define(ctx, process, "hrtime", hrtime_function, ex, true);
+    define(ctx, process, "uptime", make_function(ctx, FN_UPTIME, "uptime"), ex, true);
+    var memory_function: ptr<u8> = make_function(ctx, FN_MEMORY_USAGE, "memoryUsage");
+    define(ctx, memory_function, "rss", make_function(ctx, FN_MEMORY_RSS, "rss"), ex, true);
+    define(ctx, process, "memoryUsage", memory_function, ex, true);
+    define(ctx, process, "pid", wr_number(ctx, proc_getpid() as f64), ex, true);
+    define(ctx, process, "ppid", wr_number(ctx, proc_getppid() as f64), ex, true);
+    var performance: ptr<u8> = plain(ctx);
+    wr_protect(ctx, performance);
+    define(ctx, performance, "now", make_function(ctx, FN_PERFORMANCE_NOW, "now"), ex, true);
+    define(ctx, performance, "timeOrigin", wr_number(ctx, (deref s.start_realtime as f64) / NANOS_PER_MILLI), ex, true);
+    define(ctx, root, "performance", performance, ex, false);
+    wr_unprotect(ctx, performance);
+    wr_unprotect(ctx, process);
+    return deref ex == null;
+}
+
+pub fun shutdown_process_extras(ctx: ptr<u8>) {
+    var s: ptr<ExtrasState> = extras_state(ctx);
+    if (s == null) {
+        return;
+    }
+    for (var i: i64 = 0; i < FUNCTION_COUNT; i++) {
+        if ((deref s.functions)[i] != null) {
+            wr_unprotect(ctx, (deref s.functions)[i]);
+            (deref s.functions)[i] = null;
+        }
+    }
+    if (deref s.bigint != null) {
+        wr_unprotect(ctx, deref s.bigint);
+        deref s.bigint = null;
+    }
+    if (deref s.dom_exception != null) {
+        wr_unprotect(ctx, deref s.dom_exception);
+        deref s.dom_exception = null;
+    }
+    // Slot 47 lies outside release_host_slots, so this module releases it.
+    release_context_slot(ctx, EXTRAS_SLOT, size_of<ExtrasState>() as i64);
+}

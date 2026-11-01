@@ -741,6 +741,11 @@ pub fun install_system(ctx: ptr<u8>, source_index: i32, eval_mode: bool) -> bool
     return ex == null;
 }
 
+// Used by process.exit(code); the value has already been range-checked.
+pub fun set_system_exit_status(ctx: ptr<u8>, code: i32) {
+    deref exit_code(ctx) = code;
+}
+
 pub fun system_exit_status(ctx: ptr<u8>) -> i32 {
     return deref exit_code(ctx);
 }

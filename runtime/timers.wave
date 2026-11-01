@@ -4,6 +4,7 @@ import("std::mem::layout")::{size_of};
 import("std::time::clock")::{time_now_monotonic_ns};
 import("./context_state")::{context_slot, allocate_context_slot, release_context_slot, TIMERS_SLOT};
 import("./config")::{TIMER_LIMIT, ARGUMENT_LIMIT};
+import("./values")::{define, define_key};
 
 extern(c, "wr_undefined") fun wr_undefined(context: ptr<u8>) -> ptr<u8>;
 extern(c, "wr_number") fun wr_number(context: ptr<u8>, value: f64) -> ptr<u8>;
@@ -29,6 +30,9 @@ extern(c, "wr_set") fun wr_set(context: ptr<u8>, object: ptr<u8>, name: ptr<u8>,
     exception: ptr<ptr<u8>>);
 extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
 extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_get_prototype") fun wr_get_prototype(context: ptr<u8>, object: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_equal") fun wr_equal(context: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_to_boolean") fun wr_to_boolean(context: ptr<u8>, value: ptr<u8>) -> bool;
 extern(c, "jsrt_timer_callback") fun jsrt_timer_callback(kind: i32) -> ptr<u8>;
 extern(c, "wr_rejection_handler") fun wr_rejection_handler(context: ptr<u8>, function: ptr<u8>, exception: ptr<ptr<u8>>);
 
@@ -37,7 +41,9 @@ const MAX_ID: i64 = 9007199254740991;
 struct Timer {
     id: i64;
     deadline: i64;
+    delay: i64;
     interval: i64;
+    refed: bool;
     callback: ptr<u8>;
     args: ptr<ptr<u8>>;
     count: i64;
@@ -60,6 +66,9 @@ struct TimerState {
     rejection_callback: ptr<u8>;
     rejection_monitoring: bool;
     rejection_failed: bool;
+    timer_prototype: ptr<u8>;
+    methods: array<ptr<u8>, 6>;
+    to_primitive: ptr<u8>;
 }
 
 fun timer_state(context: ptr<u8>) -> ptr<TimerState> {
@@ -125,27 +134,125 @@ fun release_timer(context: ptr<u8>, timer: ptr<Timer>) {
     deref timer.count = 0;
     deref timer.active = false;
     deref timer.running = false;
+    deref timer.refed = false;
 }
 
-fun schedule(context: ptr<u8>, count: i64, args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>, repeating: bool) -> ptr<u8> {
+// Timer method slots in TimerState.methods.
+const METHOD_REF: i64 = 0;
+const METHOD_UNREF: i64 = 1;
+const METHOD_HAS_REF: i64 = 2;
+const METHOD_REFRESH: i64 = 3;
+const METHOD_CLOSE: i64 = 4;
+const METHOD_TO_PRIMITIVE: i64 = 5;
+const TIMER_ID_PROPERTY: str = "_jsrtTimerId";
+
+// Creates the Timeout/Immediate object returned to JavaScript. The numeric
+// identifier is a non-enumerable property so clearTimeout can accept either form.
+fun timer_object(context: ptr<u8>, id: i64, exception: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<TimerState> = timer_state(context);
+    var handle: ptr<u8> = wr_object(context, null, null);
+    wr_protect(context, handle);
+    wr_set_prototype(context, handle, deref s.timer_prototype);
+    define(context, handle, TIMER_ID_PROPERTY, wr_number(context, id as f64), exception, false);
+    wr_unprotect(context, handle);
+    return handle;
+}
+
+fun timer_for_handle(context: ptr<u8>, handle: ptr<u8>) -> ptr<Timer> {
+    var s: ptr<TimerState> = timer_state(context);
+    var ignored: ptr<u8> = null;
+    var key: ptr<u8> = wr_string_utf8(TIMER_ID_PROPERTY);
+    var id_value: ptr<u8> = wr_get(context, handle, key, &ignored);
+    wr_string_release(key);
+    if (ignored != null || id_value == null) {
+        return null;
+    }
+    var id: f64 = wr_to_number(context, id_value, &ignored);
+    if (ignored != null || id != id || id < 1.0) {
+        return null;
+    }
+    for (var i: i64 = 0; i < TIMER_LIMIT; i++) {
+        var timer: ptr<Timer> = deref s.storage + i;
+        if (deref timer.id == (id as i64)) {
+            return timer;
+        }
+    }
+    return null;
+}
+
+// Shared native entry for the Timeout/Immediate prototype methods.
+export(c) fun jsrt_timer_method(context: ptr<u8>, function: ptr<u8>, this_object: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<TimerState> = timer_state(context);
+    if (s == null || this_object == null || !wr_is_object(context, this_object)) {
+        throw_error(context, exception, "timer method called on an incompatible receiver", false);
+        return wr_undefined(context);
+    }
+    var ignored: ptr<u8> = null;
+    var key: ptr<u8> = wr_string_utf8(TIMER_ID_PROPERTY);
+    var id_value: ptr<u8> = wr_get(context, this_object, key, &ignored);
+    wr_string_release(key);
+    if (ignored != null || id_value == null) {
+        throw_error(context, exception, "timer method called on an incompatible receiver", false);
+        return wr_undefined(context);
+    }
+    if (wr_equal(context, function, (deref s.methods)[METHOD_TO_PRIMITIVE])) {
+        return id_value;
+    }
+    var timer: ptr<Timer> = timer_for_handle(context, this_object);
+    if (wr_equal(context, function, (deref s.methods)[METHOD_HAS_REF])) {
+        return wr_boolean(context, timer != null && deref timer.refed);
+    }
+    if (timer != null) {
+        if (wr_equal(context, function, (deref s.methods)[METHOD_REF])) {
+            deref timer.refed = true;
+        } else if (wr_equal(context, function, (deref s.methods)[METHOD_UNREF])) {
+            deref timer.refed = false;
+        } else if (wr_equal(context, function, (deref s.methods)[METHOD_REFRESH])) {
+            var now: i64 = time_now_monotonic_ns();
+            if (now >= 0 && deref timer.active && now <= 9223372036854775807 - deref timer.delay) {
+                deref timer.deadline = now + deref timer.delay;
+            }
+        } else if (wr_equal(context, function, (deref s.methods)[METHOD_CLOSE])) {
+            deref timer.active = false;
+            if (!deref timer.running) {
+                release_timer(context, timer);
+            }
+        }
+    }
+    if (wr_equal(context, function, (deref s.methods)[METHOD_CLOSE])) {
+        return wr_undefined(context);
+    }
+    return this_object;
+}
+
+// first_argument is the index of the first callback argument: 2 for
+// setTimeout/setInterval (callback, delay, ...) and 1 for setImmediate.
+fun schedule(context: ptr<u8>, count: i64, args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>, repeating: bool,
+    immediate: bool) -> ptr<u8> {
     var s: ptr<TimerState> = timer_state(context);
     if (count < 1 || !wr_is_object(context, args[0]) || !wr_callable(context, args[0])) {
         throw_error(context, exception, "timer callback must be a function", false);
         return wr_undefined(context);
     }
     var delay: f64 = 1.0;
-    if (count > 1) {
+    var first_argument: i64 = 2;
+    if (immediate) {
+        delay = 0.0;
+        first_argument = 1;
+    }
+    if (count > 1 && !immediate) {
         delay = wr_to_number(context, args[1], exception);
         if (exception != null && deref exception != null) {
             return wr_undefined(context);
         }
     }
     // Match the common server-runtime minimum and signed-32-bit delay range.
-    if (delay != delay || delay < 1.0 || delay > 2147483647.0) {
+    if (!immediate && (delay != delay || delay < 1.0 || delay > 2147483647.0)) {
         delay = 1.0;
     }
     var nanos: i64 = (delay as i64) * 1000000;
-    if (count - 2 > ARGUMENT_LIMIT || deref s.next_id > MAX_ID) {
+    if (count - first_argument > ARGUMENT_LIMIT || deref s.next_id > MAX_ID) {
         throw_error(context, exception, "timer argument or identifier limit exceeded", true);
         return wr_undefined(context);
     }
@@ -166,7 +273,7 @@ fun schedule(context: ptr<u8>, count: i64, args: ptr<ptr<u8>>, exception: ptr<pt
         throw_error(context, exception, "cannot represent timer deadline", true);
         return wr_undefined(context);
     }
-    var argument_count: i64 = count - 2;
+    var argument_count: i64 = count - first_argument;
     if (argument_count < 0) {
         argument_count = 0;
     }
@@ -180,11 +287,13 @@ fun schedule(context: ptr<u8>, count: i64, args: ptr<ptr<u8>>, exception: ptr<pt
     }
     wr_protect(context, args[0]);
     for (var i: i64 = 0; i < argument_count; i++) {
-        deref copy[i] = args[i + 2];
+        deref copy[i] = args[i + first_argument];
         wr_protect(context, copy[i]);
     }
     deref slot.id = deref s.next_id;
     deref slot.deadline = now + nanos;
+    deref slot.delay = nanos;
+    deref slot.refed = true;
     deref slot.interval = 0;
     if (repeating) {
         deref slot.interval = nanos;
@@ -195,17 +304,28 @@ fun schedule(context: ptr<u8>, count: i64, args: ptr<ptr<u8>>, exception: ptr<pt
     deref slot.active = true;
     deref slot.running = false;
     deref s.next_id += 1;
-    return wr_number(context, (deref slot.id) as f64);
+    var handle: ptr<u8> = timer_object(context, deref slot.id, exception);
+    if (exception != null && deref exception != null) {
+        // The object could not be built, so the identifier is unreachable.
+        release_timer(context, slot);
+        return wr_undefined(context);
+    }
+    return handle;
 }
 
 export(c) fun jsrt_set_timeout(context: ptr<u8>, function: ptr<u8>, this_object: ptr<u8>, count: i64,
     args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>) -> ptr<u8> {
-    return schedule(context, count, args, exception, false);
+    return schedule(context, count, args, exception, false, false);
 }
 
 export(c) fun jsrt_set_interval(context: ptr<u8>, function: ptr<u8>, this_object: ptr<u8>, count: i64,
     args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>) -> ptr<u8> {
-    return schedule(context, count, args, exception, true);
+    return schedule(context, count, args, exception, true, false);
+}
+
+export(c) fun jsrt_set_immediate(context: ptr<u8>, function: ptr<u8>, this_object: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>) -> ptr<u8> {
+    return schedule(context, count, args, exception, false, true);
 }
 
 export(c) fun jsrt_clear_timer(context: ptr<u8>, function: ptr<u8>, this_object: ptr<u8>, count: i64,
@@ -422,6 +542,64 @@ fun install_microtasks(context: ptr<u8>) -> bool {
     return ok;
 }
 
+
+fun native_method(context: ptr<u8>, name: str, kind: i32) -> ptr<u8> {
+    var key: ptr<u8> = wr_string_utf8(name);
+    var result: ptr<u8> = wr_function(context, key, jsrt_timer_callback(kind));
+    wr_string_release(key);
+    if (result != null) {
+        wr_protect(context, result);
+    }
+    return result;
+}
+
+// Builds the shared Timeout/Immediate prototype. Methods are non-enumerable and
+// Symbol.toPrimitive yields the identifier so numeric clearTimeout use still works.
+fun install_timer_prototype(context: ptr<u8>) -> bool {
+    var s: ptr<TimerState> = timer_state(context);
+    var exception: ptr<u8> = null;
+    var prototype: ptr<u8> = wr_object(context, null, null);
+    wr_protect(context, prototype);
+    deref s.timer_prototype = prototype;
+    var names: array<str, 6> = ["ref", "unref", "hasRef", "refresh", "close", "toPrimitive"];
+    for (var i: i64 = 0; i < 6; i++) {
+        (deref s.methods)[i] = native_method(context, names[i], 7);
+        if ((deref s.methods)[i] == null) {
+            return false;
+        }
+    }
+    for (var i: i64 = 0; i < 5; i++) {
+        define(context, prototype, names[i], (deref s.methods)[i], &exception, false);
+    }
+    var symbol_constructor: ptr<u8> = capture_constructor(context, "Symbol");
+    if (symbol_constructor == null) {
+        return false;
+    }
+    var symbol: ptr<u8> = capture_property(context, symbol_constructor, "toPrimitive");
+    wr_unprotect(context, symbol_constructor);
+    if (symbol == null) {
+        return false;
+    }
+    deref s.to_primitive = symbol;
+    define_key(context, prototype, symbol, (deref s.methods)[METHOD_TO_PRIMITIVE], &exception, false);
+    return exception == null;
+}
+
+// True while a ref'ed timer can keep the event loop alive.
+pub fun timers_refed(context: ptr<u8>) -> bool {
+    var s: ptr<TimerState> = timer_state(context);
+    if (s == null || deref s.storage == null) {
+        return false;
+    }
+    for (var i: i64 = 0; i < TIMER_LIMIT; i++) {
+        var timer: ptr<Timer> = deref s.storage + i;
+        if (deref timer.id != 0 && deref timer.active && deref timer.refed) {
+            return true;
+        }
+    }
+    return false;
+}
+
 pub fun install_timers(context: ptr<u8>) -> bool {
     var s: ptr<TimerState> = timer_state(context);
     if (!allocate_context_slot(context, TIMERS_SLOT, size_of<TimerState>() as i64)) {
@@ -441,6 +619,12 @@ pub fun install_timers(context: ptr<u8>) -> bool {
     }
     if (!install_function(context, "setTimeout", 0) || !install_function(context, "setInterval", 1) || !install_function(context,
         "clearTimeout", 2) || !install_function(context, "clearInterval", 2)) {
+        return false;
+    }
+    if (!install_function(context, "setImmediate", 6) || !install_function(context, "clearImmediate", 2)) {
+        return false;
+    }
+    if (!install_timer_prototype(context)) {
         return false;
     }
     if (!install_microtasks(context)) {
@@ -571,6 +755,20 @@ pub fun shutdown_timers(context: ptr<u8>) {
     if (deref s.rejection_callback != null) {
         wr_unprotect(context, deref s.rejection_callback);
     }
+    if (deref s.timer_prototype != null) {
+        wr_unprotect(context, deref s.timer_prototype);
+    }
+    if (deref s.to_primitive != null) {
+        wr_unprotect(context, deref s.to_primitive);
+    }
+    for (var i: i64 = 0; i < 6; i++) {
+        if ((deref s.methods)[i] != null) {
+            wr_unprotect(context, (deref s.methods)[i]);
+            (deref s.methods)[i] = null;
+        }
+    }
+    deref s.timer_prototype = null;
+    deref s.to_primitive = null;
     deref s.storage = null;
     deref s.current_context = null;
     deref s.microtask_failure = null;

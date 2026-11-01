@@ -1,5 +1,5 @@
 // Console host API and native callback entry points.
-import("./output")::{write_text, print_value};
+import("./format")::{write_formatted};
 
 extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
 extern(c, "wr_string_value") fun wr_string_value(context: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
@@ -14,21 +14,15 @@ extern(c, "wr_object") fun wr_object(context: ptr<u8>, js_class: ptr<u8>, data: 
 extern(c, "wr_context_global") fun wr_context_global(context: ptr<u8>) -> ptr<u8>;
 extern(c, "jsrt_console_callback") fun jsrt_console_callback(error_output: i32) -> ptr<u8>;
 
+// Formatting follows util.format; any conversion error propagates to the caller.
 fun console_write(context: ptr<u8>, count: i64, args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>, fd: i64) -> ptr<u8> {
-    for (var i: i64 = 0; i < count; i++) {
-        if (i > 0) {
-            write_text(fd, " ");
-        }
-        if (!print_value(context, args[i], fd, exception)) {
-            if (exception != null && deref exception == null) {
-                var message: ptr<u8> = wr_string_utf8("console conversion or output failed");
-                deref exception = wr_string_value(context, message);
-                wr_string_release(message);
-            }
-            return wr_undefined(context);
+    if (!write_formatted(context, fd, "", count, args, exception)) {
+        if (exception != null && deref exception == null) {
+            var message: ptr<u8> = wr_string_utf8("console conversion or output failed");
+            deref exception = wr_string_value(context, message);
+            wr_string_release(message);
         }
     }
-    write_text(fd, "\n");
     return wr_undefined(context);
 }
 
@@ -59,6 +53,8 @@ pub fun install_console(context: ptr<u8>) -> bool {
     var ok: bool = console_method(context, console, "log", 0);
     ok = ok && console_method(context, console, "error", 1);
     ok = ok && console_method(context, console, "warn", 1);
+    ok = ok && console_method(context, console, "info", 0);
+    ok = ok && console_method(context, console, "debug", 0);
     var name: ptr<u8> = wr_string_utf8("console");
     var exception: ptr<u8> = null;
     wr_set(context, wr_context_global(context), name, console, 0, &exception);

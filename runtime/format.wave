@@ -1,0 +1,298 @@
+// util.format placeholder handling and formatted console output.
+// Placeholders follow Node's formatWithOptions: %s %d %i %f %j %o %O %c %%.
+import("./inspect")::{Inspector, Text, inspector_init, inspector_options, inspector_free, inspector_finish, inspector_depth,
+    format_value, text_create, text_release, text_add_ascii, text_add_units, text_add_js, text_add_number,
+    text_to_value, inspect_failed, inspect_intrinsic, builtin_to_string, INSPECT_JSON_STRINGIFY, INSPECT_PARSE_INT,
+    INSPECT_PARSE_FLOAT, INSPECT_STRING};
+import("./values")::{coerce_number, get};
+import("./output")::{write_units};
+
+extern(c, "wr_type") fun wr_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_to_string") fun wr_to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_characters") fun wr_string_characters(text: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_length") fun wr_string_length(text: ptr<u8>) -> i64;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_callable") fun wr_callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_number") fun wr_number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_call") fun wr_call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun wr_protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(ctx: ptr<u8>, value: ptr<u8>);
+
+const JS_UNDEFINED: i32 = 0;
+const JS_NULL: i32 = 1;
+const JS_NUMBER: i32 = 3;
+const JS_STRING: i32 = 4;
+const JS_OBJECT: i32 = 5;
+const JS_SYMBOL: i32 = 6;
+const JS_BIGINT: i32 = 7;
+
+const DEFAULT_DEPTH: i64 = 2;
+const STRING_PLACEHOLDER_DEPTH: i64 = 0;
+const OBJECT_PLACEHOLDER_DEPTH: i64 = 4;
+
+const UNIT_PERCENT: u16 = 37;
+const UNIT_LOWER_S: u16 = 115;
+const UNIT_LOWER_J: u16 = 106;
+const UNIT_LOWER_D: u16 = 100;
+const UNIT_UPPER_O: u16 = 79;
+const UNIT_LOWER_O: u16 = 111;
+const UNIT_LOWER_I: u16 = 105;
+const UNIT_LOWER_F: u16 = 102;
+const UNIT_LOWER_C: u16 = 99;
+
+// Each inspected argument is an independent inspect() call in Node.
+pub fun inspect_argument(ins: ptr<Inspector>, value: ptr<u8>, depth: i64, dest: ptr<Text>) {
+    deref ins.indentation = 0;
+    deref ins.current_depth = 0;
+    deref ins.circular = 0;
+    deref ins.seen_count = 0;
+    inspector_depth(ins, depth);
+    format_value(ins, value, 0, dest);
+}
+
+fun call_one(ins: ptr<Inspector>, fn: ptr<u8>, value: ptr<u8>) -> ptr<u8> {
+    var args: array<ptr<u8>, 1> = [value];
+    return wr_call(deref ins.ctx, fn, null, 1, &args[0], deref ins.ex);
+}
+
+fun append_string_conversion(ins: ptr<Inspector>, value: ptr<u8>, dest: ptr<Text>) {
+    var converted: ptr<u8> = call_one(ins, inspect_intrinsic(deref ins.ctx, INSPECT_STRING), value);
+    if (!inspect_failed(ins) && converted != null) {
+        text_add_js(ins, dest, converted);
+    }
+}
+
+fun string_placeholder(ins: ptr<Inspector>, value: ptr<u8>, dest: ptr<Text>) {
+    var kind: i32 = wr_type(deref ins.ctx, value);
+    if (kind == JS_NUMBER || kind == JS_BIGINT) {
+        text_add_number(ins, dest, value);
+    } else if (kind != JS_OBJECT || wr_callable(deref ins.ctx, value) || !builtin_to_string(ins, value)) {
+        append_string_conversion(ins, value, dest);
+    } else {
+        inspect_argument(ins, value, STRING_PLACEHOLDER_DEPTH, dest);
+    }
+}
+
+fun json_placeholder(ins: ptr<Inspector>, value: ptr<u8>, dest: ptr<Text>) {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var nested: ptr<u8> = null;
+    var args: array<ptr<u8>, 1> = [value];
+    var result: ptr<u8> = wr_call(ctx, inspect_intrinsic(ctx, INSPECT_JSON_STRINGIFY), null, 1, &args[0], &nested);
+    if (nested != null) {
+        // tryStringify: cycles print [Circular]; other errors propagate.
+        var message: ptr<u8> = get(ctx, nested, "message", deref ins.ex);
+        var cyclic: bool = false;
+        if (wr_type(ctx, message) == JS_STRING) {
+            var js: ptr<u8> = wr_to_string(ctx, message, deref ins.ex);
+            if (js != null) {
+                var units: ptr<u16> = wr_string_characters(js);
+                var length: i64 = wr_string_length(js);
+                for (var i: i64 = 0; i + 5 <= length; i++) {
+                    if (units[i] == 99 && units[i + 1] == 121 && units[i + 2] == 99 && units[i + 3] == 108 &&
+                        units[i + 4] == 105) {
+                        cyclic = true;
+                    }
+                }
+                wr_string_release(js);
+            }
+        }
+        if (cyclic) {
+            text_add_ascii(ins, dest, "[Circular]");
+        } else if (deref deref ins.ex == null) {
+            deref deref ins.ex = nested;
+        }
+        return;
+    }
+    if (result == null || wr_type(ctx, result) == JS_UNDEFINED) {
+        text_add_ascii(ins, dest, "undefined");
+        return;
+    }
+    text_add_js(ins, dest, result);
+}
+
+fun numeric_placeholder(ins: ptr<Inspector>, value: ptr<u8>, mode: u16, dest: ptr<Text>) {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var kind: i32 = wr_type(ctx, value);
+    if (kind == JS_BIGINT && mode != UNIT_LOWER_F) {
+        text_add_number(ins, dest, value);
+        return;
+    }
+    if (kind == JS_SYMBOL) {
+        text_add_ascii(ins, dest, "NaN");
+        return;
+    }
+    var number: ptr<u8> = null;
+    if (mode == UNIT_LOWER_D) {
+        number = wr_number(ctx, coerce_number(ctx, value, deref ins.ex));
+    } else if (mode == UNIT_LOWER_I) {
+        number = call_one(ins, inspect_intrinsic(ctx, INSPECT_PARSE_INT), value);
+    } else {
+        number = call_one(ins, inspect_intrinsic(ctx, INSPECT_PARSE_FLOAT), value);
+    }
+    if (!inspect_failed(ins) && number != null) {
+        text_add_number(ins, dest, number);
+    }
+}
+
+fun remaining_arguments(ins: ptr<Inspector>, count: i64, args: ptr<ptr<u8>>, start: i64, join: bool, dest: ptr<Text>) {
+    var separate: bool = join;
+    for (var a: i64 = start; a < count && !inspect_failed(ins); a++) {
+        if (separate) {
+            text_add_ascii(ins, dest, " ");
+        }
+        if (wr_type(deref ins.ctx, args[a]) == JS_STRING) {
+            text_add_js(ins, dest, args[a]);
+        } else {
+            inspect_argument(ins, args[a], DEFAULT_DEPTH, dest);
+        }
+        separate = true;
+    }
+}
+
+pub fun format_arguments(ins: ptr<Inspector>, count: i64, args: ptr<ptr<u8>>, dest: ptr<Text>) {
+    var ctx: ptr<u8> = deref ins.ctx;
+    if (count == 0) {
+        return;
+    }
+    if (wr_type(ctx, args[0]) != JS_STRING) {
+        remaining_arguments(ins, count, args, 0, false, dest);
+        return;
+    }
+    if (count == 1) {
+        text_add_js(ins, dest, args[0]);
+        return;
+    }
+    var js: ptr<u8> = wr_to_string(ctx, args[0], deref ins.ex);
+    if (js == null) {
+        return;
+    }
+    var units: ptr<u16> = wr_string_characters(js);
+    var length: i64 = wr_string_length(js);
+    var a: i64 = 0;
+    var last: i64 = 0;
+    var i: i64 = 0;
+    while (i < length - 1 && !inspect_failed(ins)) {
+        if (units[i] != UNIT_PERCENT) {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        var next: u16 = units[i];
+        if (a + 1 == count) {
+            if (next == UNIT_PERCENT) {
+                text_add_units(ins, dest, units + last, i - last);
+                last = i + 1;
+            }
+            i += 1;
+            continue;
+        }
+        if (next == UNIT_PERCENT) {
+            text_add_units(ins, dest, units + last, i - last);
+            last = i + 1;
+            i += 1;
+            continue;
+        }
+        var known: bool = next == UNIT_LOWER_S || next == UNIT_LOWER_J || next == UNIT_LOWER_D ||
+            next == UNIT_UPPER_O || next == UNIT_LOWER_O || next == UNIT_LOWER_I || next == UNIT_LOWER_F ||
+            next == UNIT_LOWER_C;
+        if (!known) {
+            i += 1;
+            continue;
+        }
+        if (last != i - 1) {
+            text_add_units(ins, dest, units + last, i - 1 - last);
+        }
+        a += 1;
+        var value: ptr<u8> = args[a];
+        if (next == UNIT_LOWER_S) {
+            string_placeholder(ins, value, dest);
+        } else if (next == UNIT_LOWER_J) {
+            json_placeholder(ins, value, dest);
+        } else if (next == UNIT_UPPER_O) {
+            inspect_argument(ins, value, DEFAULT_DEPTH, dest);
+        } else if (next == UNIT_LOWER_O) {
+            inspect_argument(ins, value, OBJECT_PLACEHOLDER_DEPTH, dest);
+        } else if (next != UNIT_LOWER_C) {
+            numeric_placeholder(ins, value, next, dest);
+        }
+        last = i + 1;
+        i += 1;
+    }
+    var join: bool = false;
+    if (last != 0) {
+        a += 1;
+        join = true;
+        if (last < length) {
+            text_add_units(ins, dest, units + last, length - last);
+        }
+    }
+    wr_string_release(js);
+    remaining_arguments(ins, count, args, a, join, dest);
+}
+
+// Returns a JS string, or null with ex set.
+pub fun format_to_value(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var ins: Inspector;
+    if (!inspector_init(&ins, ctx, ex)) {
+        return null;
+    }
+    var dest: ptr<Text> = text_create(&ins);
+    format_arguments(&ins, count, args, dest);
+    var result: ptr<u8> = null;
+    if (inspector_finish(&ins)) {
+        result = text_to_value(ctx, dest);
+    }
+    text_release(dest);
+    inspector_free(&ins);
+    return result;
+}
+
+// Formats arguments, appends a newline and writes the UTF-8 result.
+pub fun write_formatted(ctx: ptr<u8>, fd: i64, label: str, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> bool {
+    var ins: Inspector;
+    if (!inspector_init(&ins, ctx, ex)) {
+        return false;
+    }
+    var dest: ptr<Text> = text_create(&ins);
+    text_add_ascii(&ins, dest, label);
+    format_arguments(&ins, count, args, dest);
+    text_add_ascii(&ins, dest, "\n");
+    var ok: bool = inspector_finish(&ins);
+    if (ok) {
+        ok = write_units(fd, deref dest.data, deref dest.length);
+    }
+    text_release(dest);
+    inspector_free(&ins);
+    return ok;
+}
+
+// util.inspect(value[, options]) or the legacy (value, showHidden, depth) form.
+pub fun inspect_to_value(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var ins: Inspector;
+    if (!inspector_init(&ins, ctx, ex)) {
+        return null;
+    }
+    var value: ptr<u8> = null;
+    if (count > 0) {
+        value = args[0];
+    }
+    if (count > 1 && wr_type(ctx, args[1]) == JS_OBJECT) {
+        inspector_options(&ins, args[1]);
+    } else if (count > 2 && wr_type(ctx, args[2]) == JS_NUMBER) {
+        inspector_depth(&ins, coerce_number(ctx, args[2], ex) as i64);
+    } else if (count > 2 && wr_type(ctx, args[2]) == JS_NULL) {
+        inspector_depth(&ins, 1099511627776);
+    }
+    var dest: ptr<Text> = text_create(&ins);
+    if (deref ex == null) {
+        format_value(&ins, value, 0, dest);
+    }
+    var result: ptr<u8> = null;
+    if (inspector_finish(&ins)) {
+        result = text_to_value(ctx, dest);
+    }
+    text_release(dest);
+    inspector_free(&ins);
+    return result;
+}
