@@ -50,7 +50,10 @@ HTTP 연결 수명 관리가 맡고, 명시적 destroy와 오류는 기존 HTTP 
 | `runtime/abort_state.wave` | EventTarget·Abort API가 공유하는 컨텍스트별 취소 상태·구독; 상위 API를 import하지 않음 |
 | `runtime/web_stream_core.wave`, `web_readable.wave`, `web_writable.wave` | Web stream 상태·JSC Promise capability·default source/sink |
 | `runtime/web_transform.wave`, `web_composition.wave`, `web_stream_adapter.wave` | 변환 역압력·pipe/tee/반복·호스트 Readable 연결 |
-| `runtime/inspect.wave`, `format.wave` | Node식 inspect 알고리즘(UTF-16 출력 버퍼·캡처한 Reflect/내장 메서드)과 util.format 자리표시자; console이 공유 |
+| `runtime/inspect_text.wave` | UTF-16 출력 버퍼·항목 목록·Inspector 상태와 코드 단위 상수(엔진 비의존) |
+| `runtime/inspect_engine.wave` | 시작 시 캡처한 내장 메서드·엔진 호출 보조·설치/종료·한도 상수·Proxy 판별 |
+| `runtime/inspect_primitive.wave`, `inspect_layout.wave` | 원시값·문자열 이스케이프·키 서식 / 숫자 열 맞춤과 한 줄·여러 줄 배치 |
+| `runtime/inspect.wave`, `format.wave` | 객체·컬렉션·오류·함수 수집과 공개 진입점 / util.format 자리표시자; console이 공유 |
 | `runtime/process_extras.wave` | process.exit/hrtime/uptime/memoryUsage, global, performance.now, atob/btoa |
 | `runtime/callbacks.wave` | util.callbackify와 콜백 fs; 두 단계 설치(fs 정의 → nextTick 캡처) |
 | `runtime/json_source.wave` | wjson 검증 뒤 reviver의 원문 span·초기 값 대응 |

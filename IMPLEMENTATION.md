@@ -187,3 +187,19 @@ File·multipart 파싱, 추가 Node API는 남아 있다. [ROADMAP.md](ROADMAP.m
   이후 코어 API 확장 전의 산출물이다.
 - 미실행: 원격 CI/VM, 운영 서명·신뢰 공개키 검증, 공개 업로드, actionlint(이번 release.yml 수정은
   YAML 구문만 확인), 깨끗한 환경에서의 엔진 전체 재컴파일.
+
+## 2026-11-02 후속: 지연 조사와 구조 정리
+
+- **부하 지연 5514 ms는 회귀가 아니었다.** 코어 API 이전 archive(b6560fea…)와 이번 archive(24dd2de3…)의
+  실행 파일을 같은 조건(60초 혼합 부하)으로 번갈아 3회씩 실행했다. 최대 지연은 이전 3296/3420/3783 ms,
+  현재 3089/3276/3501 ms이며 batches는 466~531로 겹친다. 5514 ms는 release 실행 중 다른 작업을 함께 돌린 영향으로
+  보이며 단일 측정을 비교 기준으로 쓰지 않는다. 같은 컴퓨터의 실행 사이에도 최대 지연이 약 0.5초 흔들린다.
+- runtime/inspect.wave(2,329줄)를 책임별 5개 모듈로 나눴다(inspect_text 332, inspect_engine 458,
+  inspect_primitive 246, inspect_layout 190, inspect 1,259줄). 동작 변경 없이 전체 회귀와 Node 대조를 유지했다.
+  포매터의 문자 코드 숫자는 이름 있는 상수로, 순환 오류 판별은 `mentions_cycle` 함수로 바꿨다.
+- Proxy는 엔진의 `JSRTIsProxy`(트랩을 실행하지 않음)로 식별해 `Proxy(<target unavailable>)`로 표시한다.
+  이전에는 트랩이 실행될 수 있었다. 대상 출력에는 엔진 ABI 확장과 엔진 재빌드가 필요하다.
+- tests/suites/harness.wave의 expect()는 `expect_within`으로 제한 시간을 받을 수 있다(기본 10초 유지).
+  실제 TLS 통합 검사는 60초를 쓴다.
+- build·독립 test 각각 **1058/0/0**. 이번 후속에서는 새 release를 만들지 않았으므로 최신 archive(24dd2de3…)는
+  Proxy 변경과 모듈 분할 이전의 소스로 만든 것이다. 현재 runtime SHA-256은 위 release 기록과 다르다.

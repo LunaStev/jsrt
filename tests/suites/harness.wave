@@ -52,8 +52,18 @@ pub fun check(name: str, ok: bool) {
     test_flush(null);
 }
 
+// Most cases are short in-process scripts. Cases that start an external peer
+// (real TLS, large transfers) pass LONG_COMMAND_TIMEOUT_MS to expect_within.
+pub const DEFAULT_COMMAND_TIMEOUT_MS: i64 = 10000;
+pub const LONG_COMMAND_TIMEOUT_MS: i64 = 60000;
+
 pub fun expect(name: str, arguments: ptr<str>, count: i64, expected: ptr<u8>, expected_length: i64, code: i32,
     error: str) {
+    expect_within(name, arguments, count, expected, expected_length, code, error, DEFAULT_COMMAND_TIMEOUT_MS);
+}
+
+pub fun expect_within(name: str, arguments: ptr<str>, count: i64, expected: ptr<u8>, expected_length: i64,
+    code: i32, error: str, timeout_ms: i64) {
     var suite: ptr<TestState> = test_state();
     var stdout_path: str = join((deref suite.directory) as str, "stdout") as str;
     var stderr_path: str = join((deref suite.directory) as str, "stderr") as str;
@@ -72,7 +82,7 @@ pub fun expect(name: str, arguments: ptr<str>, count: i64, expected: ptr<u8>, ex
     var pid: i64 = spawn(arguments, count, stdout_fd, stderr_fd);
     io_close(stdout_fd);
     io_close(stderr_fd);
-    var status: i32 = wait(pid, 10000);
+    var status: i32 = wait(pid, timeout_ms);
     deref suite.output_count = fs_read_all(stdout_path, (deref suite.output), 65536);
     deref suite.error_count = fs_read_all(stderr_path, (deref suite.errors), 65536);
     var ok: bool = status == code && (deref suite.output_count) >= 0 && (deref suite.error_count) >= 0;

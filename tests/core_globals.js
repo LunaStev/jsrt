@@ -71,10 +71,17 @@ function inspectCases() {
     equal(inspect(new (class X { get [Symbol.toStringTag]() { return 'Y'; } })()), 'X [Y] {}', 'class toStringTag');
     equal(inspect({get [Symbol.toStringTag]() { return 'Own'; }}), '{ Symbol(Symbol.toStringTag): [Getter] }',
         'own enumerable toStringTag is a plain property');
-    // JSC's C API cannot identify Proxy objects, so traps are observable; a
-    // transparent Proxy must still print its target's contents and prototype.
-    check(inspect(new Proxy({a: 1}, {})).includes('{ a: 1 }'), 'transparent proxy');
-    check(!inspect(new Proxy(new Map(), {})).includes('null prototype'), 'proxy prototype is read through Reflect');
+    // Proxy traps must never run: the engine probe identifies a Proxy without them. Node would
+    // print the target, but the engine ABI does not expose it, so the contents are not shown.
+    const traps = {};
+    for (const name of ['get', 'ownKeys', 'getPrototypeOf', 'getOwnPropertyDescriptor', 'has', 'apply']) {
+        traps[name] = () => { throw new Error('proxy trap ' + name); };
+    }
+    const proxy = new Proxy({a: 1}, traps);
+    equal(inspect(proxy), 'Proxy(<target unavailable>)', 'proxy is not inspected through traps');
+    equal(inspect([proxy]), '[ Proxy(<target unavailable>) ]', 'nested proxy');
+    equal(util.format('%s', proxy), 'Proxy(<target unavailable>)', '%s does not read toString from a proxy');
+    equal(inspect(new Proxy(function f() {}, traps)), 'Proxy(<target unavailable>)', 'callable proxy');
 }
 
 function formatCases() {

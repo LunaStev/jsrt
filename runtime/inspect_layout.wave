@@ -1,0 +1,190 @@
+// Line layout: grouping of numeric rows and single-line versus multi-line output.
+import("./inspect_text")::{Entries, Inspector, Text, UNIT_COMMA, UNIT_NEWLINE, UNIT_SPACE, entries_free,
+    entries_push, text_append, text_ascii, text_contains, text_new, text_spaces, text_unit};
+import("./inspect_engine")::{COMPACT_LEVELS, GROUP_COLUMN_LIMIT, GROUP_MINIMUM_ENTRIES};
+
+
+// Line layout (Node reduceToSingleString / groupArrayElements)
+
+pub fun sqrt_f64(value: f64) -> f64 {
+    if (value <= 0.0) {
+        return 0.0;
+    }
+    var guess: f64 = value;
+    if (guess < 1.0) {
+        guess = 1.0;
+    }
+    for (var i: i64 = 0; i < 64; i++) {
+        guess = (guess + value / guess) / 2.0;
+    }
+    return guess;
+}
+
+pub fun round_f64(value: f64) -> i64 {
+    return (value + 0.5) as i64;
+}
+
+pub fun group_elements(ins: ptr<Inspector>, output: ptr<Entries>, has_more: bool, numeric: bool) {
+    var total_length: i64 = 0;
+    var max_length: i64 = 0;
+    var output_length: i64 = deref output.count;
+    if (has_more) {
+        output_length -= 1;
+    }
+    var separator: i64 = 2;
+    for (var i: i64 = 0; i < output_length; i++) {
+        var length: i64 = deref (deref output.items)[i].length;
+        total_length += length + separator;
+        if (max_length < length) {
+            max_length = length;
+        }
+    }
+    var actual_max: i64 = max_length + separator;
+    if (actual_max * 3 + deref ins.indentation >= deref ins.break_length) {
+        return;
+    }
+    if (!((total_length as f64) / (actual_max as f64) > 5.0 || max_length <= 6)) {
+        return;
+    }
+    var average_bias: f64 = sqrt_f64((actual_max as f64) - (total_length as f64) / (deref output.count as f64));
+    var biased_max: f64 = (actual_max as f64) - 3.0 - average_bias;
+    if (biased_max < 1.0) {
+        biased_max = 1.0;
+    }
+    var columns: i64 = round_f64(sqrt_f64(2.5 * biased_max * (output_length as f64)) / biased_max);
+    var fit: i64 = (deref ins.break_length - deref ins.indentation) / actual_max;
+    if (fit < columns) {
+        columns = fit;
+    }
+    if (COMPACT_LEVELS * 4 < columns) {
+        columns = COMPACT_LEVELS * 4;
+    }
+    if (GROUP_COLUMN_LIMIT < columns) {
+        columns = GROUP_COLUMN_LIMIT;
+    }
+    if (columns <= 1) {
+        return;
+    }
+    var widths: array<i64, 15>;
+    for (var c: i64 = 0; c < columns; c++) {
+        var line_length: i64 = 0;
+        var j: i64 = c;
+        while (j < deref output.count) {
+            var length: i64 = deref (deref output.items)[j].length;
+            if (j < output_length && length > line_length) {
+                line_length = length;
+            }
+            j += columns;
+        }
+        widths[c] = line_length + separator;
+    }
+    var grouped: Entries;
+    grouped.items = null;
+    grouped.count = 0;
+    grouped.capacity = 0;
+    var start: i64 = 0;
+    while (start < output_length) {
+        var stop: i64 = start + columns;
+        if (stop > output_length) {
+            stop = output_length;
+        }
+        var line: ptr<Text> = text_new(ins);
+        for (var j: i64 = start; j < stop; j++) {
+            var item: ptr<Text> = (deref output.items)[j];
+            var last: bool = j == stop - 1;
+            var width: i64 = widths[j - start];
+            var used: i64 = deref item.length;
+            if (!last) {
+                used += 2;
+            } else if (numeric) {
+                width -= separator;
+            }
+            if (numeric && used < width) {
+                text_spaces(ins, line, width - used);
+            }
+            text_append(ins, line, item);
+            if (!last) {
+                text_ascii(ins, line, ", ");
+                if (!numeric && used < width) {
+                    text_spaces(ins, line, width - used);
+                }
+            }
+        }
+        entries_push(ins, &grouped, line);
+        start = stop;
+    }
+    if (has_more) {
+        entries_push(ins, &grouped, (deref output.items)[deref output.count - 1]);
+        (deref output.items)[deref output.count - 1] = null;
+    }
+    entries_free(output);
+    deref output.items = grouped.items;
+    deref output.count = grouped.count;
+    deref output.capacity = grouped.capacity;
+}
+
+pub fun below_break_length(ins: ptr<Inspector>, output: ptr<Entries>, start: i64, base: ptr<Text>) -> bool {
+    var total: i64 = deref output.count + start;
+    if (total + deref output.count > deref ins.break_length) {
+        return false;
+    }
+    for (var i: i64 = 0; i < deref output.count; i++) {
+        total += deref (deref output.items)[i].length;
+        if (total > deref ins.break_length) {
+            return false;
+        }
+    }
+    return !text_contains(base, 10);
+}
+
+pub fun reduce_output(ins: ptr<Inspector>, output: ptr<Entries>, base: ptr<Text>, open: ptr<Text>, close: str,
+    array_extras: bool, recurse: i64, has_more: bool, numeric: bool, dest: ptr<Text>) {
+    var entries: i64 = deref output.count;
+    if (array_extras && entries > GROUP_MINIMUM_ENTRIES) {
+        group_elements(ins, output, has_more, numeric);
+    }
+    if (deref ins.current_depth - recurse < COMPACT_LEVELS && entries == deref output.count) {
+        var start: i64 = deref output.count + deref ins.indentation + deref open.length + deref base.length + 10;
+        if (below_break_length(ins, output, start, base)) {
+            var multiline: bool = false;
+            for (var i: i64 = 0; i < deref output.count; i++) {
+                if (text_contains((deref output.items)[i], 10)) {
+                    multiline = true;
+                }
+            }
+            if (!multiline) {
+                if (deref base.length > 0) {
+                    text_append(ins, dest, base);
+                    text_unit(ins, dest, UNIT_SPACE);
+                }
+                text_append(ins, dest, open);
+                text_unit(ins, dest, UNIT_SPACE);
+                for (var i: i64 = 0; i < deref output.count; i++) {
+                    if (i > 0) {
+                        text_ascii(ins, dest, ", ");
+                    }
+                    text_append(ins, dest, (deref output.items)[i]);
+                }
+                text_unit(ins, dest, UNIT_SPACE);
+                text_ascii(ins, dest, close);
+                return;
+            }
+        }
+    }
+    if (deref base.length > 0) {
+        text_append(ins, dest, base);
+        text_unit(ins, dest, UNIT_SPACE);
+    }
+    text_append(ins, dest, open);
+    for (var i: i64 = 0; i < deref output.count; i++) {
+        if (i > 0) {
+            text_unit(ins, dest, UNIT_COMMA);
+        }
+        text_unit(ins, dest, UNIT_NEWLINE);
+        text_spaces(ins, dest, deref ins.indentation + 2);
+        text_append(ins, dest, (deref output.items)[i]);
+    }
+    text_unit(ins, dest, UNIT_NEWLINE);
+    text_spaces(ins, dest, deref ins.indentation);
+    text_ascii(ins, dest, close);
+}

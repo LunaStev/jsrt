@@ -17,7 +17,7 @@ import("std::net::poll")::{net_wait_connected};
 import("std::time::clock")::{time_now_monotonic_ns};
 import("std::time::sleep")::{time_sleep_ms};
 import("std::process::core")::{proc_kill};
-import("./harness")::{async_case, check, contains, expect, test, TestState, test_state};
+import("./harness")::{async_case, check, contains, expect, expect_within, LONG_COMMAND_TIMEOUT_MS, test, TestState, test_state};
 import("./network_server")::{body_case, http_dispatch_tests};
 import("jsrt::tools::compiler")::{compile_tls_peer};
 
@@ -359,8 +359,8 @@ pub fun extended_network_tests() {
     if (ready) {
         var request: array<str, 4> = [(deref suite.binary) as str, "tests/tls_request.js", port, cert];
         expected = "TLS integration passed\n";
-        expect("real HTTPS trust hostname uploads cancellation header failures and redirect integration", &request[0],
-            4, expected as ptr<u8>, mem_len_cstr(expected), 0, "");
+        expect_within("real HTTPS trust hostname uploads cancellation header failures and redirect integration",
+            &request[0], 4, expected as ptr<u8>, mem_len_cstr(expected), 0, "", LONG_COMMAND_TIMEOUT_MS);
     }
     if (pid >= 0) {
         proc_kill(pid, 15);
