@@ -1,0 +1,92 @@
+// Recycle completed HTTP messages while preserving the transport and bounded unread bytes.
+import("std::mem::layout")::{size_of};
+import("std::mem::ops")::{mem_zero};
+import("std::mem::alloc")::{mem_free};
+import("std::time::clock")::{time_now_monotonic_ns};
+import("./config")::{HTTP_PIPELINE_LIMIT};
+import("./http_state")::{HttpConnection, HttpServer, free_connection_bytes};
+import("./http_protocol")::{HttpRequest, new_request, feed_request};
+import("./stream_state")::{stream_state};
+import("./streams")::{stream_invoke};
+import("./collections")::{flag};
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "uv_read_stop") fun read_stop(handle: ptr<u8>) -> i32;
+extern(c, "jsrt_uv_read_start") fun read_start(handle: ptr<u8>) -> i32;
+extern(c, "jsrt_uv_close") fun close_handle(handle: ptr<u8>);
+fun close_connection(client: ptr<HttpConnection>) {
+    if (!deref client.closing && deref client.handle != null) {
+        deref client.closing = true;
+        read_stop(deref client.handle);
+        close_handle(deref client.handle);
+    }
+}
+
+pub fun recycle_connection(ctx: ptr<u8>, client: ptr<HttpConnection>, ex: ptr<ptr<u8>>) -> bool {
+    if (!deref client.keep_alive || !deref client.response_finished || deref client.closing || deref client.write_done != null || deref client.write_request != null || deref client.request == null || deref client.response == null) {
+        return false;
+    }
+    var old_request: ptr<HttpRequest> = deref client.request;
+    if (!deref old_request.complete || !deref client.incoming_eof) {
+        return false;
+    }
+    var state: ptr<u8> = stream_state(ctx, deref client.response, 0, ex);
+    if (deref ex != null || !flag(ctx, state, "finished", ex)) {
+        return false;
+    }
+    var server: ptr<HttpServer> = deref client.server;
+    if (server == null || !deref server.listening || deref server.closing) {
+        close_connection(client);
+        return false;
+    }
+    var next: ptr<HttpRequest> = new_request();
+    if (next == null) {
+        close_connection(client);
+        return false;
+    }
+    deref next.streaming = true;
+    deref next.allow_pipeline = true;
+    var pending: ptr<u8> = deref old_request.trailing;
+    var amount: i64 = deref old_request.trailing_length;
+    deref old_request.trailing = null;
+    var incoming: ptr<u8> = deref client.incoming;
+    var response: ptr<u8> = deref client.response;
+    var handle: ptr<u8> = deref client.handle;
+    read_stop(handle);
+    free_connection_bytes(client);
+    mem_zero(client as ptr<u8>, size_of<HttpConnection>() as i64);
+    deref client.kind = 2;
+    deref client.handle = handle;
+    deref client.server = server;
+    deref client.request = next;
+    deref client.reused = true;
+    deref client.accepted_at = time_now_monotonic_ns();
+    deref client.activity_at = deref client.accepted_at;
+    // Detach the old stream hooks before close listeners can reenter the server.
+    if (incoming != null) {
+        stream_invoke(ctx, incoming, 6, 0, null, ex);
+        unprotect(ctx, incoming);
+    }
+    if (response != null) {
+        if (deref ex == null) {
+            stream_invoke(ctx, response, 6, 0, null, ex);
+        }
+        unprotect(ctx, response);
+    }
+    var ok: bool = deref ex == null && !deref client.closing;
+    if (ok && amount > 0) {
+        ok = feed_request(next, pending, amount);
+    }
+    if (pending != null) {
+        mem_free(pending, HTTP_PIPELINE_LIMIT);
+    }
+    if (!ok) {
+        close_connection(client);
+        return true;
+    }
+    if (deref next.headers_done) {
+        deref client.read_paused = true;
+    } else if (read_start(handle) < 0) {
+        close_connection(client);
+    }
+    return true;
+}

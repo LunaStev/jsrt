@@ -1,0 +1,194 @@
+// Directory iteration policy stays in Wave; C copies opaque dirent names only.
+import("./context_state")::{context_slot, allocate_context_slot, release_context_slot};
+import("./system")::{copy_host_path, io_failure};
+import("./config")::{DIRECTORY_ENTRY_LIMIT, DIRECTORY_BYTES_LIMIT};
+import("./values")::{get, text, define, fail, capture};
+import("./collections")::{set_at, length, at};
+import("./fs_sync")::{directory_entry};
+import("std::mem::layout")::{size_of};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+extern(c, "opendir") fun open_directory(path: str) -> ptr<u8>;
+extern(c, "closedir") fun close_directory(directory: ptr<u8>) -> i32;
+extern(c, "jsrt_directory_next") fun next_entry(directory: ptr<u8>, name: ptr<u8>, size: i64) -> i32;
+extern(c, "jsrt_directory_mode") fun entry_mode(directory: ptr<u8>, name: str, mode: ptr<i64>) -> i32;
+extern(c, "__errno_location") fun errno_location() -> ptr<i32>;
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "jsrt_readdir_callback") fun callback() -> ptr<u8>;
+const SLOT: i64 = 30;
+struct State {
+    method: ptr<u8>;
+    keys: ptr<u8>;
+}
+
+pub fun readdir_options(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (kind(ctx, value) == 0) {
+        return false;
+    }
+    var encoding: ptr<u8> = value;
+    var with_types: bool = false;
+    if (kind(ctx, value) == 5) {
+        var s: ptr<State> = context_slot(ctx, SLOT) as ptr<State>;
+        var args: array<ptr<u8>, 1> = [value];
+        var keys: ptr<u8> = call(ctx, deref s.keys, null, 1, &args[0], ex);
+        if (deref ex != null) {
+            return false;
+        }
+        protect(ctx, keys);
+        for (var i: i64 = 0; i < length(ctx, keys, ex) && deref ex == null; i++) {
+            var key: ptr<u8> = at(ctx, keys, i, ex);
+            if (!equal(ctx, key, text(ctx, "encoding")) && !equal(ctx, key, text(ctx, "withFileTypes")) &&
+                !equal(ctx, key, text(ctx, "recursive"))) {
+                fail(ctx, ex, 1, "unsupported readdir option");
+            }
+        }
+        unprotect(ctx, keys);
+        if (deref ex != null) {
+            return false;
+        }
+        var types: ptr<u8> = get(ctx, value, "withFileTypes", ex);
+        if (deref ex != null) {
+            return false;
+        }
+        if (kind(ctx, types) != 0 && kind(ctx, types) != 2) {
+            fail(ctx, ex, 1, "withFileTypes must be a boolean");
+            return false;
+        }
+        with_types = equal(ctx, types, boolean(ctx, true));
+        var recursive: ptr<u8> = get(ctx, value, "recursive", ex);
+        if (deref ex != null) {
+            return false;
+        }
+        if (kind(ctx, recursive) != 0 && !equal(ctx, recursive, boolean(ctx, false))) {
+            fail(ctx, ex, 1, "recursive readdir is not implemented");
+            return false;
+        }
+        encoding = get(ctx, value, "encoding", ex);
+    }
+    if (deref ex == null && kind(ctx, encoding) != 0 && kind(ctx, encoding) != 1 &&
+        !equal(ctx, encoding, text(ctx, "utf8")) && !equal(ctx, encoding, text(ctx, "utf-8"))) {
+        fail(ctx, ex, 1, "readdir supports UTF-8 names only");
+    }
+    return with_types;
+}
+
+export(c) fun jsrt_readdir(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0) {
+        fail(ctx, ex, 1, "readdirSync requires a string path");
+        return undefined(ctx);
+    }
+    var path: array<u8, 16385>;
+    copy_host_path(ctx, args[0], &path[0], 16385, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var with_types: bool = false;
+    if (count > 1) {
+        with_types = readdir_options(ctx, args[1], ex);
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var directory: ptr<u8> = open_directory(&path[0] as str);
+    if (directory == null) {
+        io_failure(ctx, ex, "scandir", &path[0] as str, -(deref errno_location() as i64));
+        return undefined(ctx);
+    }
+    var result: ptr<u8> = array(ctx, 0, null, ex);
+    if (deref ex != null) {
+        close_directory(directory);
+        return undefined(ctx);
+    }
+    protect(ctx, result);
+    var name: array<u8, 256>;
+    var entries: i64 = 0;
+    var bytes: i64 = 0;
+    while (deref ex == null) {
+        var status: i32 = next_entry(directory, &name[0], 256);
+        if (status == 0) {
+            break;
+        }
+        if (status < 0) {
+            var number: i64 = -(deref errno_location() as i64);
+            if (number == 0) {
+                number = -5;
+            }
+            io_failure(ctx, ex, "scandir", &path[0] as str, number);
+            break;
+        }
+        if (mem_eq_cstr(&name[0] as str, ".") || mem_eq_cstr(&name[0] as str, "..")) {
+            continue;
+        }
+        bytes += mem_len_cstr(&name[0] as str);
+        if (entries >= DIRECTORY_ENTRY_LIMIT || bytes > DIRECTORY_BYTES_LIMIT) {
+            fail(ctx, ex, 2, "directory listing exceeds entry or byte limit");
+            break;
+        }
+        var value: ptr<u8> = text(ctx, &name[0] as str);
+        if (with_types) {
+            var original: ptr<u8> = value;
+            protect(ctx, original);
+            var mode: i64 = 0;
+            var status: i32 = entry_mode(directory, &name[0] as str, &mode);
+            if (status < 0) {
+                io_failure(ctx, ex, "lstat", &path[0] as str, status as i64);
+            } else {
+                value = directory_entry(ctx, original, args[0], mode, ex);
+            }
+            // The name is retained by the newly created entry after construction.
+            unprotect(ctx, original);
+        }
+        if (deref ex == null) {
+            set_at(ctx, result, entries, value, ex);
+        }
+        entries += 1;
+    }
+    if (close_directory(directory) < 0 && deref ex == null) {
+        io_failure(ctx, ex, "closedir", &path[0] as str, -(deref errno_location() as i64));
+    }
+    unprotect(ctx, result);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    return result;
+}
+
+pub fun install_fs_directory(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (!allocate_context_slot(ctx, SLOT, size_of<State>() as i64)) {
+        return false;
+    }
+    var s: ptr<State> = context_slot(ctx, SLOT) as ptr<State>;
+    var name: ptr<u8> = utf8("readdirSync");
+    deref s.method = function(ctx, name, callback());
+    release(name);
+    protect(ctx, deref s.method);
+    deref s.keys = capture(ctx, get(ctx, global(ctx), "Object", ex), "keys", ex);
+    define(ctx, get(ctx, global(ctx), "fs", ex), "readdirSync", deref s.method, ex, true);
+    return deref ex == null;
+}
+
+pub fun shutdown_fs_directory(ctx: ptr<u8>) {
+    var s: ptr<State> = context_slot(ctx, SLOT) as ptr<State>;
+    if (s == null) {
+        return;
+    }
+    if (deref s.method != null) {
+        unprotect(ctx, deref s.method);
+    }
+    if (deref s.keys != null) {
+        unprotect(ctx, deref s.keys);
+    }
+    release_context_slot(ctx, SLOT, size_of<State>() as i64);
+}

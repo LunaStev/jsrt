@@ -1,0 +1,539 @@
+import("./context_state")::{owned_context_slot, active_context};
+struct FileStreamsState {
+    resources: ptr<Resource>;
+    methods: array<ptr<u8>, 8>;
+}
+
+fun file_streams_storage(ctx: ptr<u8>) -> ptr<FileStreamsState> {
+    return owned_context_slot(ctx, 12, size_of<FileStreamsState>() as i64) as ptr<FileStreamsState>;
+}
+
+// Incremental regular-file I/O on the existing Wave worker pool.
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::mem::ops")::{mem_copy, mem_zero};
+import("std::mem::cstr")::{mem_len_cstr};
+import("std::io::fd")::{io_close};
+import("./config")::{FILE_STREAM_LIMIT, STREAM_HIGH_WATER_MARK, STREAM_BYTE_LIMIT};
+import("./system")::{FileWork, free_file, copy_host_path};
+import("./async_fs")::{submit_file_work};
+import("./values")::{get, text, define, fail};
+import("./buffer")::{buffer_integer};
+import("./buffer_core")::{byte_view_length, copy_byte_view};
+import("./streams")::{create_stream, stream_invoke};
+import("./stream_state")::{stream_state};
+import("./collections")::{set_integer, flag};
+import("./events")::{add_listener, emit_named};
+import("./stream_utils")::{add_abort_signal};
+import("./abort")::{signal_aborted};
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_to_number") fun numeric(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "jsrt_file_stream_callback") fun callback(code: i32) -> ptr<u8>;
+struct Resource {
+    owner: ptr<u8>;
+    path: ptr<u8>;
+    fd: i64;
+    position: i64;
+    end: i64;
+    chunk_size: i64;
+    mode: i32;
+    operation: i32;
+    busy: bool;
+    wanted: bool;
+    closing: bool;
+    reserved: bool;
+    waiter: ptr<u8>;
+    destroy_waiter: ptr<u8>;
+    waiting: ptr<FileWork>;
+}
+
+fun find(owner: ptr<u8>) -> ptr<Resource> {
+    var host_state: ptr<FileStreamsState> = file_streams_storage(active_context());
+    if ((deref host_state.resources) == null) {
+        return null;
+    }
+    for (var i: i64 = 0; i < FILE_STREAM_LIMIT; i++) {
+        var r: ptr<Resource> = (deref host_state.resources) + i;
+        if (deref r.owner == owner) {
+            return r;
+        }
+    }
+    return null;
+}
+
+fun discard(ctx: ptr<u8>, r: ptr<Resource>) {
+    if (deref r.fd >= 0) {
+        io_close(deref r.fd);
+    }
+    if (deref r.waiting != null) {
+        free_file(deref r.waiting);
+    }
+    if (deref r.path != null) {
+        mem_free(deref r.path, 16385);
+    }
+    if (deref r.waiter != null) {
+        unprotect(ctx, deref r.waiter);
+    }
+    if (deref r.destroy_waiter != null) {
+        unprotect(ctx, deref r.destroy_waiter);
+    }
+    if (deref r.owner != null) {
+        unprotect(ctx, deref r.owner);
+    }
+    mem_zero(r as ptr<u8>, size_of<Resource>() as i64);
+    deref r.fd = -1;
+}
+
+fun work_for(r: ptr<Resource>, mode: i32) -> ptr<FileWork> {
+    var work: ptr<FileWork> = mem_alloc_zeroed(size_of<FileWork>() as i64) as ptr<FileWork>;
+    if (work == null) {
+        return null;
+    }
+    deref work.fd = -1;
+    deref work.mode = mode;
+    deref work.path = mem_alloc(16385);
+    if (deref work.path == null) {
+        free_file(work);
+        return null;
+    }
+    mem_copy(deref work.path, deref r.path, mem_len_cstr(deref r.path as str) + 1);
+    deref work.fd = deref r.fd;
+    deref work.offset = deref r.position;
+    return work;
+}
+
+fun submit(ctx: ptr<u8>, r: ptr<Resource>, work: ptr<FileWork>, ex: ptr<ptr<u8>>) {
+    var host_state: ptr<FileStreamsState> = file_streams_storage(ctx);
+    if (work == null) {
+        fail(ctx, ex, 2, "cannot allocate file-stream work");
+        return;
+    }
+    if (deref ex != null) {
+        if (deref work.mode == 5) {
+            deref work.fd = -1;
+        }
+        free_file(work);
+        return;
+    }
+    if (!submit_file_work(ctx, work, deref r.owner, (deref host_state.methods)[6], ex)) {
+        if (deref work.mode == 5) {
+            deref work.fd = -1;
+        }
+        free_file(work);
+        return;
+    }
+    deref r.operation = deref work.mode;
+    deref r.busy = true;
+    if (deref work.mode == 5) {
+        deref r.fd = -1;
+    }
+}
+
+fun close_resource(ctx: ptr<u8>, r: ptr<Resource>, ex: ptr<ptr<u8>>) {
+    if (deref r.busy) {
+        return;
+    }
+    if (deref r.fd >= 0) {
+        var nested: ptr<u8> = null;
+        submit(ctx, r, work_for(r, 5), &nested);
+        if (nested == null) {
+            return;
+        }
+        io_close(deref r.fd);
+        deref r.fd = -1;
+    }
+    var owner: ptr<u8> = deref r.owner;
+    protect(ctx, owner);
+    var done: ptr<u8> = deref r.destroy_waiter;
+    deref r.destroy_waiter = null;
+    if (done == null) {
+        done = deref r.waiter;
+        deref r.waiter = null;
+    }
+    var reading: bool = deref r.mode == 1;
+    discard(ctx, r);
+    if (done != null) {
+        call(ctx, done, owner, 0, null, ex);
+        unprotect(ctx, done);
+    } else if (reading) {
+        var args: array<ptr<u8>, 1> = [js_null(ctx)];
+        stream_invoke(ctx, owner, 0, 1, &args[0], ex);
+    }
+    unprotect(ctx, owner);
+}
+
+fun read_next(ctx: ptr<u8>, r: ptr<Resource>, ex: ptr<ptr<u8>>) {
+    if (deref r.busy || deref r.fd < 0 || !deref r.wanted || deref r.closing) {
+        return;
+    }
+    if (deref r.position > deref r.end) {
+        deref r.closing = true;
+        close_resource(ctx, r, ex);
+        return;
+    }
+    var work: ptr<FileWork> = work_for(r, 3);
+    if (work == null) {
+        fail(ctx, ex, 2, "cannot allocate read work");
+        return;
+    }
+    var size: i64 = deref r.chunk_size;
+    if (size > deref r.end - deref r.position + 1) {
+        size = deref r.end - deref r.position + 1;
+    }
+    deref work.capacity = size;
+    deref work.bytes = mem_alloc(size);
+    if (deref work.bytes == null) {
+        free_file(work);
+        fail(ctx, ex, 2, "cannot allocate file chunk");
+        return;
+    }
+    deref r.wanted = false;
+    submit(ctx, r, work, ex);
+}
+
+export(c) fun jsrt_file_stream_create(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<FileStreamsState> = file_streams_storage(ctx);
+    if (count == 0) {
+        fail(ctx, ex, 1, "file stream requires a path");
+        return undefined(ctx);
+    }
+    var r: ptr<Resource> = null;
+    for (var i: i64 = 0; i < FILE_STREAM_LIMIT; i++) {
+        var candidate: ptr<Resource> = (deref host_state.resources) + i;
+        if (deref candidate.owner == null && !deref candidate.reserved) {
+            r = candidate;
+            break;
+        }
+    }
+    if (r == null) {
+        fail(ctx, ex, 2, "file stream resource limit exceeded");
+        return undefined(ctx);
+    }
+    // Option getters can recursively create streams before an owner exists.
+    deref r.reserved = true;
+    deref r.fd = -1;
+    deref r.path = mem_alloc(16385);
+    if (deref r.path == null) {
+        fail(ctx, ex, 2, "cannot allocate file path");
+        discard(ctx, r);
+        return undefined(ctx);
+    }
+    if (copy_host_path(ctx, args[0], deref r.path, 16385, ex) < 0) {
+        discard(ctx, r);
+        return undefined(ctx);
+    }
+    deref r.mode = 1;
+    if (equal(ctx, fn, (deref host_state.methods)[1])) {
+        deref r.mode = 2;
+    }
+    deref r.chunk_size = STREAM_HIGH_WATER_MARK;
+    deref r.end = 9007199254740991;
+    if (count > 1 && kind(ctx, args[1]) != 0) {
+        var options: ptr<u8> = args[1];
+        if (kind(ctx, options) != 5) {
+            fail(ctx, ex, 1, "file stream options must be an object");
+        } else {
+            var high: ptr<u8> = get(ctx, options, "highWaterMark", ex);
+            if (kind(ctx, high) != 0) {
+                deref r.chunk_size = buffer_integer(ctx, high, 1, STREAM_BYTE_LIMIT, ex);
+            }
+            var start: ptr<u8> = get(ctx, options, "start", ex);
+            if (kind(ctx, start) != 0) {
+                if (deref r.mode == 2) {
+                    fail(ctx, ex, 1, "write stream start is not implemented");
+                } else {
+                    deref r.position = buffer_integer(ctx, start, 0, 9007199254740991, ex);
+                }
+            }
+            var end: ptr<u8> = get(ctx, options, "end", ex);
+            if (kind(ctx, end) != 0) {
+                if (deref r.mode == 2) {
+                    fail(ctx, ex, 1, "write stream end range is not implemented");
+                } else {
+                    deref r.end = buffer_integer(ctx, end, deref r.position, 9007199254740991, ex);
+                }
+            }
+            var encoding: ptr<u8> = get(ctx, options, "encoding", ex);
+            if (kind(ctx, encoding) != 0 && kind(ctx, encoding) != 1) {
+                fail(ctx, ex, 1, "file streams return bytes; encoding option is not implemented");
+            }
+            var expected: str = "r";
+            if (deref r.mode == 2) {
+                expected = "w";
+            }
+            var flags: ptr<u8> = get(ctx, options, "flags", ex);
+            if (kind(ctx, flags) != 0 && !equal(ctx, flags, text(ctx, expected))) {
+                fail(ctx, ex, 1, "unsupported file stream flags");
+            }
+            var option: ptr<u8> = get(ctx, options, "fd", ex);
+            if (kind(ctx, option) != 0) {
+                fail(ctx, ex, 1, "externally owned descriptors are not supported");
+            }
+            option = get(ctx, options, "autoClose", ex);
+            if (equal(ctx, option, number(ctx, 0.0)) || equal(ctx, option, bool_false(ctx))) {
+                fail(ctx, ex, 1, "autoClose must remain enabled");
+            }
+        }
+    }
+    if (deref ex != null) {
+        discard(ctx, r);
+        return undefined(ctx);
+    }
+    var signal: ptr<u8> = undefined(ctx);
+    if (count > 1 && kind(ctx, args[1]) == 5) {
+        signal = get(ctx, args[1], "signal", ex);
+        if (kind(ctx, signal) != 0) {
+            signal_aborted(ctx, signal, ex);
+        }
+    }
+    if (deref ex != null) {
+        discard(ctx, r);
+        return undefined(ctx);
+    }
+    protect(ctx, signal);
+    var stream: ptr<u8> = create_stream(ctx, deref r.mode as i64, ex);
+    protect(ctx, stream);
+    deref r.owner = stream;
+    var state: ptr<u8> = stream_state(ctx, stream, 0, ex);
+    set_integer(ctx, state, "high", deref r.chunk_size, ex);
+    set_integer(ctx, state, "readHigh", deref r.chunk_size, ex);
+    set_integer(ctx, state, "writeHigh", deref r.chunk_size, ex);
+    define(ctx, stream, "_destroy", (deref host_state.methods)[5], ex, false);
+    if (deref r.mode == 1) {
+        define(ctx, stream, "_read", (deref host_state.methods)[2], ex, false);
+        add_listener(ctx, stream, text(ctx, "end"), (deref host_state.methods)[7], true, false, ex);
+    } else {
+        define(ctx, stream, "_write", (deref host_state.methods)[3], ex, false);
+        define(ctx, stream, "_final", (deref host_state.methods)[4], ex, false);
+        add_listener(ctx, stream, text(ctx, "finish"), (deref host_state.methods)[7], true, false, ex);
+    }
+    if (kind(ctx, signal) != 0) {
+        add_abort_signal(ctx, signal, stream, ex);
+    }
+    unprotect(ctx, signal);
+    if (deref ex == null && !flag(ctx, state, "destroyed", ex)) {
+        var work: ptr<FileWork> = work_for(r, deref r.mode);
+        submit(ctx, r, work, ex);
+    }
+    if (deref ex != null) {
+        discard(ctx, r);
+        return undefined(ctx);
+    }
+    return stream;
+}
+
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+fun bool_false(ctx: ptr<u8>) -> ptr<u8> {
+    return boolean(ctx, false);
+}
+
+export(c) fun jsrt_file_stream_hook(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<FileStreamsState> = file_streams_storage(ctx);
+    if (!equal(ctx, fn, (deref host_state.methods)[2]) && !equal(ctx, fn, (deref host_state.methods)[7])) {
+        var required: i64 = 1;
+        if (equal(ctx, fn, (deref host_state.methods)[3])) {
+            required = 3;
+        } else if (equal(ctx, fn, (deref host_state.methods)[5])) {
+            required = 2;
+        }
+        if (count < required || kind(ctx, args[required - 1]) != 5 || !callable(ctx, args[required - 1])) {
+            fail(ctx, ex, 1, "file hook completion callback required");
+            return undefined(ctx);
+        }
+    }
+    var r: ptr<Resource> = find(receiver);
+    if (equal(ctx, fn, (deref host_state.methods)[7])) {
+        stream_invoke(ctx, receiver, 6, 0, null, ex);
+        return undefined(ctx);
+    }
+    if (r == null) {
+        if (!equal(ctx, fn, (deref host_state.methods)[2]) && count > 0) {
+            var done: ptr<u8> = args[count - 1];
+            call(ctx, done, receiver, 0, null, ex);
+        }
+        return undefined(ctx);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[2])) {
+        deref r.wanted = true;
+        read_next(ctx, r, ex);
+    } else if (equal(ctx, fn, (deref host_state.methods)[3])) {
+        if (deref r.waiter != null || deref r.waiting != null || deref r.closing) {
+            fail(ctx, ex, 0, "file write already pending or closed");
+            return undefined(ctx);
+        }
+        var work: ptr<FileWork> = work_for(r, 4);
+        if (work == null) {
+            fail(ctx, ex, 2, "cannot allocate write work");
+            return undefined(ctx);
+        }
+        deref work.length = byte_view_length(ctx, args[0], ex);
+        if (deref ex != null || deref work.length < 0) {
+            free_file(work);
+            return undefined(ctx);
+        }
+        deref work.capacity = deref work.length + 1;
+        deref work.bytes = mem_alloc(deref work.capacity);
+        if (deref work.bytes == null) {
+            free_file(work);
+            fail(ctx, ex, 2, "cannot allocate write bytes");
+            return undefined(ctx);
+        }
+        copy_byte_view(ctx, args[0], deref work.bytes, deref work.length, ex);
+        if (deref ex != null) {
+            free_file(work);
+            return undefined(ctx);
+        }
+        deref r.waiter = args[2];
+        protect(ctx, deref r.waiter);
+        if (deref r.busy) {
+            deref r.waiting = work;
+        } else {
+            submit(ctx, r, work, ex);
+        }
+    } else {
+        if ((equal(ctx, fn, (deref host_state.methods)[5]) && deref r.destroy_waiter != null) || (!equal(ctx,
+            fn, (deref host_state.methods)[5]) && deref r.waiter != null)) {
+            fail(ctx, ex, 0, "file hook already pending");
+            return undefined(ctx);
+        }
+        var done: ptr<u8> = args[count - 1];
+        protect(ctx, done);
+        if (equal(ctx, fn, (deref host_state.methods)[5])) {
+            deref r.destroy_waiter = done;
+        } else {
+            deref r.waiter = done;
+        }
+        deref r.closing = true;
+        close_resource(ctx, r, ex);
+    }
+    return undefined(ctx);
+}
+
+export(c) fun jsrt_file_stream_complete(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var r: ptr<Resource> = find(receiver);
+    if (r == null) {
+        return undefined(ctx);
+    }
+    var mode: i32 = deref r.operation;
+    deref r.busy = false;
+    var failed: bool = kind(ctx, args[0]) != 0;
+    if (mode == 1 || mode == 2) {
+        if (!failed) {
+            deref r.fd = numeric(ctx, args[1], ex) as i64;
+        }
+    }
+    if (mode == 5) {
+        if (failed) {
+            var problem: array<ptr<u8>, 1> = [args[0]];
+            stream_invoke(ctx, receiver, 6, 1, &problem[0], ex);
+        }
+        close_resource(ctx, r, ex);
+        return undefined(ctx);
+    }
+    if (failed) {
+        var problem: array<ptr<u8>, 1> = [args[0]];
+        stream_invoke(ctx, receiver, 6, 1, &problem[0], ex);
+        return undefined(ctx);
+    }
+    if (deref r.closing) {
+        close_resource(ctx, r, ex);
+        return undefined(ctx);
+    }
+    if (mode == 1 || mode == 2) {
+        var opened: array<ptr<u8>, 1> = [args[1]];
+        emit_named(ctx, receiver, "open", 1, &opened[0], ex);
+        if (deref r.owner != receiver || deref ex != null || deref r.closing) {
+            return undefined(ctx);
+        }
+        var state: ptr<u8> = stream_state(ctx, receiver, 0, ex);
+        if (flag(ctx, state, "destroyed", ex)) {
+            return undefined(ctx);
+        }
+        emit_named(ctx, receiver, "ready", 0, null, ex);
+        if (deref r.owner != receiver || deref ex != null || deref r.closing || deref r.busy || flag(ctx,
+            state, "destroyed", ex)) {
+            return undefined(ctx);
+        }
+        if (deref r.waiting != null) {
+            var work: ptr<FileWork> = deref r.waiting;
+            deref r.waiting = null;
+            deref work.fd = deref r.fd;
+            submit(ctx, r, work, ex);
+        } else {
+            read_next(ctx, r, ex);
+        }
+    } else if (mode == 3) {
+        var n: i64 = byte_view_length(ctx, args[1], ex);
+        deref r.position += n;
+        if (n == 0) {
+            deref r.closing = true;
+            close_resource(ctx, r, ex);
+        } else {
+            var pushed: array<ptr<u8>, 1> = [args[1]];
+            stream_invoke(ctx, receiver, 0, 1, &pushed[0], ex);
+        }
+    } else if (mode == 4) {
+        var done: ptr<u8> = deref r.waiter;
+        deref r.waiter = null;
+        call(ctx, done, receiver, 0, null, ex);
+        unprotect(ctx, done);
+    }
+    return undefined(ctx);
+}
+
+pub fun install_file_streams(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var host_state: ptr<FileStreamsState> = file_streams_storage(ctx);
+    (deref host_state.resources) = mem_alloc_zeroed(FILE_STREAM_LIMIT * (size_of<Resource>() as i64)) as ptr<Resource>;
+    if ((deref host_state.resources) == null) {
+        return false;
+    }
+    var names: array<str, 8> = ["createReadStream", "createWriteStream", "readFileChunk", "writeFileChunk",
+        "finishFile", "destroyFile", "fileCompletion", "autoCloseFile"];
+    for (var i: i64 = 0; i < 8; i++) {
+        var name: ptr<u8> = utf8(names[i]);
+        (deref host_state.methods)[i] = function(ctx, name, callback(i as i32));
+        release(name);
+        protect(ctx, (deref host_state.methods)[i]);
+    }
+    var fs: ptr<u8> = get(ctx, global(ctx), "fs", ex);
+    define(ctx, fs, names[0], (deref host_state.methods)[0], ex, false);
+    define(ctx, fs, names[1], (deref host_state.methods)[1], ex, false);
+    return deref ex == null;
+}
+
+// Called only after the shared workers have joined.
+pub fun shutdown_file_streams(ctx: ptr<u8>) {
+    var host_state: ptr<FileStreamsState> = file_streams_storage(ctx);
+    if ((deref host_state.resources) != null) {
+        for (var i: i64 = 0; i < FILE_STREAM_LIMIT; i++) {
+            var r: ptr<Resource> = (deref host_state.resources) + i;
+            if (deref r.owner != null || deref r.path != null) {
+                discard(ctx, r);
+            }
+        }
+        mem_free((deref host_state.resources) as ptr<u8>, FILE_STREAM_LIMIT * (size_of<Resource>() as i64));
+        (deref host_state.resources) = null;
+    }
+    for (var i: i64 = 0; i < 8; i++) {
+        if ((deref host_state.methods)[i] != null) {
+            unprotect(ctx, (deref host_state.methods)[i]);
+            (deref host_state.methods)[i] = null;
+        }
+    }
+}

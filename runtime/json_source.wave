@@ -1,0 +1,171 @@
+// Source spans are indexed only after wjson has validated the complete input.
+// Values and object-key decoding still come from wjson; this is not a parser fallback.
+import("./json_support")::{error, data_property, own_keys, length_of, DEPTH_LIMIT, ITEM_LIMIT};
+import("./wjson_text")::{JsonText, encode_json_text, free_json_text, decode_json_text};
+import("wjson")::{JsonDoc, JSON_STRICT, json_parse_bytes, json_ok, json_root, json_as_bytes, json_free};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, owner: ptr<u8>, parent: ptr<u8>);
+extern(c, "wr_get") fun get(ctx: ptr<u8>, owner: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_get_index") fun at(ctx: ptr<u8>, owner: ptr<u8>, index: u32, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_to_string") fun stringify(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_utf16") fun utf16(value: ptr<u16>, count: i64) -> ptr<u8>;
+extern(c, "wr_string_characters") fun characters(value: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_length") fun string_length(value: ptr<u8>) -> i64;
+extern(c, "wr_string_value") fun string_value(ctx: ptr<u8>, value: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+fun plain(ctx: ptr<u8>) -> ptr<u8> {
+    var r: ptr<u8> = object(ctx, null, null);
+    prototype(ctx, r, js_null(ctx));
+    return r;
+}
+fun field(ctx: ptr<u8>, r: ptr<u8>, name: str, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var key: ptr<u8> = utf8(name);
+    data_property(ctx, r, key, value, ex);
+    release(key);
+}
+fun whitespace(units: ptr<u16>, size: i64, position: ptr<i64>) {
+    while (deref position < size && units[deref position] <= 32) {
+        deref position += 1;
+    }
+}
+fun quote_end(units: ptr<u16>, size: i64, position: ptr<i64>) {
+    deref position += 1;
+    while (deref position < size) {
+        var c: u16 = units[deref position];
+        deref position += 1;
+        if (c == 34) {
+            return;
+        }
+        if (c == 92) {
+            deref position += 1;
+        }
+    }
+}
+fun scan(ctx: ptr<u8>, units: ptr<u16>, size: i64, position: ptr<i64>, depth: i64, budget: ptr<i64>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (depth > DEPTH_LIMIT || deref budget <= 0) {
+        error(ctx, ex, 2, "wjson source metadata limit exceeded");
+        return undefined(ctx);
+    }
+    deref budget -= 1;
+    whitespace(units, size, position);
+    var start: i64 = deref position;
+    var c: u16 = units[start];
+    var r: ptr<u8> = plain(ctx);
+    protect(ctx, r);
+    if (c == 123 || c == 91) {
+        var children: ptr<u8> = plain(ctx);
+        protect(ctx, children);
+        field(ctx, r, "children", children, ex);
+        deref position += 1;
+        whitespace(units, size, position);
+        var index: i64 = 0;
+        while (deref position < size && units[deref position] != 125 && units[deref position] != 93 && deref ex == null) {
+            var key: ptr<u8> = null;
+            if (c == 123) {
+                var begin: i64 = deref position;
+                quote_end(units, size, position);
+                var source: ptr<u8> = utf16(units + begin, deref position - begin);
+                var input_text: ptr<u8> = string_value(ctx, source);
+                release(source);
+                protect(ctx, input_text);
+                var encoded: JsonText = encode_json_text(ctx, input_text, true, ex);
+                unprotect(ctx, input_text);
+                if (encoded.data == null) {
+                    error(ctx, ex, 2, "cannot encode wjson source key");
+                    break;
+                }
+                var doc: JsonDoc = json_parse_bytes(encoded.data, encoded.len, DEPTH_LIMIT as i32, JSON_STRICT);
+                free_json_text(encoded);
+                if (!json_ok(doc)) {
+                    json_free(&doc);
+                    error(ctx, ex, 1, "invalid validated wjson source key");
+                    break;
+                }
+                var count: i64 = 0;
+                var bytes: ptr<u8> = json_as_bytes(json_root(doc), &count);
+                key = decode_json_text(bytes, count, false);
+                json_free(&doc);
+                whitespace(units, size, position);
+                deref position += 1;
+            } else {
+                key = stringify(ctx, number(ctx, index as f64), ex);
+            }
+            if (key == null) {
+                error(ctx, ex, 2, "cannot allocate wjson source key");
+                break;
+            }
+            var child: ptr<u8> = scan(ctx, units, size, position, depth + 1, budget, ex);
+            if (deref ex == null) {
+                data_property(ctx, children, key, child, ex);
+            }
+            release(key);
+            index += 1;
+            whitespace(units, size, position);
+            if (units[deref position] == 44) {
+                deref position += 1;
+                whitespace(units, size, position);
+            }
+        }
+        deref position += 1;
+        unprotect(ctx, children);
+    } else {
+        if (c == 34) {
+            quote_end(units, size, position);
+        } else {
+            while (deref position < size && units[deref position] > 32 && units[deref position] != 44 &&
+                units[deref position] != 125 && units[deref position] != 93) {
+                deref position += 1;
+            }
+        }
+        var source: ptr<u8> = utf16(units + start, deref position - start);
+        field(ctx, r, "source", string_value(ctx, source), ex);
+        release(source);
+    }
+    unprotect(ctx, r);
+    return r;
+}
+fun annotate(ctx: ptr<u8>, value: ptr<u8>, meta: ptr<u8>, depth: i64, ex: ptr<ptr<u8>>) {
+    if (depth > DEPTH_LIMIT || kind(ctx, meta) != 5 || deref ex != null) {
+        return;
+    }
+    field(ctx, meta, "value", value, ex);
+    if (kind(ctx, value) != 5) {
+        return;
+    }
+    var children_key: ptr<u8> = utf8("children");
+    var children: ptr<u8> = get(ctx, meta, children_key, ex);
+    release(children_key);
+    var keys: ptr<u8> = own_keys(ctx, value, ex);
+    protect(ctx, keys);
+    for (var i: i64 = 0; i < length_of(ctx, keys, ex) && deref ex == null; i++) {
+        var key: ptr<u8> = stringify(ctx, at(ctx, keys, i as u32, ex), ex);
+        if (key != null) {
+            annotate(ctx, get(ctx, value, key, ex), get(ctx, children, key, ex), depth + 1, ex);
+            release(key);
+        }
+    }
+    unprotect(ctx, keys);
+}
+pub fun source_metadata(ctx: ptr<u8>, source: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var original: ptr<u8> = stringify(ctx, source, ex);
+    if (original == null || deref ex != null) {
+        return undefined(ctx);
+    }
+    var at: i64 = 0;
+    var budget: i64 = ITEM_LIMIT;
+    var meta: ptr<u8> = scan(ctx, characters(original), string_length(original), &at, 0, &budget, ex);
+    protect(ctx, meta);
+    release(original);
+    if (deref ex == null) {
+        annotate(ctx, value, meta, 0, ex);
+    }
+    unprotect(ctx, meta);
+    return meta;
+}

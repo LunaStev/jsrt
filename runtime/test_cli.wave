@@ -1,0 +1,62 @@
+// Explicit test files run in separate jsrt processes with inherited stdio.
+// No shell, automatic package scripts, shared globals or CPU deadlines.
+import("./config")::{TEST_FILE_LIMIT};
+import("./output")::{write_text};
+import("std::process::wait")::{proc_wait, proc_status_exited, proc_status_exit_code};
+import("std::mem::cstr")::{mem_eq_cstr};
+extern(c, "jsrt_argc") fun argc() -> i32;
+extern(c, "jsrt_argv") fun arg(index: i32) -> str;
+extern(c, "jsrt_environment") fun environment() -> ptr<ptr<i8>>;
+extern(c, "posix_spawn") fun spawn(pid: ptr<i32>, path: str, actions: ptr<u8>, attr: ptr<u8>,
+    argv: ptr<ptr<i8>>, env: ptr<ptr<i8>>) -> i32;
+
+pub fun run_tests() -> i32 {
+    var first: i32 = 2;
+    if (argc() > first && mem_eq_cstr(arg(first), "--")) {
+        first += 1;
+    }
+    var count: i32 = argc() - first;
+    if (count <= 0 || count as i64 > TEST_FILE_LIMIT) {
+        write_text(2, "expected explicit test files: jsrt test [--] <file.js>...\n");
+        return 2;
+    }
+    if (first == 2) {
+        for (var i: i32 = first; i < argc(); i++) {
+            var path: str = arg(i);
+            if (path[0] == 45) {
+                write_text(2, "unsupported test option; use -- before a filename beginning with '-'\n");
+                return 2;
+            }
+        }
+    }
+    var failed: bool = false;
+    for (var i: i32 = first; i < argc(); i++) {
+        var argv: array<ptr<i8>, 4> = ["jsrt" as ptr<i8>, "run" as ptr<i8>, arg(i) as ptr<i8>, null];
+        var pid: i32 = 0;
+        if (spawn(&pid, "/proc/self/exe", null, null, &argv[0], environment()) != 0) {
+            write_text(2, "cannot start test process: ");
+            write_text(2, arg(i));
+            write_text(2, "\n");
+            failed = true;
+            continue;
+        }
+        var status: i32 = 0;
+        var waited: i64 = proc_wait(pid as i64, &status);
+        while (waited == -4) {
+            waited = proc_wait(pid as i64, &status);
+        }
+        var passed: bool = waited == pid as i64 && proc_status_exited(status) && proc_status_exit_code(status) == 0;
+        if (passed) {
+            write_text(1, "PASS ");
+        } else {
+            failed = true;
+            write_text(1, "FAIL ");
+        }
+        write_text(1, arg(i));
+        write_text(1, "\n");
+    }
+    if (failed) {
+        return 1;
+    }
+    return 0;
+}

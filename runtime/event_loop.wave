@@ -1,0 +1,171 @@
+// Coordinate host work. Engines retain ownership of Promise checkpoints.
+import("std::time::clock")::{time_now_monotonic_ns};
+import("std::time::sleep")::{time_sleep_ns};
+import("./async_fs")::{async_pending, file_completions_ready, drain_files, wait_for_files};
+import("./timers")::{timers_ready, report_job_failure, next_timer_deadline, run_due_timer};
+import("./network")::{network_active, poll_network, wait_network};
+import("./http_server")::{dispatch_http, http_deadline};
+import("./network_deadlines")::{earliest};
+import("./http_client")::{poll_clients, clients_pending, wait_clients};
+import("./child_process")::{children_pending, poll_children};
+import("./esm")::{esm_failed};
+import("./workers")::{workers_pending, poll_workers, worker_stopping};
+import("./process_events")::{poll_process_signals, process_signals_present, wait_process_signals, reference_signals,
+    emit_process_before_exit};
+import("./system")::{system_exit_status};
+import("./process_io")::{poll_process_io, process_io_pending};
+extern(c, "wr_bind_context") fun bind_context(ctx: ptr<u8>);
+extern(c, "wr_checkpoint") fun checkpoint(ctx: ptr<u8>, ex: ptr<ptr<u8>>);
+
+pub fun run_event_loop(context: ptr<u8>, exception: ptr<ptr<u8>>) -> bool {
+    bind_context(context);
+    if (!timers_ready(context)) {
+        return false;
+    }
+    var before_exit_emitted: bool = false;
+    while (true) {
+        checkpoint(context, exception);
+        if (deref exception != null) {
+            return false;
+        }
+        if (worker_stopping(context)) {
+            return true;
+        }
+        if (esm_failed(context, exception)) {
+            return false;
+        }
+        if (report_job_failure(context, exception)) {
+            return false;
+        }
+        var child_work: i32 = poll_children(context, exception);
+        if (child_work < 0) {
+            return false;
+        }
+        var process_work: i32 = poll_process_io(context, exception);
+        if (process_work < 0) {
+            return false;
+        }
+        var worker_work: i32 = poll_workers(context, exception);
+        if (worker_work < 0) {
+            return false;
+        }
+        if (worker_stopping(context)) {
+            return true;
+        }
+        reference_signals(context, true);
+        poll_network();
+        reference_signals(context, false);
+        if (!poll_process_signals(context, exception)) {
+            return false;
+        }
+        var dispatched: i32 = dispatch_http(context, exception);
+        if (worker_work > 0 || child_work > 0 || process_work > 0) {
+            dispatched = 1;
+        }
+        var client_work: i32 = poll_clients(context, exception);
+        if (client_work < 0) {
+            return false;
+        }
+        if (client_work > 0) {
+            dispatched = 1;
+        }
+        if (dispatched < 0 || report_job_failure(context, exception)) {
+            return false;
+        }
+        if (async_pending(context) > 0 && file_completions_ready(context)) {
+            if (!drain_files(context, exception)) {
+                return false;
+            }
+            // A file completion may supply a paused upload or start transport
+            // from a Promise continuation. Poll it before waiting for more I/O.
+            dispatched = 1;
+        }
+        if (report_job_failure(context, exception)) {
+            return false;
+        }
+        var deadline: i64 = earliest(next_timer_deadline(context), http_deadline());
+        if (dispatched > 0) {
+            before_exit_emitted = false;
+        }
+        // Reap owned children without blocking timers or the server. This is I/O polling.
+        if (children_pending(context) || workers_pending(context) || process_io_pending(context)) {
+            var child_now: i64 = time_now_monotonic_ns();
+            if (child_now < 0) {
+                return false;
+            }
+            deadline = earliest(deadline, child_now + 10000000);
+        }
+        if (deadline < 0) {
+            if (dispatched > 0) {
+                continue;
+            }
+            if (clients_pending()) {
+                if (!wait_clients(context, -1)) {
+                    return false;
+                }
+            } else if (network_active()) {
+                if (!wait_network(context, -1)) {
+                    return false;
+                }
+            } else if (async_pending(context) > 0) {
+                if (!wait_for_files(context, -1)) {
+                    return false;
+                }
+            } else {
+                if (before_exit_emitted) {
+                    return true;
+                }
+                // A listener can revive host work. Promise jobs remain engine-owned;
+                // the native call returns after the engine's normal checkpoint.
+                before_exit_emitted = true;
+                emit_process_before_exit(context, system_exit_status(context), exception);
+                if (deref exception != null) {
+                    return false;
+                }
+                continue;
+            }
+            continue;
+        }
+        var now: i64 = time_now_monotonic_ns();
+        if (now < 0) {
+            return false;
+        }
+        if (deadline > now) {
+            if (dispatched > 0) {
+                continue;
+            }
+            if (async_pending(context) > 0 || network_active() || clients_pending() || process_signals_present(context)) {
+                var millis: i64 = (deadline - now + 999999) / 1000000;
+                if (millis > 2147483647) {
+                    millis = 2147483647;
+                }
+                if (clients_pending()) {
+                    if (!wait_clients(context, millis as i32)) {
+                        return false;
+                    }
+                } else if (process_signals_present(context)) {
+                    if (!wait_process_signals(context, millis as i32)) {
+                        return false;
+                    }
+                } else if (network_active()) {
+                    if (!wait_network(context, millis as i32)) {
+                        return false;
+                    }
+                } else if (!wait_for_files(context, millis as i32)) {
+                    return false;
+                }
+            } else if (time_sleep_ns(deadline - now) < 0) {
+                return false;
+            }
+            continue;
+        }
+        if (worker_stopping(context)) {
+            return true;
+        }
+        if (!run_due_timer(context, now, exception)) {
+            return false;
+        }
+        before_exit_emitted = false;
+    }
+    return true;
+}

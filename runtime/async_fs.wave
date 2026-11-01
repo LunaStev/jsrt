@@ -1,0 +1,534 @@
+import("./context_state")::{context_slot, allocate_context_slot, release_context_slot, ASYNC_FS_SLOT};
+// Wave-owned worker queue. Workers only handle byte buffers and Wave std I/O.
+// All JSC handles, Promise settlement and UTF-8 decoding stay on the main thread.
+import("./system")::{FileWork, prepare_file, perform_file, complete_file, free_file, system_fail};
+import("./fs_tasks")::{STAT, METHOD_COUNT, prepare_path_task, perform_path_task, complete_path_task};
+import("./fs_handle_jobs")::{HANDLE_OPEN, perform_handle_job, complete_handle_job};
+import("./config")::{JOB_LIMIT, FILE_WORKERS};
+import("std::mem::alloc")::{mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::io::fd")::{io_pipe, io_close, io_read, io_write};
+import("std::sys::fs")::{fcntl, FS_F_GETFL, FS_F_SETFL, FS_O_NONBLOCK};
+import("std::net::poll")::{net_wait_readable};
+
+extern(c, "pthread_create") fun pthread_create(thread: ptr<u64>, attr: ptr<u8>, callback: ptr<u8>, data: ptr<u8>) -> i32;
+extern(c, "pthread_join") fun pthread_join(thread: u64, result: ptr<ptr<u8>>) -> i32;
+extern(c, "pthread_mutex_init") fun pthread_mutex_init(mutex: ptr<u8>, attr: ptr<u8>) -> i32;
+extern(c, "pthread_mutex_destroy") fun pthread_mutex_destroy(mutex: ptr<u8>) -> i32;
+extern(c, "pthread_mutex_lock") fun pthread_mutex_lock(mutex: ptr<u8>) -> i32;
+extern(c, "pthread_mutex_unlock") fun pthread_mutex_unlock(mutex: ptr<u8>) -> i32;
+extern(c, "pthread_cond_init") fun pthread_cond_init(condition: ptr<u8>, attr: ptr<u8>) -> i32;
+extern(c, "pthread_cond_destroy") fun pthread_cond_destroy(condition: ptr<u8>) -> i32;
+extern(c, "pthread_cond_wait") fun pthread_cond_wait(condition: ptr<u8>, mutex: ptr<u8>) -> i32;
+extern(c, "pthread_cond_signal") fun pthread_cond_signal(condition: ptr<u8>) -> i32;
+extern(c, "pthread_cond_broadcast") fun pthread_cond_broadcast(condition: ptr<u8>) -> i32;
+extern(c, "jsrt_worker_callback") fun jsrt_worker_callback() -> ptr<u8>;
+extern(c, "jsrt_mutex_size") fun jsrt_mutex_size() -> i64;
+extern(c, "jsrt_condition_size") fun jsrt_condition_size() -> i64;
+extern(c, "jsrt_async_callback") fun jsrt_async_callback(writing: i32) -> ptr<u8>;
+extern(c, "wr_context_global") fun wr_context_global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_object") fun wr_object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_get") fun wr_get(ctx: ptr<u8>, object: ptr<u8>, name: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set") fun wr_set(ctx: ptr<u8>, object: ptr<u8>, name: ptr<u8>, value: ptr<u8>, flags: u32,
+    ex: ptr<ptr<u8>>);
+extern(c, "wr_function") fun wr_function(ctx: ptr<u8>, name: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_promise") fun wr_promise(ctx: ptr<u8>, resolve: ptr<ptr<u8>>, reject: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_call") fun wr_call(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_undefined") fun wr_undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_equal") fun wr_equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_protect") fun wr_protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(ctx: ptr<u8>, value: ptr<u8>);
+
+struct Job {
+    owner: ptr<u8>;
+    completion: ptr<u8>;
+    work: ptr<FileWork>;
+    resolve: ptr<u8>;
+    reject: ptr<u8>;
+    failure: ptr<u8>;
+    sequence: i64;
+    state: i32;
+    // 0 free, 1 queued, 2 running, 3 complete, 4 main-thread reservation
+}
+
+struct FileQueue {
+    methods: array<ptr<u8>, 8>;
+    jobs: ptr<Job>;
+    mutex: ptr<u8>;
+    condition: ptr<u8>;
+    mutex_ready: bool;
+    condition_ready: bool;
+    threads: ptr<u64>;
+    worker_count: i64;
+    stopping: bool;
+    outstanding: i64;
+    next_sequence: i64;
+    read_fd: i64;
+    write_fd: i64;
+}
+
+fun file_queue(ctx: ptr<u8>) -> ptr<FileQueue> {
+    return context_slot(ctx, ASYNC_FS_SLOT) as ptr<FileQueue>;
+}
+
+fun notify(s: ptr<FileQueue>) {
+    var token: u8 = 1;
+    io_write(deref s.write_fd, &token, 1);
+    // EAGAIN means the pipe is already readable.
+}
+
+export(c) fun jsrt_file_worker(data: ptr<u8>) -> ptr<u8> {
+    var s: ptr<FileQueue> = data as ptr<FileQueue>;
+    while (true) {
+        pthread_mutex_lock(deref s.mutex);
+        var selected: ptr<Job> = null;
+        while (!deref s.stopping && selected == null) {
+            for (var i: i64 = 0; i < JOB_LIMIT; i++) {
+                var job: ptr<Job> = deref s.jobs + i;
+                if (deref job.state == 1 && (selected == null || deref job.sequence < deref selected.sequence)) {
+                    selected = job;
+                }
+            }
+            if (selected == null) {
+                pthread_cond_wait(deref s.condition, deref s.mutex);
+            }
+        }
+        if (deref s.stopping) {
+            pthread_mutex_unlock(deref s.mutex);
+            return null;
+        }
+        deref selected.state = 2;
+        pthread_mutex_unlock(deref s.mutex);
+        var work: ptr<FileWork> = deref selected.work;
+        if (deref work.mode >= HANDLE_OPEN) {
+            perform_handle_job(work);
+        } else if (deref work.mode >= STAT) {
+            perform_path_task(work);
+        } else {
+            perform_file(work);
+        }
+        pthread_mutex_lock(deref s.mutex);
+        deref selected.state = 3;
+        pthread_mutex_unlock(deref s.mutex);
+        notify(s);
+    }
+    return null;
+}
+
+fun submit(ctx: ptr<u8>, argc: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>, operation: i32) -> ptr<u8> {
+    var s: ptr<FileQueue> = file_queue(ctx);
+    var resolve: ptr<u8> = null;
+    var reject: ptr<u8> = null;
+    var promise: ptr<u8> = wr_promise(ctx, &resolve, &reject, ex);
+    if (promise == null || deref ex != null) {
+        return wr_undefined(ctx);
+    }
+    wr_protect(ctx, promise);
+    wr_protect(ctx, resolve);
+    wr_protect(ctx, reject);
+    pthread_mutex_lock(deref s.mutex);
+    var selected: ptr<Job> = null;
+    for (var i: i64 = 0; i < JOB_LIMIT; i++) {
+        var job: ptr<Job> = deref s.jobs + i;
+        if (deref job.state == 0) {
+            selected = job;
+            deref job.state = 4;
+            break;
+        }
+    }
+    pthread_mutex_unlock(deref s.mutex);
+    var failure: ptr<u8> = null;
+    if (selected == null) {
+        system_fail(ctx, &failure, true, "pending file job limit exceeded (16)");
+        var rejection: array<ptr<u8>, 1> = [failure];
+        wr_call(ctx, reject, null, 1, &rejection[0], ex);
+        wr_unprotect(ctx, reject);
+        wr_unprotect(ctx, resolve);
+        wr_unprotect(ctx, promise);
+        return promise;
+    }
+    var work: ptr<FileWork> = null;
+    if (operation >= STAT) {
+        work = prepare_path_task(ctx, operation, argc, args, &failure);
+    } else {
+        work = prepare_file(ctx, argc, args, &failure, operation == 1);
+    }
+    if (failure != null) {
+        wr_protect(ctx, failure);
+    }
+    // Publish fully prepared native state under the same mutex as the workers.
+    pthread_mutex_lock(deref s.mutex);
+    deref selected.work = work;
+    deref selected.resolve = resolve;
+    deref selected.reject = reject;
+    deref selected.failure = failure;
+    deref selected.sequence = deref s.next_sequence;
+    deref s.next_sequence += 1;
+    if (failure == null) {
+        deref selected.state = 1;
+    } else {
+        deref selected.state = 3;
+    }
+    deref s.outstanding += 1;
+    pthread_cond_signal(deref s.condition);
+    pthread_mutex_unlock(deref s.mutex);
+    wr_unprotect(ctx, promise);
+    return promise;
+}
+
+export(c) fun jsrt_async_read(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, argc: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return submit(ctx, argc, args, ex, 0);
+}
+
+export(c) fun jsrt_async_write(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, argc: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return submit(ctx, argc, args, ex, 1);
+}
+
+export(c) fun jsrt_async_operation(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, argc: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<FileQueue> = file_queue(ctx);
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        if (wr_equal(ctx, function, (deref s.methods)[i])) {
+            return submit(ctx, argc, args, ex, STAT + i as i32);
+        }
+    }
+    system_fail(ctx, ex, false, "unknown filesystem operation");
+    return wr_undefined(ctx);
+}
+
+pub fun async_pending(ctx: ptr<u8>) -> i64 {
+    var s: ptr<FileQueue> = file_queue(ctx);
+    if (s == null) {
+        return 0;
+    }
+    return deref s.outstanding;
+}
+
+pub fun submit_file_work(ctx: ptr<u8>, work: ptr<FileWork>, owner: ptr<u8>, completion: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var s: ptr<FileQueue> = file_queue(ctx);
+    pthread_mutex_lock(deref s.mutex);
+    var selected: ptr<Job> = null;
+    for (var i: i64 = 0; i < JOB_LIMIT; i++) {
+        var job: ptr<Job> = deref s.jobs + i;
+        if (deref job.state == 0) {
+            selected = job;
+            deref job.state = 4;
+            break;
+        }
+    }
+    pthread_mutex_unlock(deref s.mutex);
+    if (selected == null) {
+        system_fail(ctx, ex, true, "pending file job limit exceeded (16)");
+        return false;
+    }
+    wr_protect(ctx, owner);
+    wr_protect(ctx, completion);
+    pthread_mutex_lock(deref s.mutex);
+    deref selected.work = work;
+    deref selected.owner = owner;
+    deref selected.completion = completion;
+    deref selected.sequence = deref s.next_sequence;
+    deref s.next_sequence += 1;
+    deref s.outstanding += 1;
+    deref selected.state = 1;
+    pthread_cond_signal(deref s.condition);
+    pthread_mutex_unlock(deref s.mutex);
+    return true;
+}
+
+pub fun file_completion_fd(ctx: ptr<u8>) -> i64 {
+    var s: ptr<FileQueue> = file_queue(ctx);
+    if (s == null) {
+        return -1;
+    }
+    return deref s.read_fd;
+}
+
+pub fun file_completions_ready(ctx: ptr<u8>) -> bool {
+    var s: ptr<FileQueue> = file_queue(ctx);
+    if (s == null || !deref s.mutex_ready) {
+        return false;
+    }
+    pthread_mutex_lock(deref s.mutex);
+    var ready: bool = false;
+    for (var i: i64 = 0; i < JOB_LIMIT; i++) {
+        var job: ptr<Job> = deref s.jobs + i;
+        if (deref job.state == 3) {
+            ready = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(deref s.mutex);
+    return ready;
+}
+
+pub fun wait_for_files(ctx: ptr<u8>, timeout_ms: i32) -> bool {
+    var s: ptr<FileQueue> = file_queue(ctx);
+    if (file_completions_ready(ctx)) {
+        return true;
+    }
+    var result: i64 = net_wait_readable(deref s.read_fd, timeout_ms);
+    return result >= 0 || result == -4;
+    // A signal returns control to the loop.
+}
+
+pub fun drain_files(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var s: ptr<FileQueue> = file_queue(ctx);
+    var tokens: array<u8, 64>;
+    while (io_read(deref s.read_fd, &tokens[0], 64) > 0) {
+    }
+    // One settlement per turn lets the loop check timer and microtask failures.
+    for (var delivered: i64 = 0; delivered < 1; delivered++) {
+        pthread_mutex_lock(deref s.mutex);
+        var selected: ptr<Job> = null;
+        for (var i: i64 = 0; i < JOB_LIMIT; i++) {
+            var job: ptr<Job> = deref s.jobs + i;
+            if (deref job.state == 3) {
+                selected = job;
+                deref job.state = 4;
+                break;
+            }
+        }
+        pthread_mutex_unlock(deref s.mutex);
+        if (selected == null) {
+            return true;
+        }
+        var resolve: ptr<u8> = deref selected.resolve;
+        var reject: ptr<u8> = deref selected.reject;
+        var failure: ptr<u8> = deref selected.failure;
+        var value: ptr<u8> = wr_undefined(ctx);
+        var work: ptr<FileWork> = deref selected.work;
+        var owner: ptr<u8> = deref selected.owner;
+        var native_completion: ptr<u8> = deref selected.completion;
+        if (failure == null) {
+            if (deref work.mode >= HANDLE_OPEN) {
+                value = complete_handle_job(ctx, work, &failure);
+            } else if (deref work.mode >= STAT) {
+                value = complete_path_task(ctx, work, &failure);
+            } else {
+                value = complete_file(ctx, work, &failure);
+            }
+        }
+        if (failure != null && deref selected.failure == null) {
+            wr_protect(ctx, failure);
+        }
+        wr_protect(ctx, value);
+        var rooted_value: ptr<u8> = value;
+        if (native_completion != null && failure == null &&
+            (deref work.mode == 1 || deref work.mode == 2 || deref work.mode == HANDLE_OPEN)) {
+            deref work.fd = -1;
+        }
+        free_file(work);
+        deref s.outstanding -= 1;
+        pthread_mutex_lock(deref s.mutex);
+        deref selected.work = null;
+        deref selected.resolve = null;
+        deref selected.reject = null;
+        deref selected.failure = null;
+        deref selected.state = 0;
+        deref selected.owner = null;
+        deref selected.completion = null;
+        pthread_mutex_unlock(deref s.mutex);
+        // Release the slot before running JS; Promise continuations may submit.
+        if (native_completion != null) {
+            var problem: ptr<u8> = wr_undefined(ctx);
+            if (failure != null) {
+                problem = failure;
+            }
+            var settlement: array<ptr<u8>, 2> = [problem, value];
+            wr_call(ctx, native_completion, owner, 2, &settlement[0], ex);
+            wr_unprotect(ctx, owner);
+            wr_unprotect(ctx, native_completion);
+        } else {
+            var callback: ptr<u8> = resolve;
+            if (failure != null) {
+                callback = reject;
+                value = failure;
+            }
+            var settlement: array<ptr<u8>, 1> = [value];
+            wr_call(ctx, callback, null, 1, &settlement[0], ex);
+        }
+        wr_unprotect(ctx, rooted_value);
+        if (failure != null) {
+            wr_unprotect(ctx, failure);
+        }
+        if (resolve != null) {
+            wr_unprotect(ctx, resolve);
+        }
+        if (reject != null) {
+            wr_unprotect(ctx, reject);
+        }
+        if (deref ex != null) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fun set_method(ctx: ptr<u8>, object: ptr<u8>, name: str, writing: i32, ex: ptr<ptr<u8>>) {
+    var key: ptr<u8> = wr_string_utf8(name);
+    var function: ptr<u8> = wr_function(ctx, key, jsrt_async_callback(writing));
+    wr_protect(ctx, function);
+    wr_set(ctx, object, key, function, 0, ex);
+    wr_unprotect(ctx, function);
+    wr_string_release(key);
+}
+
+pub fun install_async_fs(ctx: ptr<u8>) -> bool {
+    var s: ptr<FileQueue> = file_queue(ctx);
+    if (!allocate_context_slot(ctx, ASYNC_FS_SLOT, size_of<FileQueue>() as i64)) {
+        return false;
+    }
+    s = file_queue(ctx);
+    deref s.read_fd = -1;
+    deref s.write_fd = -1;
+    deref s.next_sequence = 1;
+    (deref s.threads) = mem_alloc_zeroed(FILE_WORKERS * (size_of<u64>() as i64)) as ptr<u64>;
+    deref s.jobs = mem_alloc_zeroed(JOB_LIMIT * (size_of<Job>() as i64)) as ptr<Job>;
+    deref s.mutex = mem_alloc_zeroed(jsrt_mutex_size());
+    deref s.condition = mem_alloc_zeroed(jsrt_condition_size());
+    if (deref s.jobs == null || deref s.mutex == null || deref s.condition == null || (deref s.threads) == null) {
+        return false;
+    }
+    if (pthread_mutex_init(deref s.mutex, null) != 0) {
+        return false;
+    }
+    deref s.mutex_ready = true;
+    if (pthread_cond_init(deref s.condition, null) != 0) {
+        return false;
+    }
+    deref s.condition_ready = true;
+    var pipe: array<i32, 2>;
+    if (io_pipe(&pipe[0]) < 0) {
+        return false;
+    }
+    deref s.read_fd = pipe[0] as i64;
+    deref s.write_fd = pipe[1] as i64;
+    for (var i: i64 = 0; i < 2; i++) {
+        var fd: i64 = pipe[i] as i64;
+        var flags: i64 = fcntl(fd, FS_F_GETFL, 0);
+        if (flags < 0 || fcntl(fd, FS_F_SETFL, flags | FS_O_NONBLOCK) < 0 || fcntl(fd, 2, 1) < 0) {
+            return false;
+        }
+    }
+    deref s.stopping = false;
+    for (var i: i64 = 0; i < FILE_WORKERS; i++) {
+        if (pthread_create(&(deref s.threads)[i], null, jsrt_worker_callback(), s as ptr<u8>) != 0) {
+            return false;
+        }
+        deref s.worker_count += 1;
+    }
+    var ex: ptr<u8> = null;
+    var promises: ptr<u8> = wr_object(ctx, null, null);
+    wr_protect(ctx, promises);
+    set_method(ctx, promises, "readFile", 0, &ex);
+    set_method(ctx, promises, "writeFile", 1, &ex);
+    var names: array<str, 8> = ["stat", "lstat", "access", "mkdir", "unlink", "rmdir", "rename", "readdir"];
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        var name: ptr<u8> = wr_string_utf8(names[i]);
+        var function: ptr<u8> = wr_function(ctx, name, jsrt_async_callback(2));
+        (deref s.methods)[i] = function;
+        wr_protect(ctx, function);
+        wr_set(ctx, promises, name, function, 0, &ex);
+        wr_string_release(name);
+        if (ex != null) {
+            break;
+        }
+    }
+    var key: ptr<u8> = wr_string_utf8("fs");
+    var fs: ptr<u8> = wr_get(ctx, wr_context_global(ctx), key, &ex);
+    wr_string_release(key);
+    key = wr_string_utf8("promises");
+    wr_set(ctx, fs, key, promises, 0, &ex);
+    wr_string_release(key);
+    wr_unprotect(ctx, promises);
+    return ex == null;
+}
+
+pub fun shutdown_async_fs(ctx: ptr<u8>) -> bool {
+    var s: ptr<FileQueue> = file_queue(ctx);
+    if (s == null) {
+        return true;
+    }
+    if (deref s.mutex_ready) {
+        pthread_mutex_lock(deref s.mutex);
+        deref s.stopping = true;
+        if (deref s.condition_ready) {
+            pthread_cond_broadcast(deref s.condition);
+        }
+        pthread_mutex_unlock(deref s.mutex);
+    }
+    var joined: bool = true;
+    for (var i: i64 = 0; i < deref s.worker_count; i++) {
+        joined = pthread_join((deref s.threads)[i], null) == 0 && joined;
+    }
+    if (!joined) {
+        return false;
+    }
+    // Never free storage still visible to a worker.
+    deref s.worker_count = 0;
+    if ((deref s.threads) != null) {
+        mem_free((deref s.threads) as ptr<u8>, FILE_WORKERS * (size_of<u64>() as i64));
+        (deref s.threads) = null;
+    }
+    if (deref s.read_fd >= 0) {
+        io_close(deref s.read_fd);
+        deref s.read_fd = -1;
+    }
+    if (deref s.write_fd >= 0) {
+        io_close(deref s.write_fd);
+        deref s.write_fd = -1;
+    }
+    if (deref s.jobs != null) {
+        for (var i: i64 = 0; i < JOB_LIMIT; i++) {
+            var job: ptr<Job> = deref s.jobs + i;
+            free_file(deref job.work);
+            if (deref job.resolve != null) {
+                wr_unprotect(ctx, deref job.resolve);
+            }
+            if (deref job.reject != null) {
+                wr_unprotect(ctx, deref job.reject);
+            }
+            if (deref job.failure != null) {
+                wr_unprotect(ctx, deref job.failure);
+            }
+            if (deref job.owner != null) {
+                wr_unprotect(ctx, deref job.owner);
+            }
+            if (deref job.completion != null) {
+                wr_unprotect(ctx, deref job.completion);
+            }
+        }
+        mem_free(deref s.jobs as ptr<u8>, JOB_LIMIT * (size_of<Job>() as i64));
+        deref s.jobs = null;
+    }
+    deref s.outstanding = 0;
+    if (deref s.condition_ready) {
+        pthread_cond_destroy(deref s.condition);
+        deref s.condition_ready = false;
+    }
+    if (deref s.mutex_ready) {
+        pthread_mutex_destroy(deref s.mutex);
+        deref s.mutex_ready = false;
+    }
+    if (deref s.condition != null) {
+        mem_free(deref s.condition, jsrt_condition_size());
+        deref s.condition = null;
+    }
+    if (deref s.mutex != null) {
+        mem_free(deref s.mutex, jsrt_mutex_size());
+        deref s.mutex = null;
+    }
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        if ((deref s.methods)[i] != null) {
+            wr_unprotect(ctx, (deref s.methods)[i]);
+        }
+    }
+    release_context_slot(ctx, ASYNC_FS_SLOT, size_of<FileQueue>() as i64);
+    return true;
+}

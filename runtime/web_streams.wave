@@ -1,0 +1,470 @@
+// Web Streams API registration and native dispatch. Algorithms live in Wave.
+import("./web_stream_core")::{WebStreamState, storage, initialize_storage, shutdown_storage, record, field_number, settle, resolved, rejected_type, type_error, error_readable, READABLE, WRITABLE, TRANSFORM, READER, WRITER, READ_CONTROLLER, WRITE_CONTROLLER, TRANSFORM_CONTROLLER, CLOSED, ERRORED, ERRORING, METHOD_COUNT, JOB_OK, JOB_ERROR, NOOP, JOB_READ_PULL, JOB_WRITE_ABORT, JOB_FLUSH, JOB_READ_CANCEL, JOB_TEE_READ, JOB_TEE_CANCEL, JOB_ITERATOR_READ, JOB_ITERATOR_RETURN, JOB_ADAPTER_READ};
+import("./web_readable")::{create_readable, reader, read, cancel, release_reader, enqueue_readable,
+    request_close, read_job};
+import("./web_writable")::{create_writable, writer, write, close, abort, release_writer, error_writable, write_job};
+import("./web_transform")::{create_transform, transform_hook, transform_job, enqueue_transform, fail_transform,
+    TRANSFORM_WRITE, TRANSFORM_START};
+import("./web_composition")::{pipe_to, pipe_job, abort_pipe, tee, tee_hook, tee_job, iterator, iterator_method,
+    iterator_job, PIPE_ABORT, TEE_PULL, TEE_CANCEL};
+import("./web_stream_core")::{handled};
+import("./web_stream_adapter")::{to_web, from_web, adapter_hook, adapter_job, TO_WEB, FROM_WEB, WEB_PULL, HOST_DESTROY};
+import("./stream_state")::{stream_state_storage, StreamHostState};
+import("./web_support")::{public_constructor};
+import("./values")::{get, put, text, define, define_key, getter, fail};
+import("./collections")::{integer, set_flag};
+
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, value: ptr<u8>, parent: ptr<u8>);
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "jsrt_web_stream_callback") fun callback(constructing: bool) -> ptr<u8>;
+const READ_GET_READER: i64 = 0;
+const READ_CANCEL: i64 = 1;
+const READ_LOCKED: i64 = 2;
+const CONTROL_ENQUEUE: i64 = 3;
+const CONTROL_CLOSE: i64 = 4;
+const CONTROL_ERROR: i64 = 5;
+const CONTROL_DESIRED: i64 = 6;
+const READER_READ: i64 = 7;
+const READER_RELEASE: i64 = 8;
+const READER_CLOSED: i64 = 9;
+const WRITE_GET_WRITER: i64 = 10;
+const WRITE_ABORT: i64 = 11;
+const WRITE_CLOSE: i64 = 12;
+const WRITE_LOCKED: i64 = 13;
+const WRITER_WRITE: i64 = 14;
+const WRITER_CLOSE: i64 = 15;
+const WRITER_ABORT: i64 = 16;
+const WRITER_RELEASE: i64 = 17;
+const WRITER_READY: i64 = 18;
+const WRITER_CLOSED: i64 = 19;
+const WRITER_DESIRED: i64 = 20;
+const WRITE_CONTROL_ERROR: i64 = 21;
+const WRITE_CONTROL_SIGNAL: i64 = 22;
+const TRANSFORM_ENQUEUE: i64 = 23;
+const TRANSFORM_ERROR: i64 = 24;
+const TRANSFORM_TERMINATE: i64 = 25;
+const TRANSFORM_DESIRED: i64 = 26;
+const TRANSFORM_READABLE: i64 = 27;
+const TRANSFORM_WRITABLE: i64 = 28;
+const PIPE_TO: i64 = 29;
+const PIPE_THROUGH: i64 = 30;
+const TEE: i64 = 31;
+const VALUES: i64 = 32;
+const ITERATOR_NEXT: i64 = 33;
+const ITERATOR_RETURN: i64 = 34;
+const READER_CANCEL: i64 = 35;
+const ITERATOR_SELF: i64 = 36;
+const ITERATOR_KIND: i64 = 8;
+export(c) fun jsrt_web_stream_construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<WebStreamState> = storage(ctx);
+    var category: i64 = 0;
+    while (category < 8 && !equal(ctx, ctor, (deref s.ctors)[category])) {
+        category += 1;
+    }
+    var first: ptr<u8> = undefined(ctx);
+    var second: ptr<u8> = undefined(ctx);
+    var third: ptr<u8> = undefined(ctx);
+    if (count > 0) {
+        first = args[0];
+    }
+    if (count > 1) {
+        second = args[1];
+    }
+    if (count > 2) {
+        third = args[2];
+    }
+    if (category == READABLE) {
+        return create_readable(ctx, first, second, 1.0, ex);
+    }
+    if (category == WRITABLE) {
+        return create_writable(ctx, first, second, ex);
+    }
+    if (category == TRANSFORM) {
+        return create_transform(ctx, first, second, third, ex);
+    }
+    if (category == READER) {
+        return reader(ctx, first, undefined(ctx), ex);
+    }
+    if (category == WRITER) {
+        return writer(ctx, first, ex);
+    }
+    fail(ctx, ex, 1, "stream controllers cannot be constructed directly");
+    return undefined(ctx);
+}
+fun desired(ctx: ptr<u8>, r: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var phase: i64 = integer(ctx, r, "state", ex);
+    if (phase == ERRORED || phase == ERRORING) {
+        return js_null(ctx);
+    }
+    if (phase == CLOSED) {
+        return number(ctx, 0.0);
+    }
+    return number(ctx, field_number(ctx, r, "high", ex) - field_number(ctx, r, "total", ex));
+}
+fun invoke(ctx: ptr<u8>, mode: i64, owner: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var value: ptr<u8> = undefined(ctx);
+    if (count > 0) {
+        value = args[0];
+    }
+    if (mode == NOOP) {
+        return undefined(ctx);
+    }
+    if (mode == JOB_OK || mode == JOB_ERROR) {
+        if (count < 1) {
+            return undefined(ctx);
+        }
+        var entry: ptr<u8> = args[0];
+        value = undefined(ctx);
+        if (count > 1) {
+            value = args[1];
+        }
+        var operation: i64 = integer(ctx, entry, "op", ex);
+        var r: ptr<u8> = get(ctx, entry, "stream", ex);
+        var extra: ptr<u8> = get(ctx, entry, "extra", ex);
+        if (operation <= JOB_READ_PULL) {
+            read_job(ctx, r, operation, value, mode == JOB_ERROR, ex);
+        } else if (operation <= JOB_WRITE_ABORT) {
+            write_job(ctx, r, operation, extra, value, mode == JOB_ERROR, ex);
+        } else if (operation <= JOB_FLUSH) {
+            transform_job(ctx, r, operation, extra, value, mode == JOB_ERROR, ex);
+        } else if (operation == JOB_READ_CANCEL) {
+            if (mode == JOB_ERROR) {
+                settle(ctx, extra, value, true, ex);
+            } else {
+                settle(ctx, extra, undefined(ctx), false, ex);
+            }
+        } else if (operation == JOB_TEE_READ || operation == JOB_TEE_CANCEL) {
+            tee_job(ctx, r, operation, value, mode == JOB_ERROR, ex);
+        } else if (operation == JOB_ITERATOR_READ || operation == JOB_ITERATOR_RETURN) {
+            iterator_job(ctx, r, operation, extra, value, mode == JOB_ERROR, ex);
+        } else if (operation >= JOB_ADAPTER_READ) {
+            adapter_job(ctx, r, operation, value, mode == JOB_ERROR, ex);
+        } else {
+            pipe_job(ctx, r, operation, value, mode == JOB_ERROR, ex);
+        }
+        return undefined(ctx);
+    }
+    if (mode >= TRANSFORM_WRITE && mode <= TRANSFORM_START) {
+        if (count < 1) {
+            return undefined(ctx);
+        }
+        value = undefined(ctx);
+        if (count > 1) {
+            value = args[1];
+        }
+        return transform_hook(ctx, mode, args[0], value, ex);
+    }
+    if (mode == PIPE_ABORT) {
+        if (count > 0) {
+            abort_pipe(ctx, args[0], ex);
+        }
+        return undefined(ctx);
+    }
+    if (mode == TEE_PULL || mode == TEE_CANCEL) {
+        if (count == 0) {
+            return undefined(ctx);
+        }
+        value = undefined(ctx);
+        if (count > 1) {
+            value = args[1];
+        }
+        return tee_hook(ctx, args[0], value, mode == TEE_CANCEL, ex);
+    }
+    if (mode == TO_WEB || mode == FROM_WEB) {
+        var options: ptr<u8> = undefined(ctx);
+        if (count > 1) {
+            options = args[1];
+        }
+        if (mode == TO_WEB) {
+            return to_web(ctx, value, options, ex);
+        }
+        return from_web(ctx, value, options, ex);
+    }
+    if (mode >= WEB_PULL && mode <= HOST_DESTROY) {
+        if (count == 0) {
+            fail(ctx, ex, 1, "missing private stream adapter");
+            return undefined(ctx);
+        }
+        return adapter_hook(ctx, mode, args[0], count, args, ex);
+    }
+    if (mode <= READ_LOCKED) {
+        var r: ptr<u8> = record(ctx, owner, READABLE, ex);
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        if (mode == READ_GET_READER) {
+            return reader(ctx, owner, value, ex);
+        }
+        if (mode == READ_LOCKED) {
+            return boolean(ctx, kind(ctx, get(ctx, r, "reader", ex)) == 5);
+        }
+        if (kind(ctx, get(ctx, r, "reader", ex)) == 5) {
+            return rejected_type(ctx, "cannot cancel a locked ReadableStream", ex);
+        }
+        return cancel(ctx, r, value, ex);
+    }
+    if (mode >= CONTROL_ENQUEUE && mode <= CONTROL_DESIRED) {
+        var controller: ptr<u8> = record(ctx, owner, READ_CONTROLLER, ex);
+        var r: ptr<u8> = get(ctx, controller, "stream", ex);
+        if (deref ex == null) {
+            if (mode == CONTROL_ENQUEUE) {
+                enqueue_readable(ctx, r, value, ex);
+            } else if (mode == CONTROL_CLOSE) {
+                request_close(ctx, r, ex);
+            } else if (mode == CONTROL_ERROR) {
+                error_readable(ctx, r, value, ex);
+            } else {
+                return desired(ctx, r, ex);
+            }
+        }
+        return undefined(ctx);
+    }
+    if ((mode >= READER_READ && mode <= READER_CLOSED) || mode == READER_CANCEL) {
+        var cursor: ptr<u8> = record(ctx, owner, READER, ex);
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        if (mode == READER_READ) {
+            return read(ctx, owner, ex);
+        }
+        if (mode == READER_RELEASE) {
+            release_reader(ctx, cursor, ex);
+            return undefined(ctx);
+        }
+        if (mode == READER_CLOSED) {
+            return get(ctx, get(ctx, cursor, "closed", ex), "promise", ex);
+        }
+        var r: ptr<u8> = get(ctx, cursor, "stream", ex);
+        if (kind(ctx, r) != 5) {
+            return rejected_type(ctx, "reader lock has been released", ex);
+        }
+        return cancel(ctx, r, value, ex);
+    }
+    if (mode >= WRITE_GET_WRITER && mode <= WRITE_LOCKED) {
+        var r: ptr<u8> = record(ctx, owner, WRITABLE, ex);
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        if (mode == WRITE_GET_WRITER) {
+            return writer(ctx, owner, ex);
+        }
+        if (mode == WRITE_LOCKED) {
+            return boolean(ctx, kind(ctx, get(ctx, r, "writer", ex)) == 5);
+        }
+        if (kind(ctx, get(ctx, r, "writer", ex)) == 5) {
+            return rejected_type(ctx, "cannot operate on a locked WritableStream", ex);
+        }
+        if (mode == WRITE_ABORT) {
+            return abort(ctx, r, value, ex);
+        }
+        return close(ctx, r, ex);
+    }
+    if (mode >= WRITER_WRITE && mode <= WRITER_DESIRED) {
+        var cursor: ptr<u8> = record(ctx, owner, WRITER, ex);
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        if (mode == WRITER_RELEASE) {
+            release_writer(ctx, cursor, ex);
+            return undefined(ctx);
+        }
+        if (mode == WRITER_READY || mode == WRITER_CLOSED) {
+            var name: str = "ready";
+            if (mode == WRITER_CLOSED) {
+                name = "closed";
+            }
+            return get(ctx, get(ctx, cursor, name, ex), "promise", ex);
+        }
+        var r: ptr<u8> = get(ctx, cursor, "stream", ex);
+        if (kind(ctx, r) != 5) {
+            fail(ctx, ex, 1, "writer lock has been released");
+            return undefined(ctx);
+        }
+        if (mode == WRITER_WRITE) {
+            return write(ctx, cursor, value, ex);
+        }
+        if (mode == WRITER_CLOSE) {
+            return close(ctx, r, ex);
+        }
+        if (mode == WRITER_ABORT) {
+            return abort(ctx, r, value, ex);
+        }
+        return desired(ctx, r, ex);
+    }
+    if (mode == WRITE_CONTROL_ERROR || mode == WRITE_CONTROL_SIGNAL) {
+        var controller: ptr<u8> = record(ctx, owner, WRITE_CONTROLLER, ex);
+        if (deref ex == null && mode == WRITE_CONTROL_ERROR) {
+            error_writable(ctx, get(ctx, controller, "stream", ex), value, ex);
+        } else if (deref ex == null) {
+            return get(ctx, controller, "signal", ex);
+        }
+        return undefined(ctx);
+    }
+    if (mode >= TRANSFORM_ENQUEUE && mode <= TRANSFORM_DESIRED) {
+        var controller: ptr<u8> = record(ctx, owner, TRANSFORM_CONTROLLER, ex);
+        var r: ptr<u8> = get(ctx, controller, "stream", ex);
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        if (mode == TRANSFORM_ENQUEUE) {
+            enqueue_transform(ctx, r, value, ex);
+        } else if (mode == TRANSFORM_ERROR) {
+            fail_transform(ctx, r, value, ex);
+        } else if (mode == TRANSFORM_TERMINATE) {
+            request_close(ctx, get(ctx, r, "readState", ex), ex);
+            var reason: ptr<u8> = type_error(ctx, "TransformStream was terminated");
+            protect(ctx, reason);
+            put(ctx, r, "error", reason, ex);
+            set_flag(ctx, r, "failed", true, ex);
+            error_writable(ctx, get(ctx, r, "writeState", ex), reason, ex);
+            settle(ctx, get(ctx, r, "pending", ex), reason, true, ex);
+            settle(ctx, get(ctx, r, "pullWait", ex), undefined(ctx), false, ex);
+            unprotect(ctx, reason);
+        } else {
+            return desired(ctx, get(ctx, r, "readState", ex), ex);
+        }
+        return undefined(ctx);
+    }
+    if (mode == TRANSFORM_READABLE || mode == TRANSFORM_WRITABLE) {
+        var r: ptr<u8> = record(ctx, owner, TRANSFORM, ex);
+        if (mode == TRANSFORM_READABLE) {
+            return get(ctx, r, "readable", ex);
+        }
+        return get(ctx, r, "writable", ex);
+    }
+    if (mode == PIPE_TO || mode == PIPE_THROUGH) {
+        var options: ptr<u8> = undefined(ctx);
+        if (count > 1) {
+            options = args[1];
+        }
+        if (mode == PIPE_TO) {
+            return pipe_to(ctx, owner, value, options, ex);
+        }
+        record(ctx, owner, READABLE, ex);
+        var readable: ptr<u8> = get(ctx, value, "readable", ex);
+        protect(ctx, readable);
+        var writable: ptr<u8> = get(ctx, value, "writable", ex);
+        record(ctx, readable, READABLE, ex);
+        var result: ptr<u8> = pipe_to(ctx, owner, writable, options, ex);
+        if (deref ex == null) {
+            handled(ctx, result, ex);
+        }
+        unprotect(ctx, readable);
+        return readable;
+    }
+    if (mode == TEE) {
+        return tee(ctx, owner, ex);
+    }
+    if (mode == VALUES) {
+        return iterator(ctx, owner, value, ex);
+    }
+    if (mode == ITERATOR_NEXT || mode == ITERATOR_RETURN) {
+        return iterator_method(ctx, owner, value, mode == ITERATOR_RETURN, ex);
+    }
+    if (mode == ITERATOR_SELF) {
+        record(ctx, owner, ITERATOR_KIND, ex);
+        return owner;
+    }
+    fail(ctx, ex, 1, "unsupported Web Stream operation");
+    return undefined(ctx);
+}
+export(c) fun jsrt_web_stream_method(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<WebStreamState> = storage(ctx);
+    var mode: i64 = 0;
+    while (mode < METHOD_COUNT) {
+        var method: ptr<u8> = (deref s.methods)[mode];
+        if (method != null && equal(ctx, fn, method)) {
+            break;
+        }
+        mode += 1;
+    }
+    var problem: ptr<u8> = null;
+    var result: ptr<u8> = invoke(ctx, mode, owner, count, args, &problem);
+    if (problem != null) {
+        if (mode == READ_CANCEL || mode == READER_READ || mode == READER_CLOSED || mode == WRITE_ABORT || mode == WRITE_CLOSE ||
+            (mode >= WRITER_WRITE && mode <= WRITER_ABORT) || mode == WRITER_READY || mode == WRITER_CLOSED || mode == PIPE_TO ||
+            mode == ITERATOR_NEXT || mode == ITERATOR_RETURN || mode == READER_CANCEL) {
+            protect(ctx, problem);
+            result = resolved(ctx, problem, true, ex);
+            unprotect(ctx, problem);
+        } else {
+            deref ex = problem;
+        }
+    }
+    return result;
+}
+pub fun install_web_streams(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var s: ptr<WebStreamState> = initialize_storage(ctx, ex);
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        if (i > ITERATOR_SELF && i < JOB_OK) {
+            continue;
+        }
+        var name: ptr<u8> = utf8("webStreamOperation");
+        (deref s.methods)[i] = function(ctx, name, callback(false));
+        release(name);
+        protect(ctx, (deref s.methods)[i]);
+    }
+    deref s.exports = object(ctx, null, null);
+    protect(ctx, deref s.exports);
+    var classes: array<str, 8> = ["ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader",
+        "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController"];
+    for (var i: i64 = 0; i < 8; i++) {
+        (deref s.ctors)[i] = public_constructor(ctx, callback(true), classes[i], ex);
+        protect(ctx, (deref s.ctors)[i]);
+        (deref s.parents)[i] = get(ctx, (deref s.ctors)[i], "prototype", ex);
+        protect(ctx, (deref s.parents)[i]);
+        define(ctx, (deref s.parents)[i], "constructor", (deref s.ctors)[i], ex, false);
+        var tag: ptr<u8> = get(ctx, get(ctx, global(ctx), "Symbol", ex), "toStringTag", ex);
+        define_key(ctx, (deref s.parents)[i], tag, text(ctx, classes[i]), ex, false);
+        define(ctx, global(ctx), classes[i], (deref s.ctors)[i], ex, false);
+        define(ctx, deref s.exports, classes[i], (deref s.ctors)[i], ex, true);
+    }
+    var names: array<str, 29> = ["getReader", "cancel", "locked", "enqueue", "close", "error", "desiredSize",
+        "read", "releaseLock", "closed", "getWriter", "abort", "close", "locked", "write", "close", "abort",
+        "releaseLock", "ready", "closed", "desiredSize", "error", "signal", "enqueue", "error", "terminate",
+        "desiredSize", "readable", "writable"];
+    var categories: array<i64, 29> = [READABLE, READABLE, READABLE, READ_CONTROLLER, READ_CONTROLLER, READ_CONTROLLER, READ_CONTROLLER, READER, READER, READER, WRITABLE, WRITABLE, WRITABLE, WRITABLE, WRITER, WRITER, WRITER, WRITER, WRITER, WRITER, WRITER, WRITE_CONTROLLER, WRITE_CONTROLLER, TRANSFORM_CONTROLLER, TRANSFORM_CONTROLLER, TRANSFORM_CONTROLLER, TRANSFORM_CONTROLLER, TRANSFORM, TRANSFORM];
+    for (var i: i64 = 0; i < 29; i++) {
+        if (i == READ_LOCKED || i == CONTROL_DESIRED || i == READER_CLOSED || i == WRITE_LOCKED ||
+            (i >= WRITER_READY && i <= WRITER_DESIRED) || i == WRITE_CONTROL_SIGNAL || i >= TRANSFORM_DESIRED) {
+            getter(ctx, (deref s.parents)[categories[i]], names[i], (deref s.methods)[i], ex);
+        } else {
+            define(ctx, (deref s.parents)[categories[i]], names[i], (deref s.methods)[i], ex, false);
+        }
+    }
+    define(ctx, (deref s.parents)[READER], "cancel", (deref s.methods)[READER_CANCEL], ex, false);
+    var composition: array<str, 4> = ["pipeTo", "pipeThrough", "tee", "values"];
+    for (var i: i64 = 0; i < 4; i++) {
+        define(ctx, (deref s.parents)[READABLE], composition[i], (deref s.methods)[PIPE_TO + i], ex, false);
+    }
+    var symbol: ptr<u8> = get(ctx, get(ctx, global(ctx), "Symbol", ex), "asyncIterator", ex);
+    define_key(ctx, (deref s.parents)[READABLE], symbol, (deref s.methods)[VALUES], ex, false);
+    deref s.iterator_parent = object(ctx, null, null);
+    protect(ctx, deref s.iterator_parent);
+    define(ctx, deref s.iterator_parent, "next", (deref s.methods)[ITERATOR_NEXT], ex, false);
+    define(ctx, deref s.iterator_parent, "return", (deref s.methods)[ITERATOR_RETURN], ex, false);
+    define_key(ctx, deref s.iterator_parent, symbol, (deref s.methods)[ITERATOR_SELF], ex, false);
+    var host: ptr<StreamHostState> = stream_state_storage(ctx);
+    define(ctx, (deref host.stream_constructors)[0], "toWeb", (deref s.methods)[TO_WEB], ex, false);
+    define(ctx, (deref host.stream_constructors)[0], "fromWeb", (deref s.methods)[FROM_WEB], ex, false);
+    return deref ex == null;
+}
+pub fun web_streams_module(ctx: ptr<u8>) -> ptr<u8> {
+    var s: ptr<WebStreamState> = storage(ctx);
+    return deref s.exports;
+}
+pub fun shutdown_web_streams(ctx: ptr<u8>) {
+    shutdown_storage(ctx);
+}

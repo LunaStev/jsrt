@@ -1,0 +1,188 @@
+// Resolve a request relative to its parent, package maps and node_modules.
+import("./module_state")::{modules_storage, Module, ModulesState, PATH_CAP};
+import("./module_support")::{own_get, error, missing, builtin};
+import("./module_files")::{ends, parsed_file, candidate, file};
+import("./module_packages")::{select_mapping, map_file, package_export, self_export};
+import("./system")::{copy_host_path};
+import("std::fs::file")::{Metadata, metadata};
+import("std::path::copy")::{path_join2, path_dirname_copy};
+import("std::mem::alloc")::{mem_alloc};
+import("std::mem::ops")::{mem_copy};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+extern(c, "wr_undefined") fun wr_undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun wr_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_protect") fun wr_protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_is_array") fun wr_is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+
+pub fun package_import(ctx: ptr<u8>, directory_path: str, request: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<ModulesState> = modules_storage(ctx);
+    if (mem_eq_cstr(request, "#") || request[1] == 47) {
+        error(ctx, ex, 1, "invalid package import specifier", "ERR_INVALID_MODULE_SPECIFIER");
+        return null;
+    }
+    var directory: array<u8, 8192>;
+    mem_copy(&directory[0], directory_path as ptr<u8>, mem_len_cstr(directory_path) + 1);
+    var scratch: array<u8, 8192>;
+    var info: Metadata;
+    while (true) {
+        if (ends(&directory[0] as str, "/node_modules")) {
+            break;
+        }
+        if (path_join2(&scratch[0], 8192, &directory[0] as str, "package.json") >= 0 && metadata(&scratch[0] as str,
+            &info) == 0 && info.is_file) {
+            var package: ptr<u8> = parsed_file(ctx, &scratch[0] as str, ex);
+            if (deref ex != null) {
+                return null;
+            }
+            wr_protect(ctx, package);
+            var target: ptr<u8> = wr_undefined(ctx);
+            if (wr_type(ctx, package) == 5 && !wr_is_array(ctx, package)) {
+                var mapping: ptr<u8> = own_get(ctx, package, "imports", ex);
+                if (wr_type(ctx, mapping) == 5 && !wr_is_array(ctx, mapping)) {
+                    target = select_mapping(ctx, mapping, request, true, ex);
+                }
+            }
+            var result: ptr<u8> = null;
+            if (deref ex == null && wr_type(ctx, target) == 4) {
+                var selected: array<u8, 8192>;
+                var n: i64 = copy_host_path(ctx, target, &selected[0], PATH_CAP, ex);
+                if (n >= 2 && selected[0] == 46 && selected[1] == 47) {
+                    result = map_file(ctx, &directory[0] as str, target, ex);
+                } else if (n >= 0 && builtin(&selected[0] as str) >= 0) {
+                    result = mem_alloc(PATH_CAP);
+                    if (result == null) {
+                        error(ctx, ex, 2, "cannot allocate builtin import", "ERR_MODULE_LIMIT");
+                    } else {
+                        mem_copy(result, &selected[0], n + 1);
+                    }
+                } else if (n >= 0) {
+                    var anchor: Module;
+                    anchor.directory = &directory[0];
+                    if ((deref host_state.import_depth) >= 16) {
+                        error(ctx, ex, 2, "package import nesting limit exceeded", "ERR_MODULE_LIMIT");
+                    } else {
+                        (deref host_state.import_depth) += 1;
+                        result = resolve_path(ctx, &anchor, &selected[0] as str, ex);
+                        (deref host_state.import_depth) -= 1;
+                        if (result == null && deref ex == null) {
+                            missing(ctx, &selected[0] as str, ex);
+                        }
+                    }
+                }
+            } else if (deref ex == null) {
+                error(ctx, ex, 0, "package import is not defined", "ERR_PACKAGE_IMPORT_NOT_DEFINED");
+            }
+            wr_unprotect(ctx, package);
+            return result;
+        }
+        if (mem_eq_cstr(&directory[0] as str, "/") || path_dirname_copy(&scratch[0], 8192, &directory[0] as str) < 0) {
+            break;
+        }
+        mem_copy(&directory[0], &scratch[0], mem_len_cstr(&scratch[0] as str) + 1);
+    }
+    error(ctx, ex, 0, "package import is not defined", "ERR_PACKAGE_IMPORT_NOT_DEFINED");
+    return null;
+}
+
+pub fun resolve_path(ctx: ptr<u8>, parent: ptr<Module>, request: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<ModulesState> = modules_storage(ctx);
+    if (request[0] == 0) {
+        missing(ctx, request, ex);
+        return null;
+    }
+    if (request[0] == 35) {
+        return package_import(ctx, deref parent.directory as str, request, ex);
+    }
+    var joined: array<u8, 8192>;
+    if (request[0] == 47) {
+        if (deref host_state.esm_resolving) {
+            return file(request);
+        }
+        return candidate(ctx, request, 0, ex);
+    }
+    var relative: bool = mem_eq_cstr(request, ".") || mem_eq_cstr(request, "..") || (request[0] == 46 && request[1] == 47) || (request[0] == 46 && request[1] == 46 && request[2] == 47);
+    if (relative) {
+        if (path_join2(&joined[0], 8192, deref parent.directory as str, request) < 0) {
+            error(ctx, ex, 2, "module path is too long", "ERR_MODULE_LIMIT");
+            return null;
+        }
+        if (deref host_state.esm_resolving) {
+            return file(&joined[0] as str);
+        }
+        return candidate(ctx, &joined[0] as str, 0, ex);
+    }
+    var directory: array<u8, 8192>;
+    mem_copy(&directory[0], deref parent.directory, mem_len_cstr(deref parent.directory as str) + 1);
+    var search: array<u8, 8192>;
+    var name_size: i64 = 0;
+    var full_size: i64 = mem_len_cstr(request);
+    var slash_count: i64 = 0;
+    while (name_size < full_size) {
+        if (request[name_size] == 47) {
+            slash_count += 1;
+            if (request[0] != 64 || slash_count == 2) {
+                break;
+            }
+        }
+        name_size += 1;
+    }
+    var package_name: array<u8, 8192>;
+    mem_copy(&package_name[0], request as ptr<u8>, name_size);
+    package_name[name_size] = 0;
+    var subpath: array<u8, 8192>;
+    subpath[0] = 46;
+    subpath[1] = 0;
+    if (name_size < full_size) {
+        mem_copy(&subpath[1], (request as ptr<u8>) + name_size, full_size - name_size + 1);
+    }
+    var found_self: bool = false;
+    var self_path: ptr<u8> = self_export(ctx, deref parent.directory as str, &package_name[0] as str,
+        &subpath[0] as str, &found_self, ex);
+    if (found_self || deref ex != null) {
+        return self_path;
+    }
+    while (true) {
+        if (path_join2(&search[0], 8192, &directory[0] as str, "node_modules") >= 0 && path_join2(&joined[0],
+            8192, &search[0] as str, &package_name[0] as str) >= 0) {
+            var found_exports: bool = false;
+            var mapped: ptr<u8> = package_export(ctx, &joined[0] as str, &subpath[0] as str, &found_exports,
+                ex);
+            if (found_exports || deref ex != null) {
+                return mapped;
+            }
+        }
+        if (path_join2(&search[0], 8192, &directory[0] as str, "node_modules") >= 0 && path_join2(&joined[0],
+            8192, &search[0] as str, request) >= 0) {
+            var result: ptr<u8> = null;
+            if (deref host_state.esm_resolving && name_size < full_size) {
+                result = file(&joined[0] as str);
+            } else {
+                result = candidate(ctx, &joined[0] as str, 0, ex);
+            }
+            if (result != null || deref ex != null) {
+                return result;
+            }
+        }
+        if (mem_eq_cstr(&directory[0] as str, "/")) {
+            break;
+        }
+        if (path_dirname_copy(&search[0], 8192, &directory[0] as str) < 0) {
+            break;
+        }
+        mem_copy(&directory[0], &search[0], mem_len_cstr(&search[0] as str) + 1);
+    }
+    return null;
+}
+
+// Resolve synchronously under import conditions, restoring nested caller policy.
+pub fun resolve_esm_path(ctx: ptr<u8>, directory: str, request: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<ModulesState> = modules_storage(ctx);
+    var previous: bool = deref s.esm_resolving;
+    deref s.esm_resolving = true;
+    var parent: Module;
+    parent.directory = directory as ptr<u8>;
+    var result: ptr<u8> = resolve_path(ctx, &parent, request, ex);
+    deref s.esm_resolving = previous;
+    return result;
+}

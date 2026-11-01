@@ -1,0 +1,22 @@
+# Build outputs, engine sources/candidates and release archives stay local.
+/target/
+
+# Personal editor and agent tooling state.
+/.vscode/
+/.idea/
+/.aws/
+
+# Environment files and signing material must never be committed.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.signatures
+
+# Temporary test and tool artifacts.
+*.o
+*.log
+*.tmp
+/core
+/core.[0-9]*

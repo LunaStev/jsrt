@@ -1,0 +1,82 @@
+// Isolated developer diagnostic. Compilation, child lifetime and cleanup are Wave-owned.
+import("./support")::{argc, arg, env, private_directory, cleanup, join, concat, run};
+import("./private_files")::{clean_private_directory};
+import("std::fs::file")::{fs_read_all};
+import("std::io::fd")::{io_write_all};
+
+pub fun worker_leaks() -> i32 {
+    if (argc() > 3) {
+        return 2;
+    }
+    var directory: ptr<u8> = private_directory("target", "worker-leaks-");
+    if (directory == null) {
+        return 1;
+    }
+    var count: str = "256";
+    if (argc() == 3) {
+        count = arg(2);
+    }
+    var report: str = join(directory as str, "valgrind") as str;
+    var command: array<str, 16> = ["/usr/bin/env", "JSC_useJIT=false", "JSC_useWasm=false", "GIGACAGE_ENABLED=0",
+        "/usr/bin/valgrind", "--leak-check=full", "--show-leak-kinds=definite", "--undef-value-errors=no",
+        concat("--log-file=", report) as str, "--error-exitcode=99", "--num-callers=20",
+        "--errors-for-leak-kinds=definite", "--suppressions=tests/jsc-valgrind.supp",
+        "target/native/jsrt", "tests/worker_churn.js", count];
+    println("Isolated JSC interpreter/Valgrind diagnostic; normal builds keep JIT enabled");
+    var result: i32 = run(&command[0], 16);
+    var bytes: array<u8, 65536>;
+    var n: i64 = fs_read_all(report, &bytes[0], 65536);
+    if (n > 0) {
+        io_write_all(2, &bytes[0], n);
+    }
+    if (!clean_private_directory(directory as str)) {
+        return 1;
+    }
+    return result;
+}
+
+fun compile_trace(directory: str) -> i32 {
+    var library: str = join(directory, "trace.so") as str;
+    var compile: array<str, 9> = [env("CC", "cc") as str, "-shared", "-fPIC", "-g", "-O0",
+        "-fno-omit-frame-pointer", "tests/native_crash_trace.c", "-o", library];
+    return run(&compile[0], 9);
+}
+
+pub fun trace_cjs_fixture(runtime: str, directory: str) -> i32 {
+    var result: i32 = compile_trace(directory);
+    if (result != 0) {
+        return result;
+    }
+    var preload: str = concat("LD_PRELOAD=", join(directory, "trace.so") as str) as str;
+    var command: array<str, 4> = ["env", preload, runtime, "tests/esm_cjs_probe.mjs"];
+    println("Isolated CommonJS interop diagnostic; no runtime will be published");
+    return run(&command[0], 4);
+}
+
+pub fun trace_native() -> i32 {
+    if (argc() < 3 || argc() > 63) {
+        println("Usage: ./bootstrap.sh trace-native <runtime> [arguments...]");
+        return 2;
+    }
+    var directory: ptr<u8> = private_directory("/tmp", "jsrt-native-trace-");
+    if (directory == null) {
+        return 1;
+    }
+    var library: str = join(directory as str, "trace.so") as str;
+    var result: i32 = compile_trace(directory as str);
+    if (result == 0) {
+        var command: array<str, 64>;
+        command[0] = "env";
+        command[1] = concat("LD_PRELOAD=", library) as str;
+        var count: i32 = argc();
+        for (var i: i32 = 2; i < count; i++) {
+            command[i] = arg(i);
+        }
+        println("Best-effort native trace in an isolated process; no runtime will be published");
+        result = run(&command[0], count as i64);
+    }
+    if (!cleanup(directory as str)) {
+        return 1;
+    }
+    return result;
+}

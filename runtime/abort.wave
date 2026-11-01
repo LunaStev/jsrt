@@ -1,0 +1,454 @@
+// Abort API and propagation policy depend on the shared state and event layer.
+import("./abort_state")::{AbortState, abort_storage, signal_state, is_aborted, reason_for, subscribe, unsubscribe};
+// Abort state and cancellation algorithms live in engine-owned WeakMap graphs.
+import("./values")::{get, put, text, plain, define, getter, capture, fail, coerce_number};
+import("./collections")::{weak_map, weak_get, weak_set, list, length, at, append, flag, set_flag,
+    bind_one};
+import("./config")::{EVENT_LISTENER_LIMIT};
+import("./web_events")::{event_target_parent, initialize_event_target, make_event, event_listener, dispatch_event};
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_to_number") fun numeric(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, value: ptr<u8>, parent: ptr<u8>);
+extern(c, "wr_constructor") fun constructor(ctx: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "jsrt_abort_callback") fun callback(code: i32) -> ptr<u8>;
+
+pub fun abort_error(ctx: ptr<u8>, timeout: bool) -> ptr<u8> {
+    var error: ptr<u8> = null;
+    var message: str = "The operation was aborted";
+    var name: str = "AbortError";
+    if (timeout) {
+        message = "The operation timed out";
+        name = "TimeoutError";
+    }
+    fail(ctx, &error, 0, message);
+    protect(ctx, error);
+    var ignored: ptr<u8> = null;
+    define(ctx, error, "name", text(ctx, name), &ignored, false);
+    define(ctx, error, "code", text(ctx, "ABORT_ERR"), &ignored, true);
+    unprotect(ctx, error);
+    return error;
+}
+
+pub fun signal_aborted(ctx: ptr<u8>, signal: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    return is_aborted(ctx, signal, ex);
+}
+pub fun signal_reason(ctx: ptr<u8>, signal: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return reason_for(ctx, signal, ex);
+}
+pub fun subscribe_abort(ctx: ptr<u8>, signal: ptr<u8>, cb: ptr<u8>, ex: ptr<ptr<u8>>) {
+    subscribe(ctx, signal, cb, ex);
+}
+pub fun unsubscribe_abort(ctx: ptr<u8>, signal: ptr<u8>, cb: ptr<u8>, ex: ptr<ptr<u8>>) {
+    unsubscribe(ctx, signal, cb, ex);
+}
+
+fun new_signal(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<AbortState> = abort_storage(ctx);
+    var result: ptr<u8> = object(ctx, null, null);
+    protect(ctx, result);
+    prototype(ctx, result, (deref host_state.signal_parent));
+    initialize_event_target(ctx, result, true, ex);
+    var s: ptr<u8> = plain(ctx);
+    protect(ctx, s);
+    put(ctx, s, "algorithms", list(ctx, ex), ex);
+    put(ctx, s, "sources", list(ctx, ex), ex);
+    weak_set(ctx, (deref host_state.states), result, s, ex);
+    define(ctx, result, "onabort", undefined(ctx), ex, true);
+    unprotect(ctx, s);
+    unprotect(ctx, result);
+    return result;
+}
+
+pub fun dependent_signal(ctx: ptr<u8>, source: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (kind(ctx, source) == 0 || kind(ctx, source) == 1) {
+        return new_signal(ctx, ex);
+    }
+    signal_aborted(ctx, source, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var inputs: ptr<u8> = list(ctx, ex);
+    protect(ctx, inputs);
+    append(ctx, inputs, source, ex);
+    var result: ptr<u8> = any_signal(ctx, inputs, ex);
+    unprotect(ctx, inputs);
+    return result;
+}
+
+pub fun fresh_signal(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return new_signal(ctx, ex);
+}
+pub fun abort_signal(ctx: ptr<u8>, signal: ptr<u8>, reason: ptr<u8>, ex: ptr<ptr<u8>>) {
+    fire(ctx, signal, reason, ex);
+}
+
+// Detach all private subscriptions, including those on sources that never abort.
+fun detach_sources(ctx: ptr<u8>, signal: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var s: ptr<u8> = signal_state(ctx, signal, ex);
+    if (s == null) {
+        return;
+    }
+    var sources: ptr<u8> = get(ctx, s, "sources", ex);
+    protect(ctx, sources);
+    put(ctx, s, "sources", list(ctx, ex), ex);
+    for (var i: i64 = 0; i < length(ctx, sources, ex); i++) {
+        var entry: ptr<u8> = at(ctx, sources, i, ex);
+        unsubscribe_abort(ctx, get(ctx, entry, "signal", ex), get(ctx, entry, "callback", ex), ex);
+    }
+    unprotect(ctx, sources);
+}
+
+fun snapshot_signals(ctx: ptr<u8>, inputs: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<AbortState> = abort_storage(ctx);
+    var params: array<ptr<u8>, 1> = [inputs];
+    var array_result: ptr<u8> = call(ctx, deref host_state.array_test, null, 1, &params[0], ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (!truth(ctx, array_result)) {
+        fail(ctx, ex, 1, "signals must be an Array of AbortSignals");
+        return undefined(ctx);
+    }
+    var total: f64 = coerce_number(ctx, get(ctx, inputs, "length", ex), ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (!(total >= 0.0 && total <= EVENT_LISTENER_LIMIT as f64) || total != (total as i64) as f64) {
+        fail(ctx, ex, 2, "AbortSignal input length must be an integer within the input limit");
+        return undefined(ctx);
+    }
+    var snapshot: ptr<u8> = list(ctx, ex);
+    protect(ctx, snapshot);
+    // Validate and snapshot every entry before installing subscriptions. Array getters
+    // can mutate/abort earlier signals; inspect their final state after this pass.
+    for (var i: i64 = 0; i < total as i64 && deref ex == null; i++) {
+        var source: ptr<u8> = at(ctx, inputs, i, ex);
+        if (deref ex != null) {
+            break;
+        }
+        protect(ctx, source);
+        signal_state(ctx, source, ex);
+        if (deref ex == null) {
+            append(ctx, snapshot, source, ex);
+        }
+        unprotect(ctx, source);
+    }
+    if (deref ex != null) {
+        unprotect(ctx, snapshot);
+        return undefined(ctx);
+    }
+    unprotect(ctx, snapshot);
+    return snapshot;
+}
+
+fun subscribe_sources(ctx: ptr<u8>, signal: ptr<u8>, snapshot: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var host_state: ptr<AbortState> = abort_storage(ctx);
+    var total: i64 = length(ctx, snapshot, ex);
+    var s: ptr<u8> = signal_state(ctx, signal, ex);
+    var sources: ptr<u8> = get(ctx, s, "sources", ex);
+    for (var i: i64 = 0; i < total && deref ex == null; i++) {
+        var source: ptr<u8> = at(ctx, snapshot, i, ex);
+        var duplicate: bool = false;
+        for (var j: i64 = 0; j < i; j++) {
+            if (equal(ctx, source, at(ctx, snapshot, j, ex))) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+        var bound: ptr<u8> = bind_one(ctx, (deref host_state.methods)[11], source, signal, ex);
+        protect(ctx, bound);
+        var entry: ptr<u8> = plain(ctx);
+        protect(ctx, entry);
+        put(ctx, entry, "signal", source, ex);
+        put(ctx, entry, "callback", bound, ex);
+        append(ctx, sources, entry, ex);
+        if (deref ex == null) {
+            subscribe_abort(ctx, source, bound, ex);
+        }
+        unprotect(ctx, entry);
+        unprotect(ctx, bound);
+    }
+
+}
+
+fun any_signal(ctx: ptr<u8>, inputs: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var snapshot: ptr<u8> = snapshot_signals(ctx, inputs, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    protect(ctx, snapshot);
+    var total: i64 = length(ctx, snapshot, ex);
+    var signal: ptr<u8> = new_signal(ctx, ex);
+    protect(ctx, signal);
+    var chosen: ptr<u8> = null;
+    for (var i: i64 = 0; i < total && deref ex == null; i++) {
+        var source: ptr<u8> = at(ctx, snapshot, i, ex);
+        if (signal_aborted(ctx, source, ex)) {
+            chosen = source;
+            break;
+        }
+    }
+    if (chosen != null) {
+        fire(ctx, signal, signal_reason(ctx, chosen, ex), ex);
+    } else {
+        subscribe_sources(ctx, signal, snapshot, ex);
+    }
+    if (deref ex != null) {
+        var ignored: ptr<u8> = null;
+        detach_sources(ctx, signal, &ignored);
+    }
+    unprotect(ctx, signal);
+    unprotect(ctx, snapshot);
+    return signal;
+}
+
+fun fire(ctx: ptr<u8>, signal: ptr<u8>, reason: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var s: ptr<u8> = signal_state(ctx, signal, ex);
+    if (s == null || flag(ctx, s, "aborted", ex)) {
+        return;
+    }
+    protect(ctx, signal);
+    if (kind(ctx, reason) == 0) {
+        reason = abort_error(ctx, false);
+    }
+    protect(ctx, reason);
+    set_flag(ctx, s, "aborted", true, ex);
+    put(ctx, s, "reason", reason, ex);
+    detach_sources(ctx, signal, ex);
+    var algorithms: ptr<u8> = get(ctx, s, "algorithms", ex);
+    protect(ctx, algorithms);
+    put(ctx, s, "algorithms", list(ctx, ex), ex);
+    // Cancellation must run even if a user listener later throws or is removed.
+    var first: ptr<u8> = null;
+    for (var i: i64 = 0; i < length(ctx, algorithms, ex); i++) {
+        var nested: ptr<u8> = null;
+        call(ctx, at(ctx, algorithms, i, ex), signal, 0, null, &nested);
+        if (nested != null && first == null) {
+            first = nested;
+            protect(ctx, first);
+        }
+    }
+    unprotect(ctx, algorithms);
+    var event: ptr<u8> = make_event(ctx, "abort", ex);
+    protect(ctx, event);
+    var args: array<ptr<u8>, 1> = [event];
+    var dispatch_problem: ptr<u8> = null;
+    dispatch_event(ctx, signal, event, &dispatch_problem);
+    if (dispatch_problem != null && first == null) {
+        first = dispatch_problem;
+        protect(ctx, first);
+    }
+    var nested: ptr<u8> = null;
+    var handler: ptr<u8> = get(ctx, signal, "onabort", &nested);
+    if (nested == null && kind(ctx, handler) == 5 && callable(ctx, handler)) {
+        call(ctx, handler, signal, 1, &args[0], &nested);
+    }
+    if (nested != null && first == null) {
+        first = nested;
+        protect(ctx, first);
+    }
+    unprotect(ctx, event);
+    unprotect(ctx, reason);
+    unprotect(ctx, signal);
+    if (first != null) {
+        if (deref ex == null) {
+            deref ex = first;
+        }
+        unprotect(ctx, first);
+    }
+}
+
+export(c) fun jsrt_abort_construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<AbortState> = abort_storage(ctx);
+    if (equal(ctx, ctor, (deref host_state.signal_ctor))) {
+        fail(ctx, ex, 1, "AbortSignal is not directly constructible");
+        return null;
+    }
+    var result: ptr<u8> = object(ctx, null, null);
+    protect(ctx, result);
+    prototype(ctx, result, get(ctx, ctor, "prototype", ex));
+    weak_set(ctx, (deref host_state.controllers), result, new_signal(ctx, ex), ex);
+    unprotect(ctx, result);
+    return result;
+}
+
+export(c) fun jsrt_abort_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<AbortState> = abort_storage(ctx);
+    var value: ptr<u8> = undefined(ctx);
+    if (count > 0) {
+        value = args[0];
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[10])) {
+        return any_signal(ctx, value, ex);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[11])) {
+        fire(ctx, value, signal_reason(ctx, receiver, ex), ex);
+        return undefined(ctx);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[0]) || equal(ctx, fn, (deref host_state.methods)[9])) {
+        if (kind(ctx, receiver) != 5) {
+            fail(ctx, ex, 1, "invalid AbortController receiver");
+            return undefined(ctx);
+        }
+        var signal: ptr<u8> = weak_get(ctx, (deref host_state.controllers), receiver, ex);
+        if (kind(ctx, signal) != 5) {
+            fail(ctx, ex, 1, "invalid AbortController receiver");
+            return undefined(ctx);
+        }
+        if (equal(ctx, fn, (deref host_state.methods)[9])) {
+            return signal;
+        }
+        fire(ctx, signal, value, ex);
+        return undefined(ctx);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[6]) || equal(ctx, fn, (deref host_state.methods)[7])) {
+        if (equal(ctx, fn, (deref host_state.methods)[7])) {
+            var n: f64 = 0.0;
+            if (kind(ctx, value) == 3) {
+                n = numeric(ctx, value, ex);
+            }
+            if (kind(ctx, value) != 3 || !(n >= 0.0 && n <= 2147483647.0) || n != (n as i64) as f64) {
+                fail(ctx, ex, 2, "timeout must be an integer from 0 to 2147483647 milliseconds");
+                return undefined(ctx);
+            }
+        }
+        var signal: ptr<u8> = new_signal(ctx, ex);
+        protect(ctx, signal);
+        if (equal(ctx, fn, (deref host_state.methods)[6])) {
+            fire(ctx, signal, value, ex);
+        } else {
+            var bound: ptr<u8> = bind_one(ctx, (deref host_state.methods)[8], null, signal, ex);
+            protect(ctx, bound);
+            var params: array<ptr<u8>, 2> = [bound, value];
+            call(ctx, (deref host_state.timer), null, 2, &params[0], ex);
+            unprotect(ctx, bound);
+        }
+        unprotect(ctx, signal);
+        return signal;
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[8])) {
+        if (count > 0) {
+            fire(ctx, value, abort_error(ctx, true), ex);
+        }
+        return undefined(ctx);
+    }
+    var s: ptr<u8> = signal_state(ctx, receiver, ex);
+    if (s == null) {
+        return undefined(ctx);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[1])) {
+        return boolean(ctx, flag(ctx, s, "aborted", ex));
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[2])) {
+        return get(ctx, s, "reason", ex);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[3])) {
+        if (flag(ctx, s, "aborted", ex)) {
+            deref ex = get(ctx, s, "reason", ex);
+        }
+        return undefined(ctx);
+    }
+    return event_listener(ctx, receiver, count, args, equal(ctx, fn, (deref host_state.methods)[5]), ex);
+}
+
+pub fun install_abort(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var host_state: ptr<AbortState> = abort_storage(ctx);
+    (deref host_state.states) = weak_map(ctx, ex);
+    protect(ctx, (deref host_state.states));
+    (deref host_state.controllers) = weak_map(ctx, ex);
+    protect(ctx, (deref host_state.controllers));
+    (deref host_state.controller_ctor) = constructor(ctx, callback(10));
+    protect(ctx, (deref host_state.controller_ctor));
+    (deref host_state.signal_ctor) = constructor(ctx, callback(10));
+    protect(ctx, (deref host_state.signal_ctor));
+    (deref host_state.signal_parent) = get(ctx, (deref host_state.signal_ctor), "prototype", ex);
+    protect(ctx, (deref host_state.signal_parent));
+    prototype(ctx, deref host_state.signal_parent, event_target_parent(ctx));
+    (deref host_state.timer) = capture(ctx, global(ctx), "setTimeout", ex);
+    deref host_state.array_test = capture(ctx, get(ctx, global(ctx), "Array", ex), "isArray", ex);
+    var names: array<str, 12> = ["abort", "aborted", "reason", "throwIfAborted", "addEventListener",
+        "removeEventListener", "abort", "timeout", "timeoutAbort", "signal", "any", "propagateAbort"];
+    for (var i: i64 = 0; i < 12; i++) {
+        var code: i64 = i;
+        if (i >= 10) {
+            code += 1;
+        }
+        var name: ptr<u8> = utf8(names[i]);
+        (deref host_state.methods)[i] = function(ctx, name, callback(code as i32));
+        release(name);
+        protect(ctx, (deref host_state.methods)[i]);
+    }
+    var parent: ptr<u8> = get(ctx, (deref host_state.controller_ctor), "prototype", ex);
+    define(ctx, parent, "constructor", (deref host_state.controller_ctor), ex, false);
+    define(ctx, parent, "abort", (deref host_state.methods)[0], ex, false);
+    getter(ctx, parent, "signal", (deref host_state.methods)[9], ex);
+    define(ctx, (deref host_state.signal_parent), "constructor", (deref host_state.signal_ctor), ex,
+        false);
+    getter(ctx, (deref host_state.signal_parent), "aborted", (deref host_state.methods)[1], ex);
+    getter(ctx, (deref host_state.signal_parent), "reason", (deref host_state.methods)[2], ex);
+    for (var i: i64 = 3; i < 6; i++) {
+        define(ctx, (deref host_state.signal_parent), names[i], (deref host_state.methods)[i], ex, false);
+    }
+    define(ctx, (deref host_state.signal_ctor), "abort", (deref host_state.methods)[6], ex, false);
+    define(ctx, (deref host_state.signal_ctor), "timeout", (deref host_state.methods)[7], ex, false);
+    define(ctx, (deref host_state.signal_ctor), "any", (deref host_state.methods)[10], ex, false);
+    define(ctx, global(ctx), "AbortController", (deref host_state.controller_ctor), ex, false);
+    define(ctx, global(ctx), "AbortSignal", (deref host_state.signal_ctor), ex, false);
+    return deref ex == null;
+}
+
+pub fun shutdown_abort(ctx: ptr<u8>) {
+    var host_state: ptr<AbortState> = abort_storage(ctx);
+    for (var i: i64 = 0; i < 12; i++) {
+        if ((deref host_state.methods)[i] != null) {
+            unprotect(ctx, (deref host_state.methods)[i]);
+            (deref host_state.methods)[i] = null;
+        }
+    }
+    if (deref host_state.array_test != null) {
+        unprotect(ctx, deref host_state.array_test);
+        deref host_state.array_test = null;
+    }
+    if ((deref host_state.timer) != null) {
+        unprotect(ctx, (deref host_state.timer));
+        (deref host_state.timer) = null;
+    }
+    if ((deref host_state.signal_parent) != null) {
+        unprotect(ctx, (deref host_state.signal_parent));
+        (deref host_state.signal_parent) = null;
+    }
+    if ((deref host_state.controller_ctor) != null) {
+        unprotect(ctx, (deref host_state.controller_ctor));
+        (deref host_state.controller_ctor) = null;
+    }
+    if ((deref host_state.signal_ctor) != null) {
+        unprotect(ctx, (deref host_state.signal_ctor));
+        (deref host_state.signal_ctor) = null;
+    }
+    if ((deref host_state.states) != null) {
+        unprotect(ctx, (deref host_state.states));
+        (deref host_state.states) = null;
+    }
+    if ((deref host_state.controllers) != null) {
+        unprotect(ctx, (deref host_state.controllers));
+        (deref host_state.controllers) = null;
+    }
+}

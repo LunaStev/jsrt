@@ -1,0 +1,105 @@
+// Stream cancellation is a private AbortSignal algorithm, ahead of user listeners.
+import("./stream_state")::{stream_state, stream_state_storage, StreamHostState, STREAM_ABORT_METHOD, STREAM_CORK_METHOD};
+import("./stream_operations")::{schedule, destroy_stream};
+import("./abort")::{signal_aborted, signal_reason, subscribe_abort, abort_error};
+import("./collections")::{integer, set_integer, flag, set_flag, bind_one};
+import("./stream_text")::{configure_text};
+import("./values")::{get, put, define, fail};
+import("./config")::{STREAM_CORK_LIMIT};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+
+pub fun configure_stream_options(ctx: ptr<u8>, receiver: ptr<u8>, state: ptr<u8>, options: ptr<u8>,
+    ex: ptr<ptr<u8>>) {
+    set_integer(ctx, state, "corked", 0, ex);
+    set_flag(ctx, state, "allowHalfOpen", true, ex);
+    set_flag(ctx, state, "autoDestroy", true, ex);
+    if (kind(ctx, options) != 5 || deref ex != null) {
+        return;
+    }
+    var encoding: ptr<u8> = get(ctx, options, "encoding", ex);
+    if ((integer(ctx, state, "type", ex) & 1) != 0 && kind(ctx, encoding) != 0 && kind(ctx, encoding) != 1) {
+        configure_text(ctx, state, encoding, ex);
+    }
+    var names: array<str, 2> = ["allowHalfOpen", "autoDestroy"];
+    for (var i: i64 = 0; i < 2 && deref ex == null; i++) {
+        var option: ptr<u8> = get(ctx, options, names[i], ex);
+        if (kind(ctx, option) != 0) {
+            set_flag(ctx, state, names[i], truth(ctx, option), ex);
+        }
+    }
+    var writer: ptr<u8> = get(ctx, options, "writev", ex);
+    if (deref ex != null) {
+        return;
+    }
+    if (kind(ctx, writer) != 0) {
+        if (kind(ctx, writer) != 5 || !callable(ctx, writer)) {
+            fail(ctx, ex, 1, "writev hook must be a function");
+            return;
+        }
+        define(ctx, receiver, "_writev", writer, ex, false);
+    }
+    var signal: ptr<u8> = get(ctx, options, "signal", ex);
+    if (deref ex != null || kind(ctx, signal) == 0) {
+        return;
+    }
+    protect(ctx, signal);
+    signal_aborted(ctx, signal, ex);
+    if (deref ex == null) {
+        var roots: ptr<StreamHostState> = stream_state_storage(ctx);
+        var callback: ptr<u8> = bind_one(ctx, (deref roots.stream_methods)[STREAM_ABORT_METHOD], receiver, undefined(ctx), ex);
+        protect(ctx, callback);
+        put(ctx, state, "signal", signal, ex);
+        put(ctx, state, "abortCallback", callback, ex);
+        if (deref ex == null) {
+            subscribe_abort(ctx, signal, callback, ex);
+        }
+        unprotect(ctx, callback);
+    }
+    unprotect(ctx, signal);
+}
+
+export(c) fun jsrt_stream_constructor_abort(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<u8> = stream_state(ctx, receiver, 0, ex);
+    if (state == null || flag(ctx, state, "destroyed", ex)) {
+        return undefined(ctx);
+    }
+    var signal: ptr<u8> = get(ctx, state, "signal", ex);
+    if (kind(ctx, signal) == 5) {
+        var reason: ptr<u8> = abort_error(ctx, false);
+        protect(ctx, reason);
+        define(ctx, reason, "cause", signal_reason(ctx, signal, ex), ex, false);
+        destroy_stream(ctx, receiver, state, reason, ex);
+        unprotect(ctx, reason);
+    }
+    return undefined(ctx);
+}
+
+export(c) fun jsrt_stream_cork(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<u8> = stream_state(ctx, receiver, 2, ex);
+    if (state == null || flag(ctx, state, "destroyed", ex)) {
+        return undefined(ctx);
+    }
+    var roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var depth: i64 = integer(ctx, state, "corked", ex);
+    if (equal(ctx, fn, (deref roots.stream_methods)[STREAM_CORK_METHOD])) {
+        if (depth >= STREAM_CORK_LIMIT) {
+            fail(ctx, ex, 2, "stream cork depth exceeded");
+            return undefined(ctx);
+        }
+        set_integer(ctx, state, "corked", depth + 1, ex);
+    } else if (depth > 0) {
+        set_integer(ctx, state, "corked", depth - 1, ex);
+        if (depth == 1) {
+            schedule(ctx, receiver, state, true, ex);
+        }
+    }
+    return undefined(ctx);
+}

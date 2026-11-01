@@ -1,0 +1,165 @@
+// Each Worker creates, executes and releases its own JSC context on this thread.
+// This module depends on host setup; workers.wave deliberately does not.
+import("./worker_state")::{WorkerLink, PATH_CAP, ERROR_UNITS, lock, unlock, stopped};
+import("./workers")::{bind_worker};
+import("./host")::{install_host, shutdown_host};
+import("./event_loop")::{run_event_loop};
+import("./source")::{read_source};
+import("./module_files")::{canonical};
+import("./module_packages")::{esm_scope};
+import("./modules")::{execute_main_module};
+import("./esm")::{execute_esm, esm_result};
+import("./system")::{system_exit_status};
+import("./clone")::{restore_clone};
+import("./config")::{SOURCE_LIMIT};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::ops")::{mem_copy};
+extern(c, "wr_context_create") fun create_context(cls: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_context_release") fun release_context(ctx: ptr<u8>);
+extern(c, "JSContextGetGroup") fun context_group(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "JSContextGroupRetain") fun retain_group(group: ptr<u8>) -> ptr<u8>;
+extern(c, "JSContextGroupRelease") fun release_group(group: ptr<u8>);
+extern(c, "jsrt_drain_owner_runloop") fun drain_owner_runloop();
+extern(c, "jsrt_prepare_worker_termination") fun prepare_entry(group: ptr<u8>) -> bool;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_to_string") fun string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_length") fun string_length(value: ptr<u8>) -> i64;
+extern(c, "wr_string_characters") fun characters(value: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_evaluate") fun evaluate(ctx: ptr<u8>, source: ptr<u8>, receiver: ptr<u8>, url: ptr<u8>,
+    line: i32, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+
+// Import this module from both executable and test roots to link the C callback.
+pub fun worker_runtime_link() {
+}
+fun capture_error(ctx: ptr<u8>, link: ptr<WorkerLink>, error: ptr<u8>) {
+    deref link.failed = true;
+    if (error == null || stopped(link)) {
+        return;
+    }
+    protect(ctx, error);
+    var nested: ptr<u8> = null;
+    var content: ptr<u8> = string(ctx, error, &nested);
+    if (content != null && nested == null) {
+        var count: i64 = string_length(content);
+        if (count > ERROR_UNITS) {
+            count = ERROR_UNITS;
+        }
+        deref link.error = mem_alloc(ERROR_UNITS * 2) as ptr<u16>;
+        if (deref link.error != null) {
+            mem_copy(deref link.error as ptr<u8>, characters(content) as ptr<u8>, count * 2);
+            deref link.error_length = count;
+        }
+    }
+    if (content != null) {
+        release(content);
+    }
+    unprotect(ctx, error);
+}
+export(c) fun jsrt_runtime_worker_task(data: ptr<u8>) -> ptr<u8> {
+    var link: ptr<WorkerLink> = data as ptr<WorkerLink>;
+    var ctx: ptr<u8> = create_context(null);
+    var ex: ptr<u8> = null;
+    var source: ptr<u8> = null;
+    var path: ptr<u8> = null;
+    var url: ptr<u8> = null;
+    var ready: bool = false;
+    var completed: bool = false;
+    var status: i32 = 1;
+    if (ctx != null && !stopped(link) && prepare_entry(context_group(ctx))) {
+        var name: str = "<worker-eval>";
+        if (deref link.path != null) {
+            path = canonical(deref link.path as str);
+            if (path != null) {
+                name = path as str;
+                var bytes: ptr<u8> = read_source(name);
+                if (bytes != null) {
+                    source = utf8(bytes as str);
+                    mem_free(bytes, SOURCE_LIMIT + 1);
+                }
+            }
+        }
+        if (deref link.path == null || source != null) {
+            ready = install_host(ctx, 0, deref link.source != null, name, &ex);
+            if (ready) {
+                ready = bind_worker(ctx, link, &ex);
+            }
+            if (ready && deref link.source != null) {
+                var value: ptr<u8> = restore_clone(ctx, deref link.source, &ex);
+                if (ex == null) {
+                    protect(ctx, value);
+                    source = string(ctx, value, &ex);
+                    unprotect(ctx, value);
+                }
+            }
+            url = utf8(name);
+        }
+        // Startup uses a fresh realm and cannot be interrupted halfway through
+        // host construction. Publish the retained group only before user execution.
+        if (ready && source != null && ex == null) {
+            lock(deref link.mutex);
+            deref link.group = retain_group(context_group(ctx));
+            var cancelled: bool = deref link.stop;
+            if (!cancelled) {
+                deref link.online = true;
+            }
+            unlock(deref link.mutex);
+            if (!cancelled && prepare_entry(context_group(ctx))) {
+                if (deref link.source != null) {
+                    evaluate(ctx, source, null, url, 1, &ex);
+                } else if (esm_scope(ctx, name, &ex)) {
+                    execute_esm(ctx, name, &ex);
+                } else if (ex == null) {
+                    execute_main_module(ctx, source, &ex);
+                }
+                if (ex == null && !stopped(link) && run_event_loop(ctx, &ex) && !stopped(link)
+                    && esm_result(ctx, &ex)) {
+                    status = system_exit_status(ctx);
+                    completed = true;
+                }
+            }
+        }
+        if (!completed && !stopped(link)) {
+            capture_error(ctx, link, ex);
+        }
+    }
+    if (ctx == null && !stopped(link)) {
+        deref link.failed = true;
+    }
+    if (ctx != null) {
+        var closed: bool = shutdown_host(ctx);
+        if (!closed) {
+            status = 1;
+            deref link.failed = true;
+        }
+        if (source != null) {
+            release(source);
+        }
+        if (url != null) {
+            release(url);
+        }
+        if (closed) {
+            // The parent's termination handle must not keep the VM alive past
+            // its owning thread. Revoke it under the same lock used by stop_link.
+            lock(deref link.mutex);
+            var group: ptr<u8> = deref link.group;
+            deref link.group = null;
+            unlock(deref link.mutex);
+            if (group != null) {
+                release_group(group);
+            }
+            release_context(ctx);
+            drain_owner_runloop();
+        }
+    }
+    if (path != null) {
+        mem_free(path, PATH_CAP);
+    }
+    lock(deref link.mutex);
+    deref link.code = status;
+    deref link.done = true;
+    unlock(deref link.mutex);
+    return null;
+}

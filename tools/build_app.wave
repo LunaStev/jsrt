@@ -1,0 +1,201 @@
+// Build CLI and engine checks. The root entry point supplies the baseline version.
+import("./support")::{argc, arg, env, join, absolute, executable, ensure_directory, private_directory,
+    cleanup};
+import("./build_pipeline")::{build_runtime};
+import("./engine_build")::{build_engine};
+import("./trace_native")::{trace_native, worker_leaks};
+import("./soak")::{run_soak};
+import("./linux_check")::{linux_check};
+import("./compat_lock")::{compatibility_lock, compatibility_probe};
+import("./release_sign")::{signature_cli};
+import("./deploy_app")::{release_check_cli};
+import("std::mem::cstr")::{mem_eq_cstr, mem_len_cstr};
+import("std::path::copy")::{path_dirname_copy};
+import("std::fs::file")::{Metadata, metadata};
+import("std::sys::fs")::{rmdir};
+extern(c, "jsrt_probe_engine") fun jsrt_probe_engine(path: str, version: ptr<u32>) -> i32;
+extern(c, "jsrt_engine_has_symbol") fun jsrt_engine_has_symbol(path: str, name: str) -> i32;
+extern(c, "fflush") fun fflush(stream: ptr<u8>) -> i32;
+
+pub fun run(minimum_major: u32, minimum_minor: u32, minimum_micro: u32) -> i32 {
+    if (argc() >= 2 && mem_eq_cstr(arg(1), "check-release")) {
+        return release_check_cli();
+    }
+    if (argc() >= 2 && mem_eq_cstr(arg(1), "sign-release")) {
+        return signature_cli(true);
+    }
+    if (argc() >= 2 && mem_eq_cstr(arg(1), "verify-release")) {
+        return signature_cli(false);
+    }
+    if (argc() >= 2 && mem_eq_cstr(arg(1), "worker-leaks")) {
+        return worker_leaks();
+    }
+    if (argc() >= 2 && mem_eq_cstr(arg(1), "linux-check")) {
+        return linux_check();
+    }
+    if (argc() == 2 && mem_eq_cstr(arg(1), "compat-probe")) {
+        return compatibility_probe();
+    }
+    if (argc() >= 2 && mem_eq_cstr(arg(1), "compat-lock")) {
+        return compatibility_lock();
+    }
+    if (argc() >= 2 && mem_eq_cstr(arg(1), "soak")) {
+        return run_soak();
+    }
+    if (argc() >= 2 && mem_eq_cstr(arg(1), "trace-native")) {
+        return trace_native();
+    }
+    if (argc() == 2 && mem_eq_cstr(arg(1), "engine-build")) {
+        return build_engine();
+    }
+    var compatibility: bool = false;
+    var npm_only: bool = false;
+    var require_tcp: bool = false;
+    var probe_worker: bool = false;
+    var probe_only: i32 = 0;
+    var release_mode: bool = false;
+    var library: ptr<u8> = env("JSRT_JSC_LIBRARY", "");
+    if (library == null) {
+        println("invalid engine library environment value");
+        return 1;
+    }
+    var count: i32 = argc();
+    var index: i32 = 1;
+    while (index < count) {
+        var option: str = arg(index);
+        if (mem_eq_cstr(option, "build")) {
+        } else if (mem_eq_cstr(option, "test")) {
+        } else if (mem_eq_cstr(option, "test-npm")) {
+            npm_only = true;
+        } else if (mem_eq_cstr(option, "release")) {
+            release_mode = true;
+        } else if (mem_eq_cstr(option, "probe-worker")) {
+            probe_only = 1;
+        } else if (mem_eq_cstr(option, "probe-interop")) {
+            probe_only = 2;
+        } else if (mem_eq_cstr(option, "--allow-older-engine")) {
+            compatibility = true;
+        } else if (mem_eq_cstr(option, "--require-tcp")) {
+            require_tcp = true;
+        } else if (mem_eq_cstr(option, "--probe-worker-termination")) {
+            probe_worker = true;
+        } else if (mem_eq_cstr(option, "--engine") && index + 1 < count) {
+            index += 1;
+            if (!mem_eq_cstr(arg(index), "jsc")) {
+                println("only the jsc engine is supported");
+                return 2;
+            }
+        } else if (mem_eq_cstr(option, "--engine-library") && index + 1 < count) {
+            index += 1;
+            library = arg(index) as ptr<u8>;
+        } else if (mem_eq_cstr(option, "--help")) {
+            println("Usage: ./bootstrap.sh [build|test|test-npm|release|engine-build|probe-worker|probe-interop|trace-native] [--engine jsc] [--engine-library <path>] [--allow-older-engine] [--require-tcp]");
+            println("./bootstrap.sh soak [--binary <path>] [--duration-seconds <1..86400>] [--report <new-csv-file>]");
+            println("./bootstrap.sh linux-check [--archive <release.tar.gz>|--archive-directory <directory>] --image <26.04|26.10>");
+            println("./bootstrap.sh worker-leaks [0..16384]");
+            println("./bootstrap.sh sign-release --archive <path> --key <Ed25519-private.pem> --output <new-directory>");
+            println("./bootstrap.sh verify-release --archive <path> --public-key <trusted.pem> --signature-directory <directory>");
+            println("./bootstrap.sh check-release --bundle <unpacked-release-directory>");
+            println("./bootstrap.sh compat-lock [--binary <path>] --output <new-lock-file>");
+            println("./bootstrap.sh compat-probe (isolated Polka/GDB diagnostic)");
+            println("Engine: JavaScriptCoreGTK");
+            println("Both build and test validate the complete suite before publishing the runtime");
+            println("--require-tcp fails validation if live TCP tests cannot run");
+            println("--probe-worker-termination additionally requires the isolated explicit JSC termination probe");
+            println("probe-worker runs only that diagnostic and never publishes a runtime");
+            println("probe-interop traces the isolated CommonJS interop regression and never publishes");
+            return 0;
+        } else {
+            println("unknown build option: {}", option);
+            return 2;
+        }
+        index += 1;
+    }
+    if (probe_only > 0 && (npm_only || require_tcp)) {
+        println("isolated probes cannot be combined with npm or required TCP validation");
+        return 2;
+    }
+    if (release_mode) {
+        if (compatibility || probe_only > 0) {
+            println("Release cannot use an older-engine compatibility build or an isolated probe");
+            return 2;
+        }
+        require_tcp = true;
+        npm_only = true;
+        probe_worker = true;
+    }
+    var version: array<u32, 3>;
+    if (mem_len_cstr(library as str) == 0) {
+        library = "libjavascriptcoregtk-6.0.so.1" as ptr<u8>;
+        if (jsrt_probe_engine(library as str, &version[0]) != 0) {
+            library = "libjavascriptcoregtk-4.1.so.0" as ptr<u8>;
+        }
+    } else {
+        library = absolute(library as str);
+    }
+    if (library == null || jsrt_probe_engine(library as str, &version[0]) != 0) {
+        println("cannot load JavaScriptCoreGTK; set JSRT_JSC_LIBRARY to an engine library");
+        return 1;
+    }
+    println("JavaScriptCoreGTK {}.{}.{}", version[0], version[1], version[2]);
+    var supported: bool = version[0] > minimum_major || (version[0] == minimum_major && (version[1] > minimum_minor || (version[1] == minimum_minor && version[2] >= minimum_micro)));
+    if (!compatibility && !supported) {
+        println("JavaScriptCoreGTK {}.{}.{} or newer is required; no runtime build was produced", minimum_major,
+            minimum_minor, minimum_micro);
+        return 1;
+    }
+    var required: array<str, 20> = ["JSObjectMakeFunction", "JSObjectMakeDeferredPromise", "JSGlobalContextSetUnhandledRejectionCallback",
+        "JSObjectMakeConstructor", "JSValueIsArray", "JSValueGetTypedArrayType", "JSObjectMakeTypedArray",
+        "JSObjectMakeTypedArrayWithArrayBufferAndOffset", "JSObjectGetTypedArrayBuffer", "JSObjectGetTypedArrayByteLength",
+        "JSObjectGetTypedArrayByteOffset", "JSObjectGetTypedArrayBytesPtr", "JSObjectGetArrayBufferByteLength",
+        "JSClassCreate", "JSClassRelease", "kJSClassDefinitionEmpty", "JSObjectMakeArrayBufferWithBytesNoCopy",
+        "JSObjectGetArrayBufferBytesPtr", "JSObjectGetPrivate", "JSObjectSetPrivate"];
+    for (var i: i64 = 0; i < 20; i++) {
+        if (jsrt_engine_has_symbol(library as str, required[i]) != 1) {
+            println("Engine library is missing required symbol: {}; no runtime was published", required[i]);
+            return 1;
+        }
+    }
+    var compiler: ptr<u8> = executable(env("JSRT_WAVEC", "wavec") as str);
+    var cc: ptr<u8> = executable(env("CC", "cc") as str);
+    if (compiler == null || cc == null) {
+        println("wavec and a C compiler are required");
+        return 1;
+    }
+    var standard: ptr<u8> = env("JSRT_STD_ROOT", "");
+    if (standard == null) {
+        return 1;
+    }
+    if (mem_len_cstr(standard as str) == 0) {
+        var parent: array<u8, 8192>;
+        if (path_dirname_copy(&parent[0], 8192, absolute(compiler as str) as str) < 0) {
+            return 1;
+        }
+        standard = join(&parent[0] as str, "std");
+    }
+    var info: Metadata;
+    if (metadata(standard as str, &info) < 0 || !info.is_directory) {
+        println("set JSRT_STD_ROOT to the compiler's Wave standard library");
+        return 1;
+    }
+    if (!ensure_directory("target") || !ensure_directory("target/tools")) {
+        return 1;
+    }
+    var directory: ptr<u8> = private_directory("target/tools", "build-");
+    if (directory == null) {
+        println("cannot create a private build directory");
+        return 1;
+    }
+    fflush(null);
+    var result: i32 = build_runtime(compiler as str, cc as str, standard as str, library as str, compatibility,
+        require_tcp, npm_only, probe_worker, probe_only, release_mode, directory as str);
+    if (!cleanup(directory as str)) {
+        println("cannot remove owned build artifacts");
+        if (result == 0) {
+            result = 1;
+        }
+    }
+    // Remove only an empty parent; never touch another invocation's workspace.
+    rmdir("target/tools");
+    return result;
+}

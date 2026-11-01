@@ -1,0 +1,13 @@
+// Explicit process address-space policy. This is neither a JS heap limit nor a sandbox.
+import("./output")::{write_text};
+extern(c, "jsrt_address_space_limit") fun set_address_space_limit(bytes: u64) -> i32;
+pub fun apply_memory_limit(bytes: i64) -> bool {
+    if (bytes == 0) {
+        return true;
+    }
+    if (bytes < 0 || set_address_space_limit(bytes as u64) != 0) {
+        write_text(2, "cannot apply process address-space limit\n");
+        return false;
+    }
+    return true;
+}

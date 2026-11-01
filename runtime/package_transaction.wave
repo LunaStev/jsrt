@@ -1,0 +1,473 @@
+// Durable install journal. A directory flock serializes cooperating installers.
+// Recovery only removes a published lock whose device/inode matches the journal.
+import("std::sys::fs")::{open, fstat, Stat, fsync};
+import("std::io::fd")::{io_close, io_read, io_write_all};
+import("std::mem::cstr")::{mem_eq_cstr};
+import("wjson")::{Json, JsonDoc, JsonWriter, json_parse_bytes, json_ok, json_root, json_free, json_get,
+    json_i64_or, json_bool_or, json_is_bool, json_writer_new, json_writer_free, json_writer_finish, json_writer_len,
+    json_begin_object, json_end_object, json_field_i64, json_field_bool, JSON_STRICT};
+import("./config")::{PACKAGE_ENTRY_LIMIT, PACKAGE_PATH_CAP};
+import("./package_replace")::{configure_replacement, replacement_active, replacement_fields, replacement_error,
+    replacing_tree, replacing_lock, reset_replacement, prepare_replacement, exchange_lock, exchange_tree,
+    verify_replacement_lock, valid_replacement, recover_replacement};
+extern(c, "openat") fun open_at(fd: i32, path: str, flags: i32, mode: i32) -> i32;
+extern(c, "mkdirat") fun mkdir_at(fd: i32, path: str, mode: i32) -> i32;
+extern(c, "unlinkat") fun unlink_at(fd: i32, path: str, flags: i32) -> i32;
+extern(c, "renameat") fun rename_at(a: i32, from: str, b: i32, target: str) -> i32;
+extern(c, "renameat2") fun rename_new(a: i32, from: str, b: i32, target: str, flags: u32) -> i32;
+extern(c, "linkat") fun link_at(a: i32, from: str, b: i32, target: str, flags: i32) -> i32;
+extern(c, "flock") fun lock_fd(fd: i32, operation: i32) -> i32;
+extern(c, "getuid") fun current_uid() -> i32;
+extern(c, "fdopendir") fun directory_open(fd: i32) -> ptr<u8>;
+extern(c, "closedir") fun directory_close(directory: ptr<u8>) -> i32;
+extern(c, "jsrt_directory_next") fun directory_next(directory: ptr<u8>, name: ptr<u8>, capacity: i64) -> i32;
+const DIR_FLAGS: i32 = 720896;
+const READ_FLAGS: i32 = 657408;
+pub const STAGE_NAME: str = ".jsrt-transaction";
+static project: i32 = -1;
+static stage: i32 = -1;
+static stage_owned: bool = false;
+static prepared: bool = false;
+static failure: str = "package transaction failed";
+pub fun transaction_error() -> str {
+    return failure;
+}
+
+fun fail(message: str) -> bool {
+    failure = message;
+    return false;
+}
+
+pub fun stage_fd() -> i32 {
+    return stage;
+}
+
+// Borrowed only while this install transaction owns the project lock.
+pub fun project_fd() -> i32 {
+    return project;
+}
+
+// The descriptor remains anchored to a no-follow directory throughout traversal.
+fun walk(fd: i32, deleting: bool, depth: i64, budget: ptr<i64>) -> bool {
+    if (depth > PACKAGE_PATH_CAP / 2) {
+        return false;
+    }
+    var copy: i32 = open_at(fd, ".", DIR_FLAGS, 0);
+    if (copy < 0) {
+        return false;
+    }
+    var directory: ptr<u8> = directory_open(copy);
+    if (directory == null) {
+        io_close(copy as i64);
+        return false;
+    }
+    var ok: bool = true;
+    var name: array<u8, 256>;
+    while (ok) {
+        var status: i32 = directory_next(directory, &name[0], 256);
+        if (status == 0) {
+            break;
+        }
+        if (status < 0) {
+            ok = false;
+            break;
+        }
+        if (mem_eq_cstr(&name[0] as str, ".") || mem_eq_cstr(&name[0] as str, "..")) {
+            continue;
+        }
+        if (deleting && depth == 0 && (mem_eq_cstr(&name[0] as str, "state.wjson") || mem_eq_cstr(&name[0] as str,
+            "state.next"))) {
+            continue;
+        }
+        deref budget += 1;
+        if (deref budget > PACKAGE_ENTRY_LIMIT + 8) {
+            ok = false;
+            break;
+        }
+        var child: i32 = open_at(fd, &name[0] as str, DIR_FLAGS, 0);
+        if (child >= 0) {
+            ok = walk(child, deleting, depth+1, budget);
+            io_close(child as i64);
+            if (ok && deleting) {
+                ok = unlink_at(fd, &name[0] as str, 512) == 0;
+            }
+        } else if (deleting) {
+            ok = unlink_at(fd, &name[0] as str, 0) == 0;
+        } else {
+            child = open_at(fd, &name[0] as str, READ_FLAGS, 0);
+            var info: Stat;
+            ok = child >= 0 && fstat(child as i64, &info) == 0 && (info.mode & 61440) == 32768 && fsync(child as i64) == 0;
+            if (child >= 0) {
+                io_close(child as i64);
+            }
+        }
+    }
+    directory_close(directory);
+    return ok && fsync(fd as i64) == 0;
+}
+
+fun cleanup_stage() -> bool {
+    if (!stage_owned) {
+        return true;
+    }
+    var budget: i64 = 0;
+    if (stage < 0 || !walk(stage, true, 0, &budget)) {
+        return fail("cannot clean owned package transaction; journal retained");
+    }
+    // Remove the recovery record last: interrupted cleanup remains recoverable.
+    unlink_at(stage, "state.next", 0);
+    if (unlink_at(stage, "state.wjson", 0) != 0) {
+        var probe: i32 = open_at(stage, "state.wjson", 2228224, 0);
+        if (probe >= 0) {
+            io_close(probe as i64);
+            return fail("cannot remove package recovery journal");
+        }
+    }
+    if (fsync(stage as i64) != 0) {
+        return fail("cannot sync package journal removal");
+    }
+    io_close(stage as i64);
+    stage = -1;
+    if (unlink_at(project, STAGE_NAME, 512) != 0 || fsync(project as i64) != 0) {
+        return fail("cannot durably remove package transaction directory");
+    }
+    stage_owned = false;
+    prepared = false;
+    return true;
+}
+
+fun identity(parent: i32, path: str, directory: bool, info: ptr<Stat>) -> bool {
+    var flags: i32 = READ_FLAGS;
+    if (directory) {
+        flags = DIR_FLAGS;
+    }
+    var fd: i32 = open_at(parent, path, flags, 0);
+    if (fd < 0) {
+        return false;
+    }
+    var ok: bool = fstat(fd as i64, info) == 0;
+    io_close(fd as i64);
+    var expected: i32 = 32768;
+    if (directory) {
+        expected = 16384;
+    }
+    return ok && (deref info.mode & 61440) == expected;
+}
+
+fun write_state(ready: bool, new_lock: bool, tree: Stat, lock: Stat) -> bool {
+    var writer: JsonWriter = json_writer_new(0);
+    var version: i64 = 1;
+    if (replacement_active()) {
+        version = 2;
+    }
+    var ok: bool = json_begin_object(&writer) && json_field_i64(&writer, "format", version) && json_field_bool(&writer,
+        "prepared", ready) && json_field_bool(&writer, "newLock", new_lock) && json_field_i64(&writer,
+        "treeDev", tree.dev) && json_field_i64(&writer, "treeIno", tree.ino) && json_field_i64(&writer,
+        "lockDev", lock.dev) && json_field_i64(&writer, "lockIno", lock.ino) && replacement_fields(&writer) &&
+        json_end_object(&writer);
+    var fd: i32 = -1;
+    // A previous crash may leave an unfinished next record beside the last
+    // durable journal. Discard only this reserved file, never the journal.
+    if (ok) {
+        unlink_at(stage, "state.next", 0);
+        fd = open_at(stage, "state.next", 655553, 384);
+        ok = fd >= 0;
+    }
+    if (ok) {
+        ok = io_write_all(fd as i64, json_writer_finish(&writer) as ptr<u8>, json_writer_len(&writer)) == json_writer_len(&writer) && fsync(fd as i64) == 0;
+    }
+    if (fd >= 0) {
+        io_close(fd as i64);
+    }
+    if (ok) {
+        ok = rename_at(stage, "state.next", stage, "state.wjson") == 0 && fsync(stage as i64) == 0;
+    }
+    json_writer_free(&writer);
+    if (!ok) {
+        return fail("cannot persist package recovery journal");
+    }
+    return true;
+}
+
+fun recover_prepared(value: Json, version: i64) -> bool {
+    var new_lock: bool = json_bool_or(json_get(value, "newLock"), false);
+    var tree_dev: i64 = json_i64_or(json_get(value, "treeDev"), -1);
+    var tree_ino: i64 = json_i64_or(json_get(value, "treeIno"), -1);
+    var lock_dev: i64 = json_i64_or(json_get(value, "lockDev"), -1);
+    var lock_ino: i64 = json_i64_or(json_get(value, "lockIno"), -1);
+    var tree: Stat;
+    var lock: Stat;
+    var proof: Stat;
+    if (new_lock && (!identity(stage, "lock.proof", false, &proof) || proof.dev != lock_dev || proof.ino != lock_ino)) {
+        return fail("package lock ownership proof is missing; existing files preserved");
+    }
+    if (!identity(stage, "tree.proof", false, &proof) || proof.dev != tree_dev || proof.ino != tree_ino) {
+        return fail("package tree ownership proof is missing; existing files preserved");
+    }
+    var target: i32 = open_at(project, "node_modules", DIR_FLAGS, 0);
+    var committed: bool = target >= 0 && identity(target, ".jsrt-install-proof", false, &tree) &&
+        tree.dev == tree_dev && tree.ino == tree_ino;
+    if (target >= 0) {
+        io_close(target as i64);
+    }
+    if (version == 2) {
+        if (!recover_replacement(project, stage, value, committed)) {
+            return fail(replacement_error());
+        }
+    } else {
+        var own_lock: bool = new_lock && identity(project, "jsrt.lock.wjson", false, &lock) &&
+            lock.dev == lock_dev && lock.ino == lock_ino;
+        if (committed && new_lock && !own_lock) {
+            return fail("committed package tree has a conflicting lockfile; journal retained");
+        }
+        if (!committed && own_lock && unlink_at(project, "jsrt.lock.wjson", 0) != 0) {
+            return fail("cannot roll back owned package lockfile");
+        }
+    }
+    if (fsync(project as i64) != 0) {
+        return fail("cannot sync recovered package publication");
+    }
+    // Persist the decision before deleting either generation's ownership proof.
+    tree.dev = 0;
+    tree.ino = 0;
+    lock.dev = 0;
+    lock.ino = 0;
+    return write_state(false, false, tree, lock);
+}
+
+fun recover() -> bool {
+    var fd: i32 = open_at(stage, "state.wjson", READ_FLAGS, 0);
+    if (fd < 0) {
+        // A crash before journal creation can only leave an empty stage or its
+        // private unfinished state.next file. Never traverse unknown contents.
+        var scan: i32 = open_at(stage, ".", DIR_FLAGS, 0);
+        if (scan < 0) {
+            return false;
+        }
+        var iterator: ptr<u8> = directory_open(scan);
+        if (iterator == null) {
+            io_close(scan as i64);
+            return false;
+        }
+        var name: array<u8, 256>;
+        var safe: bool = true;
+        while (safe) {
+            var status: i32 = directory_next(iterator, &name[0], 256);
+            if (status == 0) {
+                break;
+            }
+            if (status < 0) {
+                safe = false;
+                break;
+            }
+            if (!mem_eq_cstr(&name[0] as str, ".") && !mem_eq_cstr(&name[0] as str, "..") && !mem_eq_cstr(&name[0] as str,
+                "state.next")) {
+                safe = false;
+            }
+        }
+        directory_close(iterator);
+        if (!safe) {
+            return fail("unrecognized package transaction directory; existing files preserved");
+        }
+        stage_owned = true;
+        return cleanup_stage();
+    }
+    var journal_info: Stat;
+    if (fstat(fd as i64, &journal_info) != 0 || (journal_info.mode & 61440) != 32768) {
+        io_close(fd as i64);
+        return fail("package recovery journal must be a regular file");
+    }
+    var bytes: array<u8, 1025>;
+    var length: i64 = 0;
+    while (length < 1025) {
+        var n: i64 = io_read(fd as i64, &bytes[length], 1025-length);
+        if (n == -4) {
+            continue;
+        }
+        if (n < 0) {
+            length = 1025;
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        length += n;
+    }
+    io_close(fd as i64);
+    var document: JsonDoc = json_parse_bytes(&bytes[0], length, 8, JSON_STRICT);
+    var value: Json = json_root(document);
+    var version: i64 = json_i64_or(json_get(value, "format"), 0);
+    var ok: bool = length <= 1024 && json_ok(document) && (version == 1 || version == 2) && json_is_bool(json_get(value,
+        "prepared")) && json_is_bool(json_get(value, "newLock"));
+    var ready: bool = json_bool_or(json_get(value, "prepared"), false);
+    var new_lock: bool = json_bool_or(json_get(value, "newLock"), false);
+    var tree_dev: i64 = json_i64_or(json_get(value, "treeDev"), -1);
+    var tree_ino: i64 = json_i64_or(json_get(value, "treeIno"), -1);
+    var lock_dev: i64 = json_i64_or(json_get(value, "lockDev"), -1);
+    var lock_ino: i64 = json_i64_or(json_get(value, "lockIno"), -1);
+    if (ready && (tree_dev < 0 || tree_ino <= 0 || (new_lock && (lock_dev < 0 || lock_ino <= 0)))) {
+        ok = false;
+    }
+    if (version == 2) {
+        ok = ok && valid_replacement(value);
+    }
+    if (!ok) {
+        json_free(&document);
+        return fail("invalid package recovery journal; existing files preserved");
+    }
+    if (ready) {
+        ok = recover_prepared(value, version);
+    }
+    json_free(&document);
+    if (!ok) {
+        return false;
+    }
+    stage_owned = true;
+    return cleanup_stage();
+}
+
+pub fun open_transaction(root: str) -> bool {
+    if (project >= 0) {
+        return fail("a package transaction is already open in this process");
+    }
+    reset_replacement();
+    stage_owned = false;
+    prepared = false;
+    project = open(root, DIR_FLAGS, 0) as i32;
+    if (project < 0) {
+        return fail("cannot open project directory");
+    }
+    if (lock_fd(project, 6) != 0) {
+        return fail("another package installer holds the project lock");
+    }
+    // Disambiguate absence from a symlink, file, permission error or corruption.
+    var probe: i32 = open_at(project, STAGE_NAME, 2228224, 0);
+    if (probe >= 0) {
+        io_close(probe as i64);
+        stage = open_at(project, STAGE_NAME, DIR_FLAGS, 0);
+        var info: Stat;
+        if (stage < 0 || fstat(stage as i64, &info) != 0 || info.uid != current_uid() || (info.mode & 511) != 448) {
+            return fail("unsafe package transaction directory; existing files preserved");
+        }
+        if (!recover()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fun replace_transaction(tree: bool, lock: bool) -> bool {
+    if (project < 0 || stage >= 0 || !configure_replacement(project, tree, lock)) {
+        return fail(replacement_error());
+    }
+    return true;
+}
+
+pub fun start_transaction_stage() -> bool {
+    if (mkdir_at(project, STAGE_NAME, 448) != 0) {
+        return fail("cannot create private package transaction directory");
+    }
+    stage = open_at(project, STAGE_NAME, DIR_FLAGS, 0);
+    stage_owned = true;
+    if (stage < 0 || fsync(project as i64) != 0) {
+        return fail("cannot persist package transaction directory");
+    }
+    var tree: Stat;
+    tree.dev = 0;
+    tree.ino = 0;
+    var lock: Stat;
+    lock.dev = 0;
+    lock.ino = 0;
+    return write_state(false, false, tree, lock);
+}
+
+pub fun prepare_publication(new_lock: bool) -> bool {
+    var budget: i64 = 0;
+    var tree: Stat;
+    var lock: Stat;
+    lock.dev = 0;
+    lock.ino = 0;
+    var tree_directory: i32 = open_at(stage, "node_modules", DIR_FLAGS, 0);
+    if (tree_directory < 0) {
+        return fail("cannot open staged package tree");
+    }
+    var marker: i32 = open_at(tree_directory, ".jsrt-install-proof", 655553, 420);
+    var own_tree: bool = marker >= 0;
+    if (marker >= 0) {
+        io_close(marker as i64);
+    }
+    own_tree = own_tree && link_at(tree_directory, ".jsrt-install-proof", stage, "tree.proof", 0) == 0 && identity(tree_directory,
+        ".jsrt-install-proof", false, &tree);
+    io_close(tree_directory as i64);
+    if (!own_tree) {
+        return fail("cannot retain package tree ownership proof");
+    }
+    if (new_lock && link_at(stage, "jsrt.lock.wjson", stage, "lock.proof", 0) != 0) {
+        return fail("cannot retain package lock ownership proof");
+    }
+    if (!prepare_replacement(project, stage)) {
+        return fail(replacement_error());
+    }
+    if (!walk(stage, false, 0, &budget) || (new_lock && !identity(stage, "jsrt.lock.wjson", false, &lock))) {
+        return fail("cannot sync staged package data");
+    }
+    if (!write_state(true, new_lock, tree, lock)) {
+        return false;
+    }
+    prepared = true;
+    return true;
+}
+
+pub fun publish_transaction_lock(new_lock: bool) -> bool {
+    if (!prepared) {
+        return fail("package publication was not prepared");
+    }
+    if (new_lock && replacing_lock()) {
+        return exchange_lock(project, stage) || fail(replacement_error());
+    }
+    if (new_lock && (rename_new(stage, "jsrt.lock.wjson", project, "jsrt.lock.wjson", 1) != 0 || fsync(project as i64) != 0)) {
+        return fail("cannot publish lockfile without replacing an existing file");
+    }
+    return true;
+}
+
+pub fun publish_transaction_tree() -> bool {
+    if (!prepared) {
+        return fail("package publication was not prepared");
+    }
+    if (!verify_replacement_lock(project, stage)) {
+        return fail(replacement_error());
+    }
+    if (replacing_tree()) {
+        return exchange_tree(project, stage) || fail(replacement_error());
+    }
+    if (rename_new(stage, "node_modules", project, "node_modules", 1) != 0 || fsync(project as i64) != 0) {
+        return fail("node_modules already exists or cannot be published; journal retained");
+    }
+    return true;
+}
+
+pub fun commit_transaction(new_lock: bool) -> bool {
+    return prepare_publication(new_lock) && publish_transaction_lock(new_lock) && publish_transaction_tree();
+}
+
+pub fun close_transaction() -> bool {
+    var ok: bool = true;
+    if (stage_owned) {
+        if (prepared) {
+            ok = recover();
+        } else {
+            ok = cleanup_stage();
+        }
+    }
+    if (stage >= 0) {
+        io_close(stage as i64);
+        stage = -1;
+    }
+    if (project >= 0) {
+        io_close(project as i64);
+        project = -1;
+    }
+    reset_replacement();
+    return ok;
+}

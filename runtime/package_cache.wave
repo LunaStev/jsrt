@@ -1,0 +1,366 @@
+// Content-addressed archives; the install transaction owns temporary writes.
+import("./package_io")::{Blob, package_fail, verify_integrity, free_blob};
+import("./package_transaction")::{project_fd, stage_fd};
+import("./config")::{PACKAGE_ARCHIVE_LIMIT, PACKAGE_CACHE_BYTE_LIMIT, PACKAGE_CACHE_ENTRY_LIMIT, PACKAGE_ENTRY_LIMIT};
+import("std::sys::fs")::{fstat, fsync, Stat};
+import("std::io::fd")::{io_close, io_read, io_write_all};
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed, mem_free};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("std::mem::ops")::{mem_copy};
+import("std::mem::layout")::{size_of};
+extern(c, "openat") fun open_at(fd: i32, path: str, flags: i32, mode: i32) -> i32;
+extern(c, "mkdirat") fun mkdir_at(fd: i32, path: str, mode: i32) -> i32;
+extern(c, "unlinkat") fun unlink_at(fd: i32, path: str, flags: i32) -> i32;
+extern(c, "renameat2") fun rename_new(from_fd: i32, from: str, to_fd: i32, to: str, flags: u32) -> i32;
+extern(c, "__errno_location") fun errno_location() -> ptr<i32>;
+extern(c, "getuid") fun current_uid() -> i32;
+extern(c, "fdopendir") fun directory_open(fd: i32) -> ptr<u8>;
+extern(c, "closedir") fun directory_close(directory: ptr<u8>) -> i32;
+extern(c, "jsrt_directory_next") fun directory_next(directory: ptr<u8>, name: ptr<u8>, capacity: i64) -> i32;
+
+const DIRECTORY_FLAGS: i32 = 720896;
+const READ_FLAGS: i32 = 657408;
+const CREATE_FLAGS: i32 = 655553;
+const CACHE_DIRECTORY: str = ".jsrt-cache";
+const TEMPORARY_ARCHIVE: str = "cache-archive.tmp";
+
+struct CacheEntry {
+    name: array<u8, 104>;
+    info: Stat;
+    removed: bool;
+}
+
+fun managed_name(name: str) -> bool {
+    if (mem_len_cstr(name) != 97) {
+        return false;
+    }
+    var prefix: str = "sha512-";
+    for (var i: i64 = 0; i < 7; i++) {
+        if (name[i] != prefix[i]) {
+            return false;
+        }
+    }
+    for (var i: i64 = 7; i < 93; i++) {
+        var c: u8 = name[i];
+        if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 95)) {
+            return false;
+        }
+    }
+    return mem_eq_cstr((name as ptr<u8> + 93) as str, ".tgz");
+}
+
+fun owned_archive(fd: i32, info: ptr<Stat>) -> bool {
+    return fd >= 0 && fstat(fd as i64, info) == 0 && (deref info.mode & 61440) == 32768 &&
+        deref info.uid == current_uid() && deref info.nlink == 1 &&
+        deref info.size >= 0 && deref info.size <= PACKAGE_ARCHIVE_LIMIT;
+}
+
+fun owned_directory(fd: i32) -> bool {
+    var info: Stat;
+    return fd >= 0 && fstat(fd as i64, &info) == 0 && info.uid == current_uid() && (info.mode & 18) == 0;
+}
+
+fun older(a: ptr<CacheEntry>, b: ptr<CacheEntry>) -> bool {
+    if (deref a.info.mtime != deref b.info.mtime) {
+        return deref a.info.mtime < deref b.info.mtime;
+    }
+    if (deref a.info.mtime_nsec != deref b.info.mtime_nsec) {
+        return deref a.info.mtime_nsec < deref b.info.mtime_nsec;
+    }
+    for (var i: i64 = 0; i < 97; i++) {
+        if ((deref a.name)[i] != (deref b.name)[i]) {
+            return (deref a.name)[i] < (deref b.name)[i];
+        }
+    }
+    return false;
+}
+
+// Scan and validate the entire bounded snapshot before deleting anything.
+// Unknown names are user data. Recognizable unsafe entries fail closed.
+fun trim_directory(parent: i32, byte_limit: i64, entry_limit: i64) -> bool {
+    var capacity: i64 = PACKAGE_ENTRY_LIMIT * (size_of<CacheEntry>() as i64);
+    var entries: ptr<CacheEntry> = mem_alloc_zeroed(capacity) as ptr<CacheEntry>;
+    var scan: i32 = open_at(parent, ".", DIRECTORY_FLAGS, 0);
+    var iterator: ptr<u8> = null;
+    if (scan >= 0) {
+        iterator = directory_open(scan);
+        if (iterator == null) {
+            io_close(scan as i64);
+        }
+    }
+    var ok: bool = entries != null && iterator != null;
+    var count: i64 = 0;
+    var scanned: i64 = 0;
+    var total: i64 = 0;
+    var name: array<u8, 256>;
+    while (ok) {
+        var status: i32 = directory_next(iterator, &name[0], 256);
+        if (status <= 0) {
+            ok = status == 0;
+            break;
+        }
+        if (mem_eq_cstr(&name[0] as str, ".") || mem_eq_cstr(&name[0] as str, "..")) {
+            continue;
+        }
+        scanned += 1;
+        if (scanned > PACKAGE_ENTRY_LIMIT) {
+            ok = false;
+            break;
+        }
+        if (!managed_name(&name[0] as str)) {
+            continue;
+        }
+        var entry: ptr<CacheEntry> = entries + count;
+        var fd: i32 = open_at(parent, &name[0] as str, READ_FLAGS, 0);
+        ok = owned_archive(fd, &(deref entry.info));
+        if (fd >= 0) {
+            io_close(fd as i64);
+        }
+        if (ok) {
+            mem_copy(&(deref entry.name)[0], &name[0], 98);
+            total += deref entry.info.size;
+            count += 1;
+        }
+    }
+    if (iterator != null) {
+        directory_close(iterator);
+    }
+    var remaining: i64 = count;
+    while (ok && (total > byte_limit || remaining > entry_limit)) {
+        var oldest: ptr<CacheEntry> = null;
+        for (var i: i64 = 0; i < count; i++) {
+            var entry: ptr<CacheEntry> = entries + i;
+            if (!deref entry.removed && (oldest == null || older(entry, oldest))) {
+                oldest = entry;
+            }
+        }
+        if (oldest == null) {
+            ok = false;
+            break;
+        }
+        var current: Stat;
+        var fd: i32 = open_at(parent, &(deref oldest.name)[0] as str, READ_FLAGS, 0);
+        ok = owned_archive(fd, &current) && current.dev == deref oldest.info.dev &&
+            current.ino == deref oldest.info.ino && current.size == deref oldest.info.size &&
+            current.mtime == deref oldest.info.mtime && current.mtime_nsec == deref oldest.info.mtime_nsec;
+        if (ok) {
+            ok = unlink_at(parent, &(deref oldest.name)[0] as str, 0) == 0;
+        }
+        if (fd >= 0) {
+            io_close(fd as i64);
+        }
+        if (ok) {
+            deref oldest.removed = true;
+            total -= current.size;
+            remaining -= 1;
+        }
+    }
+    if (entries != null) {
+        mem_free(entries as ptr<u8>, capacity);
+    }
+    return ok && fsync(parent as i64) == 0;
+}
+
+pub fun prune_archive_cache(byte_limit: i64, entry_limit: i64) -> bool {
+    if (byte_limit < 0 || byte_limit > PACKAGE_CACHE_BYTE_LIMIT || entry_limit < 0 || entry_limit > PACKAGE_CACHE_ENTRY_LIMIT) {
+        return package_fail("cache limits exceed the compiled bounds");
+    }
+    var parent: i32 = directory(false);
+    if (parent == -2) {
+        return true;
+    }
+    if (parent < 0) {
+        return false;
+    }
+    var ok: bool = trim_directory(parent, byte_limit, entry_limit);
+    io_close(parent as i64);
+    if (!ok) {
+        return package_fail("cannot prune archive cache: unsafe entry, changed file or I/O failure");
+    }
+    return true;
+}
+
+pub fun cache_filename(expected: str, output: ptr<u8>) -> bool {
+    if ((expected as ptr<u8>) == null || mem_len_cstr(expected) != 95) {
+        return false;
+    }
+    var prefix: str = "sha512-";
+    for (var i: i64 = 0; i < 7; i++) {
+        if (expected[i] != prefix[i]) {
+            return false;
+        }
+        output[i] = expected[i];
+    }
+    for (var i: i64 = 7; i < 93; i++) {
+        var c: u8 = expected[i];
+        if (c == 43) {
+            c = 45;
+        } else if (c == 47) {
+            c = 95;
+        } else if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122))) {
+            return false;
+        }
+        output[i] = c;
+    }
+    if (expected[93] != 61 || expected[94] != 61) {
+        return false;
+    }
+    output[93] = 46;
+    output[94] = 116;
+    output[95] = 103;
+    output[96] = 122;
+    output[97] = 0;
+    return true;
+}
+
+fun directory(create: bool) -> i32 {
+    var project: i32 = project_fd();
+    if (project < 0) {
+        package_fail("archive cache requires an active install transaction");
+        return -1;
+    }
+    var fd: i32 = open_at(project, CACHE_DIRECTORY, DIRECTORY_FLAGS, 0);
+    if (fd >= 0) {
+        if (!owned_directory(fd)) {
+            io_close(fd as i64);
+            package_fail("archive cache directory must be owned and not writable by other users");
+            return -1;
+        }
+        return fd;
+    }
+    if (deref errno_location() != 2) {
+        package_fail("cannot open archive cache directory without following links");
+        return -1;
+    }
+    if (!create) {
+        return -2;
+    }
+    if (mkdir_at(project, CACHE_DIRECTORY, 448) < 0 && deref errno_location() != 17) {
+        package_fail("cannot create archive cache directory");
+        return -1;
+    }
+    fd = open_at(project, CACHE_DIRECTORY, DIRECTORY_FLAGS, 0);
+    if (!owned_directory(fd) || fsync(project as i64) < 0) {
+        if (fd >= 0) {
+            io_close(fd as i64);
+        }
+        package_fail("cannot open or synchronize archive cache directory");
+        return -1;
+    }
+    return fd;
+}
+
+// 1 = verified hit, 0 = absent, -1 = error. Never silently consume corrupt data.
+pub fun read_cached_archive(expected: str, archive: ptr<Blob>) -> i64 {
+    deref archive.bytes = null;
+    deref archive.length = 0;
+    deref archive.capacity = 0;
+    var name: array<u8, 104>;
+    if (!cache_filename(expected, &name[0])) {
+        package_fail("cache key requires canonical SHA512 integrity");
+        return -1;
+    }
+    var parent: i32 = directory(false);
+    if (parent == -2) {
+        return 0;
+    }
+    if (parent < 0) {
+        return -1;
+    }
+    var fd: i32 = open_at(parent, &name[0] as str, READ_FLAGS, 0);
+    var missing: bool = fd < 0 && deref errno_location() == 2;
+    io_close(parent as i64);
+    if (missing) {
+        return 0;
+    }
+    var info: Stat;
+    if (!owned_archive(fd, &info)) {
+        if (fd >= 0) {
+            io_close(fd as i64);
+        }
+        package_fail("cached archive must be a bounded regular file without symlinks");
+        return -1;
+    }
+    deref archive.capacity = info.size+1;
+    deref archive.bytes = mem_alloc(deref archive.capacity);
+    var ok: bool = deref archive.bytes != null;
+    while (ok && deref archive.length < info.size) {
+        var count: i64 = io_read(fd as i64, deref archive.bytes+deref archive.length, info.size-deref archive.length);
+        if (count == -4) {
+            continue;
+        }
+        if (count <= 0) {
+            ok = false;
+            break;
+        }
+        deref archive.length += count;
+    }
+    var extra: array<u8, 1>;
+    if (ok) {
+        ok = io_read(fd as i64, &extra[0], 1) == 0;
+    }
+    io_close(fd as i64);
+    if (ok) {
+        ok = verify_integrity(deref archive, expected);
+    }
+    if (!ok) {
+        free_blob(archive);
+        package_fail("cached archive read or SHA512 verification failed");
+        return -1;
+    }
+    var bytes: ptr<u8> = deref archive.bytes;
+    bytes[deref archive.length] = 0;
+    return 1;
+}
+
+pub fun store_cached_archive(archive: Blob, expected: str) -> bool {
+    if (!verify_integrity(archive, expected)) {
+        return false;
+    }
+    var name: array<u8, 104>;
+    if (!cache_filename(expected, &name[0])) {
+        return package_fail("invalid archive cache key");
+    }
+    var existing: Blob;
+    var hit: i64 = read_cached_archive(expected, &existing);
+    free_blob(&existing);
+    if (hit != 0) {
+        return hit == 1;
+    }
+    var parent: i32 = directory(true);
+    if (parent < 0) {
+        return false;
+    }
+    if (!trim_directory(parent, PACKAGE_CACHE_BYTE_LIMIT - archive.length, PACKAGE_CACHE_ENTRY_LIMIT - 1)) {
+        io_close(parent as i64);
+        return package_fail("cannot reserve bounded archive cache capacity");
+    }
+    var stage: i32 = stage_fd();
+    var fd: i32 = open_at(stage, TEMPORARY_ARCHIVE, CREATE_FLAGS, 384);
+    if (fd < 0) {
+        io_close(parent as i64);
+        return package_fail("cannot reserve transaction cache write");
+    }
+    var ok: bool = io_write_all(fd as i64, archive.bytes, archive.length) == archive.length && fsync(fd as i64) == 0;
+    io_close(fd as i64);
+    if (ok && rename_new(stage, TEMPORARY_ARCHIVE, parent, &name[0] as str, 1) < 0) {
+        if (deref errno_location() == 17) {
+            var existing: Blob;
+            ok = read_cached_archive(expected, &existing) == 1;
+            free_blob(&existing);
+        } else {
+            ok = false;
+        }
+    }
+    // A completed rename leaves no source. An interrupted source belongs to the
+    // existing journal's private staging directory and is recovered with it.
+    unlink_at(stage, TEMPORARY_ARCHIVE, 0);
+    if (ok) {
+        ok = fsync(parent as i64) == 0 && fsync(stage as i64) == 0;
+    }
+    io_close(parent as i64);
+    if (!ok) {
+        return package_fail("cannot publish verified archive cache entry");
+    }
+    return true;
+}

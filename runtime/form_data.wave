@@ -1,0 +1,433 @@
+// Multipart policy stays in Wave. Private records may recognize immutable Blobs.
+import("./context_state")::{owned_context_slot, context_slot, release_context_slot};
+import("./values")::{get, put, plain, text, define, define_key, fail};
+import("./collections")::{weak_map, weak_get, weak_set, list, length, at, append, remove_at, integer, set_integer, flag, set_flag};
+import("./buffer_core")::{copy_byte_view, buffer_from_bytes};
+import("./byte_codec")::{encode_utf8};
+import("./config")::{BUFFER_LIMIT, FORM_DATA_ENTRY_LIMIT};
+import("std::mem::layout")::{size_of};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::ops")::{mem_copy};
+import("std::mem::cstr")::{mem_len_cstr};
+import("std::random::fill")::{RandomFillResult, random_fill};
+import("./web_support")::{usv_text, apply, public_constructor};
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, owner: ptr<u8>, parent: ptr<u8>);
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "jsrt_form_callback") fun callback(constructing: bool) -> ptr<u8>;
+const SLOT: i64 = 41;
+const APPEND: i64 = 0;
+const SET: i64 = 1;
+const GET: i64 = 2;
+const GET_ALL: i64 = 3;
+const HAS: i64 = 4;
+const DELETE: i64 = 5;
+const ENTRIES: i64 = 6;
+const KEYS: i64 = 7;
+const VALUES: i64 = 8;
+const FOR_EACH: i64 = 9;
+const NEXT: i64 = 10;
+const SELF: i64 = 11;
+const METHOD_COUNT: i64 = 12;
+const BLOB_KIND: i64 = 0;
+struct State {
+    records: ptr<u8>;
+    blobs: ptr<u8>;
+    ctor: ptr<u8>;
+    parent: ptr<u8>;
+    iterators: ptr<u8>;
+    iterator_parent: ptr<u8>;
+    methods: array<ptr<u8>, 12>;
+}
+fun state(ctx: ptr<u8>) -> ptr<State> {
+    return context_slot(ctx, SLOT) as ptr<State>;
+}
+fun record(ctx: ptr<u8>, owner: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<State> = state(ctx);
+    if (s == null || kind(ctx, owner) != 5 || deref ex != null) {
+        return undefined(ctx);
+    }
+    return weak_get(ctx, deref s.records, owner, ex);
+}
+fun as_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    return usv_text(ctx, value, ex);
+}
+fun blob_record(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<State> = state(ctx);
+    if (kind(ctx, value) != 5 || deref ex != null) {
+        return undefined(ctx);
+    }
+    var r: ptr<u8> = weak_get(ctx, deref s.blobs, value, ex);
+    if (kind(ctx, r) == 5 && integer(ctx, r, "kind", ex) == BLOB_KIND) {
+        return r;
+    }
+    return undefined(ctx);
+}
+export(c) fun jsrt_form_construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count > 0 && kind(ctx, args[0]) != 0) {
+        fail(ctx, ex, 1, "FormData accepts no HTML form input");
+        return undefined(ctx);
+    }
+    var entropy: array<u8, 24>;
+    var random: RandomFillResult = random_fill(&entropy[0], 24);
+    if (!random.ok) {
+        fail(ctx, ex, 0, "cannot obtain multipart boundary entropy");
+        return undefined(ctx);
+    }
+    var boundary: array<u8, 54>;
+    var alphabet: str = "0123456789abcdef";
+    mem_copy(&boundary[0], "jsrt-" as ptr<u8>, 5);
+    for (var i: i64 = 0; i < 24; i++) {
+        boundary[5 + i * 2] = alphabet[entropy[i] >> 4];
+        boundary[6 + i * 2] = alphabet[entropy[i] & 15];
+    }
+    boundary[53] = 0;
+    var r: ptr<u8> = plain(ctx);
+    protect(ctx, r);
+    put(ctx, r, "entries", list(ctx, ex), ex);
+    put(ctx, r, "boundary", text(ctx, &boundary[0] as str), ex);
+    var s: ptr<State> = state(ctx);
+    var owner: ptr<u8> = object(ctx, null, null);
+    protect(ctx, owner);
+    prototype(ctx, owner, get(ctx, ctor, "prototype", ex));
+    weak_set(ctx, deref s.records, owner, r, ex);
+    unprotect(ctx, owner);
+    unprotect(ctx, r);
+    return owner;
+}
+export(c) fun jsrt_form_method(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<State> = state(ctx);
+    if (equal(ctx, fn, (deref s.methods)[NEXT]) || equal(ctx, fn, (deref s.methods)[SELF])) {
+        var cursor: ptr<u8> = undefined(ctx);
+        if (kind(ctx, owner) == 5) {
+            cursor = weak_get(ctx, deref s.iterators, owner, ex);
+        }
+        if (kind(ctx, cursor) != 5) {
+            fail(ctx, ex, 1, "invalid FormData iterator receiver");
+            return undefined(ctx);
+        }
+        if (equal(ctx, fn, (deref s.methods)[SELF])) {
+            return owner;
+        }
+        var source: ptr<u8> = record(ctx, get(ctx, cursor, "owner", ex), ex);
+        var items: ptr<u8> = get(ctx, source, "entries", ex);
+        var index: i64 = integer(ctx, cursor, "index", ex);
+        var done: bool = flag(ctx, cursor, "done", ex) || index >= length(ctx, items, ex);
+        var value: ptr<u8> = undefined(ctx);
+        if (!done) {
+            var entry: ptr<u8> = at(ctx, items, index, ex);
+            var mode: i64 = integer(ctx, cursor, "mode", ex);
+            value = get(ctx, entry, "name", ex);
+            if (mode == VALUES) {
+                value = get(ctx, entry, "value", ex);
+            } else if (mode == ENTRIES) {
+                var pair: array<ptr<u8>, 2> = [value, get(ctx, entry, "value", ex)];
+                value = array(ctx, 2, &pair[0], ex);
+            }
+            set_integer(ctx, cursor, "index", index + 1, ex);
+        } else {
+            set_flag(ctx, cursor, "done", true, ex);
+        }
+        protect(ctx, value);
+        var result: ptr<u8> = object(ctx, null, null);
+        protect(ctx, result);
+        define(ctx, result, "value", value, ex, true);
+        define(ctx, result, "done", boolean(ctx, done), ex, true);
+        unprotect(ctx, result);
+        unprotect(ctx, value);
+        return result;
+    }
+    var r: ptr<u8> = record(ctx, owner, ex);
+    if (kind(ctx, r) != 5) {
+        fail(ctx, ex, 1, "invalid FormData receiver");
+        return undefined(ctx);
+    }
+    var op: i64 = 0;
+    while (op < METHOD_COUNT && !equal(ctx, fn, (deref s.methods)[op])) {
+        op += 1;
+    }
+    var items: ptr<u8> = get(ctx, r, "entries", ex);
+    if (op >= ENTRIES && op <= VALUES) {
+        var cursor: ptr<u8> = plain(ctx);
+        protect(ctx, cursor);
+        put(ctx, cursor, "owner", owner, ex);
+        set_integer(ctx, cursor, "index", 0, ex);
+        set_integer(ctx, cursor, "mode", op, ex);
+        var result: ptr<u8> = object(ctx, null, null);
+        protect(ctx, result);
+        prototype(ctx, result, deref s.iterator_parent);
+        weak_set(ctx, deref s.iterators, result, cursor, ex);
+        unprotect(ctx, result);
+        unprotect(ctx, cursor);
+        return result;
+    }
+    if (op == FOR_EACH) {
+        if (count == 0 || !callable(ctx, args[0])) {
+            fail(ctx, ex, 1, "FormData forEach requires a function");
+            return undefined(ctx);
+        }
+        var receiver: ptr<u8> = undefined(ctx);
+        if (count > 1) {
+            receiver = args[1];
+        }
+        for (var i: i64 = 0; i < length(ctx, items, ex) && deref ex == null; i++) {
+            var entry: ptr<u8> = at(ctx, items, i, ex);
+            var values: array<ptr<u8>, 3> = [get(ctx, entry, "value", ex), get(ctx, entry, "name", ex), owner];
+            apply(ctx, args[0], receiver, 3, &values[0], ex);
+        }
+        return undefined(ctx);
+    }
+    if (count == 0 || ((op == APPEND || op == SET) && count < 2)) {
+        fail(ctx, ex, 1, "FormData method is missing a name or value");
+        return undefined(ctx);
+    }
+    var name: ptr<u8> = as_string(ctx, args[0], ex);
+    protect(ctx, name);
+    var entry: ptr<u8> = null;
+    if (op == APPEND || op == SET) {
+        entry = plain(ctx);
+        protect(ctx, entry);
+        put(ctx, entry, "name", name, ex);
+        var value: ptr<u8> = args[1];
+        var blob: ptr<u8> = blob_record(ctx, value, ex);
+        var filename: ptr<u8> = undefined(ctx);
+        if (kind(ctx, blob) == 5) {
+            filename = text(ctx, "blob");
+            if (count > 2) {
+                filename = as_string(ctx, args[2], ex);
+            }
+        } else {
+            if (count > 2) {
+                fail(ctx, ex, 1, "FormData filename requires a Blob");
+            }
+            value = as_string(ctx, value, ex);
+        }
+        protect(ctx, filename);
+        put(ctx, entry, "value", value, ex);
+        put(ctx, entry, "filename", filename, ex);
+        unprotect(ctx, filename);
+    }
+    var output: ptr<u8> = undefined(ctx);
+    if (op == GET) {
+        output = js_null(ctx);
+    } else if (op == HAS) {
+        output = boolean(ctx, false);
+    } else if (op == GET_ALL) {
+        output = array(ctx, 0, null, ex);
+    }
+    protect(ctx, output);
+    var replaced: bool = false;
+    for (var i: i64 = 0; i < length(ctx, items, ex) && deref ex == null; i++) {
+        var item: ptr<u8> = at(ctx, items, i, ex);
+        if (equal(ctx, get(ctx, item, "name", ex), name)) {
+            if (op == GET || op == HAS) {
+                unprotect(ctx, output);
+                output = boolean(ctx, true);
+                if (op == GET) {
+                    output = get(ctx, item, "value", ex);
+                }
+                protect(ctx, output);
+                break;
+            }
+            if (op == GET_ALL) {
+                append(ctx, output, get(ctx, item, "value", ex), ex);
+            } else if (op == DELETE || op == SET) {
+                if (op == SET && !replaced) {
+                    // Replace in place, preserving the first matching position.
+                    define_key(ctx, items, number_index(ctx, i as f64), entry, ex, true);
+                    replaced = true;
+                } else {
+                    remove_at(ctx, items, i, ex);
+                    i -= 1;
+                }
+            }
+        }
+    }
+    if ((op == APPEND || (op == SET && !replaced)) && deref ex == null) {
+        if (length(ctx, items, ex) >= FORM_DATA_ENTRY_LIMIT) {
+            fail(ctx, ex, 2, "FormData entry limit exceeded");
+        } else {
+            append(ctx, items, entry, ex);
+        }
+    }
+    unprotect(ctx, output);
+    if (entry != null) {
+        unprotect(ctx, entry);
+    }
+    unprotect(ctx, name);
+    return output;
+}
+extern(c, "wr_number") fun number_index(ctx: ptr<u8>, n: f64) -> ptr<u8>;
+
+fun append_literal(bytes: ptr<u8>, used: ptr<i64>, value: str, ex: ptr<ptr<u8>>, ctx: ptr<u8>) {
+    if (deref ex != null) {
+        return;
+    }
+    var n: i64 = mem_len_cstr(value);
+    if (n > BUFFER_LIMIT - deref used) {
+        fail(ctx, ex, 2, "multipart body limit exceeded");
+        return;
+    }
+    mem_copy(bytes + deref used, value as ptr<u8>, n);
+    deref used += n;
+}
+fun append_text(ctx: ptr<u8>, bytes: ptr<u8>, used: ptr<i64>, value: ptr<u8>, quoted: bool, ex: ptr<ptr<u8>>) {
+    if (deref ex != null) {
+        return;
+    }
+    var raw: ptr<u8> = mem_alloc(BUFFER_LIMIT + 1);
+    if (raw == null) {
+        fail(ctx, ex, 2, "cannot allocate multipart text");
+        return;
+    }
+    var n: i64 = encode_utf8(ctx, value, raw, BUFFER_LIMIT + 1, false, ex);
+    for (var i: i64 = 0; i < n && deref ex == null; i++) {
+        var c: u8 = raw[i];
+        if (quoted && (c == 34 || c == 13 || c == 10 || c == 0)) {
+            var hex: str = "0123456789ABCDEF";
+            var encoded: array<u8, 4> = [37, hex[c >> 4], hex[c & 15], 0];
+            append_literal(bytes, used, &encoded[0] as str, ex, ctx);
+        } else if (deref used >= BUFFER_LIMIT) {
+            fail(ctx, ex, 2, "multipart body limit exceeded");
+        } else {
+            bytes[deref used] = c;
+            deref used += 1;
+        }
+    }
+    mem_free(raw, BUFFER_LIMIT + 1);
+}
+pub fun form_data_type(ctx: ptr<u8>, owner: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var r: ptr<u8> = record(ctx, owner, ex);
+    if (kind(ctx, r) != 5) {
+        return null;
+    }
+    var bytes: array<u8, 128>;
+    var prefix: str = "multipart/form-data; boundary=";
+    var used: i64 = mem_len_cstr(prefix);
+    mem_copy(&bytes[0], prefix as ptr<u8>, used);
+    var n: i64 = encode_utf8(ctx, get(ctx, r, "boundary", ex), &bytes[used], 128 - used, false, ex);
+    if (deref ex != null || n < 0) {
+        return undefined(ctx);
+    }
+    return text(ctx, &bytes[0] as str);
+}
+pub fun form_data_body(ctx: ptr<u8>, owner: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var r: ptr<u8> = record(ctx, owner, ex);
+    if (kind(ctx, r) != 5) {
+        return null;
+    }
+    var bytes: ptr<u8> = mem_alloc(BUFFER_LIMIT + 1);
+    if (bytes == null) {
+        fail(ctx, ex, 2, "cannot allocate multipart body");
+        return undefined(ctx);
+    }
+    var used: i64 = 0;
+    var items: ptr<u8> = get(ctx, r, "entries", ex);
+    var boundary: ptr<u8> = get(ctx, r, "boundary", ex);
+    for (var i: i64 = 0; i < length(ctx, items, ex) && deref ex == null; i++) {
+        var entry: ptr<u8> = at(ctx, items, i, ex);
+        append_literal(bytes, &used, "--", ex, ctx);
+        append_text(ctx, bytes, &used, boundary, false, ex);
+        append_literal(bytes, &used, "\r\nContent-Disposition: form-data; name=\"", ex, ctx);
+        append_text(ctx, bytes, &used, get(ctx, entry, "name", ex), true, ex);
+        append_literal(bytes, &used, "\"", ex, ctx);
+        var value: ptr<u8> = get(ctx, entry, "value", ex);
+        var blob: ptr<u8> = blob_record(ctx, value, ex);
+        if (kind(ctx, blob) == 5) {
+            append_literal(bytes, &used, "; filename=\"", ex, ctx);
+            append_text(ctx, bytes, &used, get(ctx, entry, "filename", ex), true, ex);
+            append_literal(bytes, &used, "\"\r\nContent-Type: ", ex, ctx);
+            var mime: ptr<u8> = get(ctx, blob, "type", ex);
+            if (equal(ctx, mime, text(ctx, ""))) {
+                mime = text(ctx, "application/octet-stream");
+            }
+            append_text(ctx, bytes, &used, mime, false, ex);
+        }
+        append_literal(bytes, &used, "\r\n\r\n", ex, ctx);
+        if (kind(ctx, blob) == 5 && deref ex == null) {
+            var n: i64 = copy_byte_view(ctx, get(ctx, blob, "bytes", ex), bytes + used, BUFFER_LIMIT - used, ex);
+            if (n >= 0) {
+                used += n;
+            }
+        } else {
+            append_text(ctx, bytes, &used, value, false, ex);
+        }
+        append_literal(bytes, &used, "\r\n", ex, ctx);
+    }
+    append_literal(bytes, &used, "--", ex, ctx);
+    append_text(ctx, bytes, &used, boundary, false, ex);
+    append_literal(bytes, &used, "--\r\n", ex, ctx);
+    var result: ptr<u8> = undefined(ctx);
+    if (deref ex == null) {
+        result = buffer_from_bytes(ctx, bytes, used, ex);
+    }
+    mem_free(bytes, BUFFER_LIMIT + 1);
+    return result;
+}
+pub fun install_form_data(ctx: ptr<u8>, blobs: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var s: ptr<State> = owned_context_slot(ctx, SLOT, size_of<State>() as i64) as ptr<State>;
+    deref s.blobs = blobs;
+    protect(ctx, blobs);
+    deref s.records = weak_map(ctx, ex);
+    protect(ctx, deref s.records);
+    deref s.iterators = weak_map(ctx, ex);
+    protect(ctx, deref s.iterators);
+    deref s.iterator_parent = object(ctx, null, null);
+    protect(ctx, deref s.iterator_parent);
+    deref s.ctor = public_constructor(ctx, callback(true), "FormData", ex);
+    protect(ctx, deref s.ctor);
+    deref s.parent = get(ctx, deref s.ctor, "prototype", ex);
+    protect(ctx, deref s.parent);
+    define(ctx, deref s.parent, "constructor", deref s.ctor, ex, false);
+    var names: array<str, 12> = ["append", "set", "get", "getAll", "has", "delete", "entries", "keys", "values", "forEach", "next", "iterator"];
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        var name: ptr<u8> = utf8(names[i]);
+        (deref s.methods)[i] = function(ctx, name, callback(false));
+        release(name);
+        protect(ctx, (deref s.methods)[i]);
+        if (i < NEXT) {
+            define(ctx, deref s.parent, names[i], (deref s.methods)[i], ex, false);
+        }
+    }
+    var symbol: ptr<u8> = get(ctx, get(ctx, global(ctx), "Symbol", ex), "iterator", ex);
+    define_key(ctx, deref s.parent, symbol, (deref s.methods)[ENTRIES], ex, false);
+    define(ctx, deref s.iterator_parent, "next", (deref s.methods)[NEXT], ex, false);
+    define_key(ctx, deref s.iterator_parent, symbol, (deref s.methods)[SELF], ex, false);
+    define(ctx, global(ctx), "FormData", deref s.ctor, ex, true);
+    return deref ex == null;
+}
+pub fun shutdown_form_data(ctx: ptr<u8>) {
+    var s: ptr<State> = state(ctx);
+    if (s == null) {
+        return;
+    }
+    var roots: array<ptr<u8>, 6> = [deref s.records, deref s.blobs, deref s.ctor, deref s.parent, deref s.iterators, deref s.iterator_parent];
+    for (var i: i64 = 0; i < 6; i++) {
+        if (roots[i] != null) {
+            unprotect(ctx, roots[i]);
+        }
+    }
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        if ((deref s.methods)[i] != null) {
+            unprotect(ctx, (deref s.methods)[i]);
+        }
+    }
+    release_context_slot(ctx, SLOT, size_of<State>() as i64);
+}

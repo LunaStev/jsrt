@@ -1,0 +1,47 @@
+name: JavaScriptCore compatibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_npm:
+        description: Run the public npm HTTPS suite as well
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    # Provision Wave, native dependencies, and both JSC libraries on these runners.
+    runs-on: [self-hosted, linux, x64, jsrt-wave-jsc]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: baseline
+            library_variable: JSRT_BASELINE_JSC_LIBRARY
+          - engine: candidate
+            library_variable: JSRT_CANDIDATE_JSC_LIBRARY
+    name: Linux JSC ${{ matrix.engine }}
+    env:
+      JSRT_JSC_LIBRARY: ${{ vars[matrix.library_variable] }}
+      JSRT_WAVEC: ${{ vars.JSRT_WAVEC || 'wavec' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require the selected engine library
+        run: test -n "$JSRT_JSC_LIBRARY" && test -f "$JSRT_JSC_LIBRARY"
+      - name: Build and require live TCP TLS and keep-alive checks
+        run: ./bootstrap.sh build --require-tcp --probe-worker-termination
+      - name: Repeat the test entry point against the selected engine
+        run: ./bootstrap.sh test --require-tcp --probe-worker-termination
+      - name: Record the actual engine and native backends
+        run: |
+          ./target/native/jsrt --version
+          ./target/native/jsrt --info
+      - name: Public npm HTTPS integration
+        if: ${{ inputs.run_npm }}
+        run: ./bootstrap.sh test-npm --require-tcp

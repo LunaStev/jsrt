@@ -1,0 +1,99 @@
+// Node-style next ticks are host callbacks, never a second Promise job queue.
+// The engine ABI holds an outer native entry while Wave drains this FIFO.
+import("./context_state")::{context_slot, owned_context_slot, release_context_slot};
+import("./values")::{get, put, plain, fail};
+import("./collections")::{list, length, at, append, remove_at};
+import("./config")::{NEXT_TICK_LIMIT, ARGUMENT_LIMIT};
+import("std::mem::layout")::{size_of};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+const SLOT: i64 = 40;
+struct State {
+    queue: ptr<u8>;
+    draining: bool;
+}
+fun state(ctx: ptr<u8>) -> ptr<State> {
+    return context_slot(ctx, SLOT) as ptr<State>;
+}
+pub fun install_next_ticks(ctx: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var s: ptr<State> = owned_context_slot(ctx, SLOT, size_of<State>() as i64) as ptr<State>;
+    deref s.queue = list(ctx, ex);
+    protect(ctx, deref s.queue);
+}
+export(c) fun jsrt_next_tick_ready(ctx: ptr<u8>) -> bool {
+    var s: ptr<State> = state(ctx);
+    return s != null && deref s.queue != null;
+}
+export(c) fun jsrt_next_tick_pending(ctx: ptr<u8>) -> bool {
+    var s: ptr<State> = state(ctx);
+    if (s == null || deref s.queue == null || deref s.draining) {
+        return false;
+    }
+    var ignored: ptr<u8> = null;
+    return length(ctx, deref s.queue, &ignored) > 0;
+}
+export(c) fun jsrt_process_next_tick(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<State> = state(ctx);
+    if (s == null || count == 0 || kind(ctx, args[0]) != 5 || !callable(ctx, args[0])) {
+        fail(ctx, ex, 1, "nextTick callback must be a function");
+        return undefined(ctx);
+    }
+    if (count - 1 > ARGUMENT_LIMIT || length(ctx, deref s.queue, ex) >= NEXT_TICK_LIMIT) {
+        fail(ctx, ex, 2, "nextTick argument or pending callback limit exceeded");
+        return undefined(ctx);
+    }
+    var record: ptr<u8> = plain(ctx);
+    protect(ctx, record);
+    put(ctx, record, "callback", args[0], ex);
+    var values: ptr<u8> = list(ctx, ex);
+    protect(ctx, values);
+    for (var i: i64 = 1; i < count && deref ex == null; i++) {
+        append(ctx, values, args[i], ex);
+    }
+    put(ctx, record, "args", values, ex);
+    append(ctx, deref s.queue, record, ex);
+    unprotect(ctx, values);
+    unprotect(ctx, record);
+    return undefined(ctx);
+}
+export(c) fun jsrt_drain_next_ticks(ctx: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var s: ptr<State> = state(ctx);
+    if (s == null || deref s.queue == null || deref s.draining || deref ex != null) {
+        return;
+    }
+    deref s.draining = true;
+    while (length(ctx, deref s.queue, ex) > 0 && deref ex == null) {
+        var record: ptr<u8> = at(ctx, deref s.queue, 0, ex);
+        protect(ctx, record);
+        remove_at(ctx, deref s.queue, 0, ex);
+        var callback: ptr<u8> = get(ctx, record, "callback", ex);
+        var values: ptr<u8> = get(ctx, record, "args", ex);
+        var count: i64 = length(ctx, values, ex);
+        var args: array<ptr<u8>, 64>;
+        for (var i: i64 = 0; i < count && deref ex == null; i++) {
+            args[i] = at(ctx, values, i, ex);
+        }
+        if (deref ex == null) {
+            call(ctx, callback, null, count, &args[0], ex);
+        }
+        unprotect(ctx, record);
+    }
+    deref s.draining = false;
+}
+pub fun shutdown_next_ticks(ctx: ptr<u8>) {
+    var s: ptr<State> = state(ctx);
+    if (s == null) {
+        return;
+    }
+    if (deref s.queue != null) {
+        unprotect(ctx, deref s.queue);
+        deref s.queue = null;
+    }
+    release_context_slot(ctx, SLOT, size_of<State>() as i64);
+}

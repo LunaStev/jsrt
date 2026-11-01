@@ -1,0 +1,592 @@
+// User-local deployment policy. Only a marked, owned prefix may be modified.
+import("./support")::{argc, arg, absolute, join, concat, private_directory, spawn, wait, env, run};
+import("./private_files")::{clean_private_directory};
+import("./release_files")::{MARKER, digest, hex_digest, verify_payload, copy_payload};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("std::mem::ops")::{mem_eq, mem_copy};
+import("std::mem::alloc")::{mem_alloc};
+import("std::sys::fs")::{open, fstat, fsync, Stat, mkdir, rename_path};
+import("std::fs::file")::{fs_read_all};
+import("std::io::fd")::{io_read, io_write_all, io_close};
+extern(c, "getuid") fun user_id() -> i32;
+extern(c, "lstat") fun link_stat(path: str, info: ptr<Stat>) -> i32;
+extern(c, "flock") fun lock_prefix(fd: i32, flags: i32) -> i32;
+extern(c, "symlink") fun symbolic_link(target: str, path: str) -> i32;
+extern(c, "readlink") fun read_link(path: str, bytes: ptr<u8>, capacity: i64) -> i64;
+extern(c, "renameat2") fun rename_new(a: i32, source: str, b: i32, destination: str, flags: u32) -> i32;
+extern(c, "opendir") fun directory_open(path: str) -> ptr<u8>;
+extern(c, "closedir") fun directory_close(directory: ptr<u8>) -> i32;
+extern(c, "jsrt_directory_next") fun directory_next(directory: ptr<u8>, name: ptr<u8>, capacity: i64) -> i32;
+extern(c, "__errno_location") fun errno_location() -> ptr<i32>;
+extern(c, "unlink") fun unlink_file(path: str) -> i32;
+extern(c, "getpid") fun own_pid() -> i32;
+extern(c, "kill") fun send_signal(pid: i32, signal: i32) -> i32;
+extern(c, "jsrt_deploy_diagnostic_file_limit") fun diagnostic_file_limit(bytes: u64) -> i32;
+const DIRECTORY_FLAGS: i32 = 720896;
+const REGULAR_FLAGS: i32 = 657408;
+const CREATE_FLAGS: i32 = 655553;
+const CURRENT_DIRECTORY: i32 = -100;
+const SYMLINK_KIND: i32 = 40960;
+const FILE_MASK: i32 = 61440;
+const PROBE_TIMEOUT_MS: i64 = 10000;
+const DIAGNOSTIC_FILE_BYTES: u64 = 1048576;
+
+// Explicit deployment diagnostics only, never JS execution policy.
+fun checkpoint(name: str) {
+    var selected: ptr<u8> = env("JSRT_DEPLOY_DIAGNOSTIC_INTERRUPT", "");
+    if (selected != null && mem_eq_cstr(selected as str, name)) {
+        send_signal(own_pid(), 9);
+    }
+}
+
+fun io_gate(name: str) -> bool {
+    var selected: ptr<u8> = env("JSRT_DEPLOY_DIAGNOSTIC_IO", "");
+    if (selected != null && mem_eq_cstr(selected as str, name)) {
+        println("Injected deployment I/O failure at {}", name);
+        return false;
+    }
+    return true;
+}
+
+fun journal(prefix: str, name: str, stage: str) -> bool {
+    var fd: i64 = open(join(prefix, name) as str, CREATE_FLAGS, 384);
+    if (fd < 0) {
+        return false;
+    }
+    var offset: i64 = mem_len_cstr(prefix) + 10;
+    var leaf: str = (stage as ptr<u8> + offset) as str;
+    var n: i64 = mem_len_cstr(leaf);
+    var ok: bool = io_write_all(fd, leaf as ptr<u8>, n) == n && fsync(fd) == 0;
+    io_close(fd);
+    return sync_directory(prefix) && ok;
+}
+
+fun clear_journal(prefix: str, name: str) -> bool {
+    var path: str = join(prefix, name) as str;
+    if (unlink_file(path) < 0 && deref errno_location() != 2) {
+        return false;
+    }
+    return sync_directory(prefix);
+}
+
+fun recover_stage(prefix: str, marker: str, kind: str) -> bool {
+    var fd: i64 = open(join(prefix, marker) as str, REGULAR_FLAGS, 0);
+    if (fd < 0) {
+        // Wave sys::fs returns negative errno directly; it does not set libc errno.
+        return fd == -2;
+    }
+    var info: Stat;
+    var bytes: array<u8, 128>;
+    var n: i64 = io_read(fd, &bytes[0], 127);
+    var width: i64 = mem_len_cstr(kind);
+    var ok: bool = fstat(fd, &info) == 0 && info.uid == user_id() && info.nlink == 1 &&
+        (info.mode & FILE_MASK) == 32768 && info.size == n && n == width + 32 &&
+        mem_eq(&bytes[0], kind as ptr<u8>, width);
+    io_close(fd);
+    for (var i: i64 = width; i < n && ok; i++) {
+        ok = (bytes[i] >= 48 && bytes[i] <= 57) || (bytes[i] >= 97 && bytes[i] <= 102);
+    }
+    if (!ok) {
+        println("Invalid deployment recovery journal; preserved");
+        return false;
+    }
+    bytes[n] = 0;
+    var path: str = join(join(prefix, "releases") as str, &bytes[0] as str) as str;
+    if (link_stat(path, &info) == 0) {
+        if (!clean_private_directory(path)) {
+            return false;
+        }
+    } else if (deref errno_location() != 2) {
+        return false;
+    }
+    return clear_journal(prefix, marker);
+}
+
+fun recover_locked(prefix: str, scratch: str) -> bool {
+    var ok: bool = true;
+    var current: ptr<u8> = release_target(prefix, "current", &ok);
+    var previous: ptr<u8> = release_target(prefix, "previous", &ok);
+    var targets: array<ptr<u8>, 2> = [current, previous];
+    for (var i: i64 = 0; i < 2 && ok; i++) {
+        if (targets[i] != null) {
+            var root: str = join(prefix, targets[i] as str) as str;
+            ok = verify_payload(root, scratch);
+            if (ok) {
+                var hash: ptr<u8> = digest(join(root, "SHA256SUMS") as str, scratch);
+                ok = hash != null && mem_eq(hash, targets[i] + 9, 64);
+            }
+        }
+    }
+    return ok && recover_stage(prefix, ".pending-copy", "incoming-") &&
+        recover_stage(prefix, ".pending-switch", "switch-");
+}
+
+fun valid_path(path: str) -> bool {
+    var n: i64 = mem_len_cstr(path);
+    if (n < 2 || n > 3000 || path[0] != 47) {
+        return false;
+    }
+    for (var i: i64 = 0; i < n; i++) {
+        if (path[i] < 32 || path[i] == 127) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fun sync_directory(path: str) -> bool {
+    var fd: i64 = open(path, DIRECTORY_FLAGS, 0);
+    if (fd < 0) {
+        return false;
+    }
+    var ok: bool = fsync(fd) == 0;
+    io_close(fd);
+    return ok;
+}
+
+pub fun probe_payload(root: str, scratch: str) -> bool {
+    if (!verify_payload(root, scratch)) {
+        return false;
+    }
+    var command: array<str, 2> = [join(root, "bin/jsrt") as str, join(root, "checks/probe.js") as str];
+    var log: str = join(scratch, "probe-output") as str;
+    var fd: i64 = open(log, 524865, 384);
+    if (fd < 0) {
+        return false;
+    }
+    var pid: i64 = spawn(&command[0], 2, fd, -1);
+    io_close(fd);
+    var result: i32 = wait(pid, PROBE_TIMEOUT_MS);
+    var bytes: array<u8, 256>;
+    var n: i64 = fs_read_all(log, &bytes[0], 256);
+    var expected: str = "release probe ok\n";
+    var ok: bool = result == 0 && n == mem_len_cstr(expected) && mem_eq(&bytes[0], expected as ptr<u8>, n);
+    if (!ok) {
+        println("Release execution probe failed (status {})", result);
+    }
+    return ok;
+}
+
+fun release_target(prefix: str, name: str, ok: ptr<bool>) -> ptr<u8> {
+    var path: str = join(prefix, name) as str;
+    var info: Stat;
+    if (link_stat(path, &info) < 0) {
+        if (deref errno_location() != 2) {
+            deref ok = false;
+        }
+        return null;
+    }
+    if ((info.mode & FILE_MASK) != SYMLINK_KIND || info.uid != user_id()) {
+        deref ok = false;
+        return null;
+    }
+    var bytes: array<u8, 128>;
+    var n: i64 = read_link(path, &bytes[0], 128);
+    if (n != 73 || !mem_eq(&bytes[0], "releases/" as ptr<u8>, 9) || !hex_digest(&bytes[9])) {
+        deref ok = false;
+        return null;
+    }
+    var result: ptr<u8> = mem_alloc(74);
+    if (result == null) {
+        deref ok = false;
+        return null;
+    }
+    mem_copy(result, &bytes[0], 73);
+    result[73] = 0;
+    return result;
+}
+
+fun managed_prefix(prefix: str) -> i64 {
+    var fd: i64 = open(prefix, DIRECTORY_FLAGS, 0);
+    var info: Stat;
+    if (fd < 0) {
+        return -1;
+    }
+    var ok: bool = fstat(fd, &info) == 0 && info.uid == user_id() && (info.mode & 511) == 448 &&
+        lock_prefix(fd as i32, 6) == 0;
+    var marker: i64 = open(join(prefix, ".jsrt-installation") as str, REGULAR_FLAGS, 0);
+    if (marker < 0) {
+        ok = false;
+    } else {
+        var bytes: array<u8, 64>;
+        ok = fstat(marker, &info) == 0 && (info.mode & FILE_MASK) == 32768 && info.uid == user_id() &&
+            info.nlink == 1 && info.size == mem_len_cstr(MARKER) &&
+            io_read(marker, &bytes[0], 64) == mem_len_cstr(MARKER) &&
+            mem_eq(&bytes[0], MARKER as ptr<u8>, mem_len_cstr(MARKER)) && ok;
+        io_close(marker);
+    }
+    var d: ptr<u8> = directory_open(prefix);
+    if (d == null) {
+        ok = false;
+    } else {
+        var name: array<u8, 256>;
+        while (ok) {
+            var status: i32 = directory_next(d, &name[0], 256);
+            if (status <= 0) {
+                ok = status == 0;
+                break;
+            }
+            var entry: str = &name[0] as str;
+            if (!mem_eq_cstr(entry, ".") && !mem_eq_cstr(entry, "..") &&
+                !mem_eq_cstr(entry, ".jsrt-installation") && !mem_eq_cstr(entry, "bin") &&
+                !mem_eq_cstr(entry, "releases") && !mem_eq_cstr(entry, "current") && !mem_eq_cstr(entry, "previous")) {
+                ok = mem_eq_cstr(entry, ".pending-copy") || mem_eq_cstr(entry, ".pending-switch");
+            }
+        }
+        directory_close(d);
+    }
+    release_target(prefix, "current", &ok);
+    release_target(prefix, "previous", &ok);
+    var names: array<str, 2> = ["bin", "releases"];
+    for (var i: i64 = 0; i < 2; i++) {
+        var child: i64 = open(join(prefix, names[i]) as str, DIRECTORY_FLAGS, 0);
+        if (child < 0) {
+            ok = false;
+        } else {
+            ok = fstat(child, &info) == 0 && info.uid == user_id() && ok;
+            io_close(child);
+        }
+    }
+    var links: array<str, 2> = ["jsrt", "jsrt-deploy"];
+    d = directory_open(join(prefix, "bin") as str);
+    var link_count: i64 = 0;
+    if (d == null) {
+        ok = false;
+    } else {
+        var name: array<u8, 256>;
+        while (true) {
+            var status: i32 = directory_next(d, &name[0], 256);
+            if (status <= 0) {
+                ok = status == 0 && ok;
+                break;
+            }
+            if (mem_eq_cstr(&name[0] as str, ".") || mem_eq_cstr(&name[0] as str, "..")) {
+                continue;
+            }
+            if (!mem_eq_cstr(&name[0] as str, links[0]) && !mem_eq_cstr(&name[0] as str, links[1])) {
+                ok = false;
+            }
+            link_count += 1;
+        }
+        directory_close(d);
+    }
+    ok = link_count == 2 && ok;
+    for (var i: i64 = 0; i < 2; i++) {
+        var path: str = join(join(prefix, "bin") as str, links[i]) as str;
+        var wanted: str = concat("../current/bin/", links[i]) as str;
+        var bytes: array<u8, 128>;
+        var n: i64 = read_link(path, &bytes[0], 128);
+        ok = link_stat(path, &info) == 0 && (info.mode & FILE_MASK) == SYMLINK_KIND &&
+            info.uid == user_id() && n == mem_len_cstr(wanted) && mem_eq(&bytes[0], wanted as ptr<u8>, n) && ok;
+    }
+    if (!ok) {
+        io_close(fd);
+        println("Refusing an unmanaged, modified, unsafe, or busy installation prefix");
+        return -1;
+    }
+    return fd;
+}
+
+fun initialize_prefix(prefix: str) -> bool {
+    var info: Stat;
+    if (link_stat(prefix, &info) == 0) {
+        return true;
+    }
+    if (deref errno_location() != 2 || mkdir(prefix, 448) < 0) {
+        return false;
+    }
+    var marker: i64 = open(join(prefix, ".jsrt-installation") as str, CREATE_FLAGS, 384);
+    var ok: bool = marker >= 0;
+    if (marker >= 0) {
+        ok = io_write_all(marker, MARKER as ptr<u8>, mem_len_cstr(MARKER)) == mem_len_cstr(MARKER) && fsync(marker) == 0;
+        io_close(marker);
+    }
+    ok = mkdir(join(prefix, "bin") as str, 493) == 0 && ok;
+    ok = mkdir(join(prefix, "releases") as str, 448) == 0 && ok;
+    ok = symbolic_link("../current/bin/jsrt", join(prefix, "bin/jsrt") as str) == 0 && ok;
+    ok = symbolic_link("../current/bin/jsrt-deploy", join(prefix, "bin/jsrt-deploy") as str) == 0 && ok;
+    ok = sync_directory(prefix) && ok;
+    if (!ok) {
+        clean_private_directory(prefix);
+    }
+    return ok;
+}
+
+fun activate(prefix: str, target: str, previous: ptr<u8>) -> bool {
+    var scratch: ptr<u8> = private_directory(join(prefix, "releases") as str, "switch-");
+    if (scratch == null) {
+        return false;
+    }
+    var next: str = join(scratch as str, "current") as str;
+    var old: str = join(scratch as str, "previous") as str;
+    var ok: bool = symbolic_link(target, next) == 0;
+    ok = journal(prefix, ".pending-switch", scratch as str) && ok;
+    checkpoint("switch-staged");
+    if (previous != null && ok) {
+        ok = symbolic_link(previous as str, old) == 0 &&
+            rename_path(old, join(prefix, "previous") as str) == 0;
+        ok = sync_directory(prefix) && ok;
+        checkpoint("previous-switched");
+    }
+    if (ok) {
+        ok = io_gate("current-rename") && rename_path(next, join(prefix, "current") as str) == 0;
+        checkpoint("current-switched");
+    }
+    ok = sync_directory(prefix) && ok;
+    ok = clean_private_directory(scratch as str) && ok;
+    if (ok) {
+        ok = clear_journal(prefix, ".pending-switch");
+    }
+    return ok;
+}
+
+pub fun install_bundle(bundle: str, prefix: str, scratch: str) -> bool {
+    if (!verify_payload(bundle, scratch)) {
+        return false;
+    }
+    var hash: ptr<u8> = digest(join(bundle, "SHA256SUMS") as str, scratch);
+    if (hash == null || !initialize_prefix(prefix)) {
+        return false;
+    }
+    var lock: i64 = managed_prefix(prefix);
+    if (lock < 0) {
+        return false;
+    }
+    if (!recover_locked(prefix, scratch)) {
+        io_close(lock);
+        return false;
+    }
+    var ok: bool = true;
+    var current: ptr<u8> = release_target(prefix, "current", &ok);
+    if (ok && current != null) {
+        var active: str = join(prefix, current as str) as str;
+        ok = verify_payload(active, scratch);
+        if (ok) {
+            var active_hash: ptr<u8> = digest(join(active, "SHA256SUMS") as str, scratch);
+            ok = active_hash != null && mem_eq(active_hash, current + 9, 64);
+        }
+    }
+    if (!ok) {
+        io_close(lock);
+        println("Existing active release is modified or unsafe; it was preserved");
+        return false;
+    }
+    var target: str = concat("releases/", hash as str) as str;
+    var generation: str = join(prefix, target) as str;
+    var stage: ptr<u8> = private_directory(join(prefix, "releases") as str, "incoming-");
+    if (stage == null) {
+        io_close(lock);
+        return false;
+    }
+    ok = journal(prefix, ".pending-copy", stage as str);
+    checkpoint("copy-reserved");
+    ok = ok && io_gate("copy-write") && copy_payload(bundle, stage as str);
+    checkpoint("copy-completed");
+    ok = ok && probe_payload(stage as str, scratch);
+    if (ok) {
+        var dirs: array<str, 5> = ["bin", "lib", "licenses", "engine-source", "checks"];
+        for (var i: i64 = 0; i < 5; i++) {
+            ok = sync_directory(join(stage as str, dirs[i]) as str) && ok;
+        }
+        ok = sync_directory(stage as str) && ok;
+    }
+    if (ok && rename_new(CURRENT_DIRECTORY, stage as str, CURRENT_DIRECTORY, generation, 1) != 0) {
+        if (deref errno_location() == 17) {
+            ok = verify_payload(generation, scratch);
+            if (ok) {
+                var existing_hash: ptr<u8> = digest(join(generation, "SHA256SUMS") as str, scratch);
+                ok = existing_hash != null && mem_eq(existing_hash, hash, 64);
+            }
+        } else {
+            ok = false;
+        }
+        ok = clean_private_directory(stage as str) && ok;
+    } else if (!ok) {
+        clean_private_directory(stage as str);
+    }
+    if (ok) {
+        ok = io_gate("generation-fsync") && sync_directory(join(prefix, "releases") as str);
+        checkpoint("generation-published");
+        if (ok) {
+            ok = clear_journal(prefix, ".pending-copy");
+        }
+        if (ok && (current == null || !mem_eq_cstr(current as str, target))) {
+            ok = activate(prefix, target, current);
+        }
+    }
+    io_close(lock);
+    if (ok) {
+        println("Installed {} at {}/bin/jsrt", hash as str, prefix);
+    } else {
+        println("Installation did not finish; inspect current and previous before retrying");
+    }
+    return ok;
+}
+
+pub fun rollback_bundle(prefix: str, scratch: str) -> bool {
+    var lock: i64 = managed_prefix(prefix);
+    if (lock < 0) {
+        return false;
+    }
+    if (!recover_locked(prefix, scratch)) {
+        io_close(lock);
+        return false;
+    }
+    var ok: bool = true;
+    var previous: ptr<u8> = release_target(prefix, "previous", &ok);
+    var current: ptr<u8> = release_target(prefix, "current", &ok);
+    ok = ok && previous != null && current != null && !mem_eq_cstr(previous as str, current as str);
+    if (ok) {
+        ok = probe_payload(join(prefix, previous as str) as str, scratch) &&
+            activate(prefix, previous as str, current);
+    }
+    io_close(lock);
+    if (ok) {
+        println("Rolled back {}/bin/jsrt", prefix);
+    }
+    return ok;
+}
+
+pub fun uninstall_bundle(prefix: str, scratch: str) -> bool {
+    var lock: i64 = managed_prefix(prefix);
+    if (lock < 0) {
+        return false;
+    }
+    var releases: str = join(prefix, "releases") as str;
+    var d: ptr<u8> = directory_open(releases);
+    var ok: bool = d != null;
+    if (d != null) {
+        var name: array<u8, 256>;
+        while (ok) {
+            var status: i32 = directory_next(d, &name[0], 256);
+            if (status <= 0) {
+                ok = status == 0;
+                break;
+            }
+            if (mem_eq_cstr(&name[0] as str, ".") || mem_eq_cstr(&name[0] as str, "..")) {
+                continue;
+            }
+            ok = mem_len_cstr(&name[0] as str) == 64 && hex_digest(&name[0]);
+            if (ok) {
+                var generation: str = join(releases, &name[0] as str) as str;
+                ok = verify_payload(generation, scratch);
+                if (ok) {
+                    var actual: ptr<u8> = digest(join(generation, "SHA256SUMS") as str, scratch);
+                    ok = actual != null && mem_eq(actual, &name[0], 64);
+                }
+            }
+        }
+        directory_close(d);
+    }
+    if (ok) {
+        ok = clean_private_directory(prefix);
+    } else {
+        println("Uninstall refused: modified release or unrecognized staging files are preserved");
+    }
+    io_close(lock);
+    return ok;
+}
+
+// This compiled Wave path runs unchanged on a separate Linux VM. It needs no
+// source checkout, compiler or host library bind mounts.
+pub fun check_bundle(bundle: str, scratch: str) -> bool {
+    var kernel: array<str, 2> = ["/usr/bin/uname", "-a"];
+    var info: array<str, 2> = [join(bundle, "bin/jsrt") as str, "--info"];
+    if (run(&kernel[0], 2) != 0 || !probe_payload(bundle, scratch) || run(&info[0], 2) != 0) {
+        return false;
+    }
+    var prefix: str = join(scratch, "installed") as str;
+    if (!install_bundle(bundle, prefix, scratch) || !install_bundle(bundle, prefix, scratch)) {
+        return false;
+    }
+    var installed: array<str, 2> = [join(prefix, "bin/jsrt") as str, join(prefix, "current/checks/probe.js") as str];
+    var ok: bool = run(&installed[0], 2) == 0;
+    ok = uninstall_bundle(prefix, scratch) && ok;
+    println("Native Linux installation, execution and removal: {}", ok);
+    return ok;
+}
+
+pub fun release_check_cli() -> i32 {
+    if (argc() != 4 || !mem_eq_cstr(arg(2), "--bundle")) {
+        return 2;
+    }
+    var bundle: ptr<u8> = absolute(arg(3));
+    var scratch: ptr<u8> = private_directory("/tmp", "jsrt-release-check-");
+    if (bundle == null || scratch == null) {
+        return 1;
+    }
+    var ok: bool = check_bundle(bundle as str, scratch as str);
+    ok = clean_private_directory(scratch as str) && ok;
+    if (!ok) {
+        return 1;
+    }
+    return 0;
+}
+
+pub fun deploy_main() -> i32 {
+    var limited: ptr<u8> = env("JSRT_DEPLOY_DIAGNOSTIC_FSIZE", "");
+    if (limited != null && mem_eq_cstr(limited as str, "1")) {
+        if (diagnostic_file_limit(DIAGNOSTIC_FILE_BYTES) != 0) {
+            return 1;
+        }
+    }
+    if (argc() < 2) {
+        println("jsrt-deploy verify --bundle <directory>");
+        println("jsrt-deploy check --bundle <directory>");
+        println("jsrt-deploy install --bundle <directory> --prefix <private-directory>");
+        println("jsrt-deploy rollback|recover|uninstall --prefix <private-directory>");
+        return 2;
+    }
+    var bundle: ptr<u8> = null;
+    var prefix: ptr<u8> = null;
+    for (var i: i32 = 2; i < argc(); i++) {
+        if (mem_eq_cstr(arg(i), "--bundle") && i + 1 < argc()) {
+            i += 1;
+            bundle = absolute(arg(i));
+        } else if (mem_eq_cstr(arg(i), "--prefix") && i + 1 < argc()) {
+            i += 1;
+            prefix = absolute(arg(i));
+        } else {
+            return 2;
+        }
+    }
+    var verb: str = arg(1);
+    var verify: bool = mem_eq_cstr(verb, "verify");
+    var check: bool = mem_eq_cstr(verb, "check");
+    var install: bool = mem_eq_cstr(verb, "install");
+    var rollback: bool = mem_eq_cstr(verb, "rollback");
+    var uninstall: bool = mem_eq_cstr(verb, "uninstall");
+    var recover: bool = mem_eq_cstr(verb, "recover");
+    if ((!verify && !check && !install && !rollback && !uninstall && !recover) ||
+        ((verify || check || install) && (bundle == null || !valid_path(bundle as str))) ||
+        ((install || rollback || uninstall || recover) && (prefix == null || !valid_path(prefix as str)))) {
+        return 2;
+    }
+    var scratch: ptr<u8> = private_directory("/tmp", "jsrt-deploy-");
+    if (scratch == null) {
+        return 1;
+    }
+    var ok: bool = false;
+    if (check) {
+        ok = check_bundle(bundle as str, scratch as str);
+    } else if (verify) {
+        ok = probe_payload(bundle as str, scratch as str);
+    } else if (install) {
+        ok = install_bundle(bundle as str, prefix as str, scratch as str);
+    } else if (rollback) {
+        ok = rollback_bundle(prefix as str, scratch as str);
+    } else if (recover) {
+        var lock: i64 = managed_prefix(prefix as str);
+        if (lock >= 0) {
+            ok = recover_locked(prefix as str, scratch as str);
+            io_close(lock);
+        }
+    } else {
+        ok = uninstall_bundle(prefix as str, scratch as str);
+    }
+    ok = clean_private_directory(scratch as str) && ok;
+    if (!ok) {
+        return 1;
+    }
+    return 0;
+}

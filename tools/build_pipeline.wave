@@ -1,0 +1,144 @@
+// Full validation gates publication. Test tools stay inside the private build directory.
+import("./support")::{join, run, ensure_directory, env, spawn, wait};
+import("./compiler")::{compile_wave, compile_test_runner, compile_c, compile_cpp, compile_addon_fixture, link};
+import("./trace_native")::{trace_cjs_fixture};
+import("./network_build")::{build_network};
+import("./release")::{build_release};
+import("std::fs::file")::{rename};
+extern(c, "fflush") fun fflush(stream: ptr<u8>) -> i32;
+
+pub fun build_runtime(compiler: str, cc: str, standard: str, library: str, compatibility: bool, require_tcp: bool,
+    npm_only: bool, probe_worker: bool, probe_only: i32, release_mode: bool, directory: str) -> i32 {
+    var object: str = join(directory, "runtime.o") as str;
+    var args: str = join(directory, "args.o") as str;
+    var bridge: str = join(directory, "bridge.o") as str;
+    var adapter: str = join(directory, "engine.o") as str;
+    var binary: str = join(directory, "jsrt") as str;
+    var result: i32 = build_network(cc, directory);
+    if (result != 0) {
+        return result;
+    }
+    result = compile_wave(compiler, standard, "runtime/main.wave", object);
+    if (result != 0) {
+        return result;
+    }
+    result = compile_c(cc, "native/c/engine_jsc.c", adapter, false);
+    if (result != 0) {
+        return result;
+    }
+    result = compile_c(cc, "native/c/args.c", args, false);
+    if (result != 0) {
+        return result;
+    }
+    result = compile_c(cc, "native/c/bridge.c", bridge, compatibility);
+    if (result != 0) {
+        return result;
+    }
+    result = compile_c(cc, "native/c/curl_abi.c", join(directory, "curl-abi.o") as str, false);
+    if (result != 0) {
+        return result;
+    }
+    result = compile_c(cc, "native/c/filesystem_abi.c", join(directory, "filesystem-abi.o") as str, false);
+    if (result != 0) {
+        return result;
+    }
+    result = compile_cpp(env("CXX", "c++") as str, "native/cpp/node_api.cpp", join(directory, "node-api.o") as str);
+    if (result != 0) {
+        return result;
+    }
+    result = link(cc, object, args, adapter, bridge, library, binary, directory, false);
+    if (result != 0) {
+        return result;
+    }
+    // Check the engine policy and basic VM initialization before testing.
+    var probe: array<str, 3> = [binary, "--check", "tests/http_server.js"];
+    result = run(&probe[0], 3);
+    if (result != 0) {
+        return result;
+    }
+    var destination: str = "target/native";
+    if (compatibility) {
+        destination = "target/compat";
+    }
+    // A failing regression/security check must never replace the last build.
+    if (probe_only == 2) {
+        return trace_cjs_fixture(binary, directory);
+    }
+    var test_object: str = join(directory, "tests.o") as str;
+    var test_binary: str = join(directory, "tests") as str;
+    result = compile_test_runner(compiler, standard, test_object);
+    if (result != 0) {
+        return result;
+    }
+    result = compile_c(cc, "tests/context_threads.c", join(directory, "test-threads.o") as str, false);
+    if (result != 0) {
+        return result;
+    }
+    result = link(cc, test_object, args, adapter, bridge, library, test_binary, directory, true);
+    if (result != 0) {
+        return result;
+    }
+    if (probe_only == 1) {
+        var command: array<str, 2> = [test_binary, "--termination-only"];
+        var status: i32 = wait(spawn(&command[0], 2, -1, -1), 10000);
+        println("Explicit worker termination probe exit status: {}; runtime was not published", status);
+        return status;
+    }
+    var fixtures: array<str, 5> = ["addon.node", "addon-version.node", "addon-init.node", "addon-symbol.node",
+        "addon-api.node"];
+    var modes: array<str, 5> = ["-DJSRT_ADDON_MODE=0", "-DJSRT_ADDON_MODE=1", "-DJSRT_ADDON_MODE=2",
+        "-DJSRT_ADDON_MODE=3", "-DJSRT_ADDON_MODE=4"];
+    for (var i: i64 = 0; i < 5; i++) {
+        result = compile_addon_fixture(cc, "tests/native_addon.c", join(directory, fixtures[i]) as str,
+            modes[i]);
+        if (result != 0) {
+            return result;
+        }
+    }
+    var command: array<str, 3> = [test_binary, binary, "--require-tcp"];
+    var count: i64 = 2;
+    if (require_tcp) {
+        count = 3;
+    }
+    var regression_result: i32 = run(&command[0], count);
+    var npm_result: i32 = 0;
+    if (npm_only) {
+        command[2] = "--npm-only";
+        // Report independent npm failures even if TCP capability was denied.
+        npm_result = run(&command[0], 3);
+    }
+    var worker_result: i32 = 0;
+    if (probe_worker) {
+        var probe_command: array<str, 2> = [test_binary, "--termination-only"];
+        // Bound this isolated diagnostic process, never JavaScript in the runtime.
+        worker_result = wait(spawn(&probe_command[0], 2, -1, -1), 10000);
+        println("Explicit worker termination probe exit status: {}", worker_result);
+    }
+    if (regression_result != 0 || npm_result != 0 || worker_result != 0) {
+        println("Main regression suite exit status: {}", regression_result);
+        if (npm_only) {
+            println("Public npm suite exit status: {}", npm_result);
+        }
+        println("Validation failed; the previous runtime was not replaced");
+        if (regression_result != 0) {
+            return regression_result;
+        }
+        if (npm_result != 0) {
+            return npm_result;
+        }
+        return worker_result;
+    }
+    if (release_mode && !build_release(compiler, cc, standard, library, directory, test_binary)) {
+        println("Release validation failed; the previous runtime was not replaced");
+        return 1;
+    }
+    if (!ensure_directory(destination) || rename(binary, join(destination, "jsrt") as str) < 0) {
+        return 1;
+    }
+    println("Built {}/jsrt (Wave + JavaScriptCoreGTK)", destination);
+    if (compatibility) {
+        println("Explicit older-engine compatibility build; not latest-engine validation");
+    }
+    fflush(null);
+    return 0;
+}

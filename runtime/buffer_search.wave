@@ -1,0 +1,229 @@
+// Linear-time byte/UTF-16-unit search, with bounded temporary storage.
+import("./context_state")::{context_slot, allocate_context_slot, release_context_slot};
+import("./config")::{BUFFER_LIMIT};
+import("./buffer_core")::{byte_view_length, copy_byte_view};
+import("./byte_codec")::{encoding, encode_bytes};
+import("./values")::{define, fail, coerce_number};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_to_number") fun numeric(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "fmod") fun remainder(a: f64, b: f64) -> f64;
+extern(c, "jsrt_buffer_search_callback") fun callback() -> ptr<u8>;
+const SLOT: i64 = 29;
+fun roots(ctx: ptr<u8>) -> ptr<ptr<u8>> {
+    return context_slot(ctx, SLOT) as ptr<ptr<u8>>;
+}
+
+fun search_unit(bytes: ptr<u8>, at: i64, unit_width: i64) -> i64 {
+    if (unit_width == 1) {
+        return bytes[at] as i64;
+    }
+    return bytes[at*2] as i64 + (bytes[at*2+1] as i64)*256;
+}
+
+fun search(haystack: ptr<u8>, haystack_length: i64, needle: ptr<u8>, needle_length: i64, start: i64,
+    backwards: bool, unit_width: i64, prefix_table: ptr<i32>) -> i64 {
+    // KMP avoids quadratic behavior for repetitive multi-megabyte inputs.
+    prefix_table[0] = 0;
+    var matched: i64 = 0;
+    for (var i: i64 = 1; i < needle_length; i++) {
+        var value: i64 = search_unit(needle, i, unit_width);
+        while (matched > 0 && value != search_unit(needle, matched, unit_width)) {
+            matched = prefix_table[matched-1] as i64;
+        }
+        if (value == search_unit(needle, matched, unit_width)) {
+            matched += 1;
+        }
+        prefix_table[i] = matched as i32;
+    }
+    matched = 0;
+    var result: i64 = -1;
+    var begin: i64 = start;
+    var end: i64 = haystack_length;
+    if (backwards) {
+        begin = 0;
+        if (start < haystack_length-needle_length) {
+            end = start+needle_length;
+        }
+    }
+    for (var i: i64 = begin; i < end; i++) {
+        var value: i64 = search_unit(haystack, i, unit_width);
+        while (matched > 0 && value != search_unit(needle, matched, unit_width)) {
+            matched = prefix_table[matched-1] as i64;
+        }
+        if (value == search_unit(needle, matched, unit_width)) {
+            matched += 1;
+        }
+        if (matched == needle_length) {
+            result = (i-needle_length+1)*unit_width;
+            if (!backwards) {
+                return result;
+            }
+            matched = prefix_table[matched-1] as i64;
+        }
+    }
+    return result;
+}
+
+export(c) fun jsrt_buffer_search(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var method_roots: ptr<ptr<u8>> = roots(ctx);
+    var backwards: bool = equal(ctx, fn, method_roots[1]);
+    var includes: bool = equal(ctx, fn, method_roots[2]);
+    if (count == 0 || (kind(ctx, args[0]) != 3 && kind(ctx, args[0]) != 4 && kind(ctx, args[0]) != 5)) {
+        fail(ctx, ex, 1, "search value must be a number, string or Uint8Array");
+        return undefined(ctx);
+    }
+    var value: ptr<u8> = args[0];
+    var code_arg: ptr<u8> = null;
+    var offset: f64 = 0.0;
+    var default_offset: bool = count < 2 || kind(ctx, args[1]) == 0;
+    if (count > 2) {
+        code_arg = args[2];
+    }
+    if (count > 1 && kind(ctx, args[1]) == 4) {
+        code_arg = args[1];
+        default_offset = true;
+    } else if (!default_offset) {
+        offset = coerce_number(ctx, args[1], ex);
+        if (offset != offset) {
+            default_offset = true;
+        }
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var code: i32 = 0;
+    if (kind(ctx, value) != 3) {
+        code = encoding(ctx, code_arg, ex, false);
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var haystack_length: i64 = byte_view_length(ctx, receiver, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var start: i64 = 0;
+    if (default_offset) {
+        if (backwards) {
+            start = haystack_length;
+        }
+    } else if (offset > haystack_length as f64) {
+        start = haystack_length;
+    } else if (offset < -(haystack_length as f64)) {
+        start = -1;
+    } else {
+        start = offset as i64;
+        if (start < 0) {
+            start += haystack_length;
+        }
+    }
+    var haystack: ptr<u8> = mem_alloc(haystack_length+1);
+    var needle: ptr<u8> = mem_alloc(BUFFER_LIMIT+1);
+    var needle_length: i64 = -1;
+    var prefix_table: ptr<i32> = null;
+    var result: i64 = -1;
+    if (haystack == null || needle == null) {
+        fail(ctx, ex, 2, "cannot allocate Buffer search storage");
+    } else {
+        if (kind(ctx, value) == 4) {
+            needle_length = encode_bytes(ctx, value, code, needle, BUFFER_LIMIT+1, ex);
+        } else if (kind(ctx, value) == 3) {
+            var octet: f64 = remainder(numeric(ctx, value, ex), 256.0);
+            if (!(octet >= -255.0 && octet <= 255.0)) {
+                octet = 0.0;
+            }
+            needle[0] = (octet as i64 & 255) as u8;
+            needle_length = 1;
+            code = 0;
+        } else {
+            needle_length = copy_byte_view(ctx, value, needle, BUFFER_LIMIT, ex);
+        }
+        if (deref ex == null) {
+            copy_byte_view(ctx, receiver, haystack, haystack_length, ex);
+        }
+        if (deref ex == null) {
+            if (needle_length == 0) {
+                result = start;
+                if (result < 0) {
+                    result = 0;
+                }
+            } else {
+                var unit_width: i64 = 1;
+                if (code == 6) {
+                    unit_width = 2;
+                }
+                if (backwards && start >= haystack_length) {
+                    start = haystack_length-1;
+                }
+                if (!backwards && start < 0) {
+                    start = 0;
+                }
+                if (start >= 0 && haystack_length >= unit_width && needle_length >= unit_width && haystack_length/unit_width >= needle_length/unit_width) {
+                    prefix_table = mem_alloc((needle_length/unit_width)*4) as ptr<i32>;
+                    if (prefix_table == null) {
+                        fail(ctx, ex, 2, "cannot allocate Buffer search table");
+                    } else {
+                        result = search(haystack, haystack_length/unit_width, needle, needle_length/unit_width,
+                            start/unit_width, backwards, unit_width, prefix_table);
+                    }
+                }
+                if (prefix_table != null) {
+                    mem_free(prefix_table as ptr<u8>, (needle_length/unit_width)*4);
+                }
+            }
+        }
+    }
+    if (haystack != null) {
+        mem_free(haystack, haystack_length+1);
+    }
+    if (needle != null) {
+        mem_free(needle, BUFFER_LIMIT+1);
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (includes) {
+        return boolean(ctx, result >= 0);
+    }
+    return number(ctx, result as f64);
+}
+
+pub fun install_buffer_search(ctx: ptr<u8>, parent: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (!allocate_context_slot(ctx, SLOT, 24)) {
+        return false;
+    }
+    var method_roots: ptr<ptr<u8>> = roots(ctx);
+    var names: array<str, 3> = ["indexOf", "lastIndexOf", "includes"];
+    for (var i: i64 = 0; i < 3; i++) {
+        var name: ptr<u8> = utf8(names[i]);
+        method_roots[i] = function(ctx, name, callback());
+        release(name);
+        protect(ctx, method_roots[i]);
+        define(ctx, parent, names[i], method_roots[i], ex, false);
+    }
+    return deref ex == null;
+}
+
+pub fun shutdown_buffer_search(ctx: ptr<u8>) {
+    var method_roots: ptr<ptr<u8>> = roots(ctx);
+    if (method_roots == null) {
+        return;
+    }
+    for (var i: i64 = 0; i < 3; i++) {
+        if (method_roots[i] != null) {
+            unprotect(ctx, method_roots[i]);
+        }
+    }
+    release_context_slot(ctx, SLOT, 24);
+}

@@ -1,0 +1,221 @@
+// Lossless UTF-16 <-> scalar UTF-8 transport for the wjson boundary.
+// U+E000 is doubled; lone UTF-16 units use U+E000 + U+E100..U+E8FF.
+// This lets unmodified wjson accept JS strings without losing NUL/surrogates.
+import("std::mem::alloc")::{mem_alloc, mem_free};
+extern(c, "wr_to_string") fun wr_to_string(ctx: ptr<u8>, value: ptr<u8>, exception: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_length") fun wr_string_length(text: ptr<u8>) -> i64;
+extern(c, "wr_string_characters") fun wr_string_characters(text: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_utf16") fun wr_string_utf16(chars: ptr<u16>, count: i64) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+
+pub const JSON_TEXT_LIMIT: i64 = 4194304;
+pub struct JsonText {
+    data: ptr<u8>;
+    len: i64;
+    cap: i64;
+}
+
+fun utf8(buffer: ptr<u8>, at: i64, cp: u32) -> i64 {
+    if (cp < 128) {
+        deref buffer[at] = cp as u8;
+        return at + 1;
+    }
+    if (cp < 2048) {
+        deref buffer[at] = (192 | (cp >> 6)) as u8;
+        deref buffer[at + 1] = (128 | (cp & 63)) as u8;
+        return at + 2;
+    }
+    if (cp < 65536) {
+        deref buffer[at] = (224 | (cp >> 12)) as u8;
+        deref buffer[at + 1] = (128 | ((cp >> 6) & 63)) as u8;
+        deref buffer[at + 2] = (128 | (cp & 63)) as u8;
+        return at + 3;
+    }
+    deref buffer[at] = (240 | (cp >> 18)) as u8;
+    deref buffer[at + 1] = (128 | ((cp >> 12) & 63)) as u8;
+    deref buffer[at + 2] = (128 | ((cp >> 6) & 63)) as u8;
+    deref buffer[at + 3] = (128 | (cp & 63)) as u8;
+    return at + 4;
+}
+
+fun mapped(buffer: ptr<u8>, at: i64, cp: u32) -> i64 {
+    if (cp == 57344) {
+        return utf8(buffer, utf8(buffer, at, 57344), 57344);
+    }
+    if (cp >= 55296 && cp <= 57343) {
+        return utf8(buffer, utf8(buffer, at, 57344), 57600 + cp - 55296);
+    }
+    return utf8(buffer, at, cp);
+}
+
+fun hex(c: u16) -> i32 {
+    if (c >= 48 && c <= 57) {
+        return(c - 48) as i32;
+    }
+    if (c >= 65 && c <= 70) {
+        return(c - 55) as i32;
+    }
+    if (c >= 97 && c <= 102) {
+        return(c - 87) as i32;
+    }
+    return -1;
+}
+
+pub fun encode_json_text(ctx: ptr<u8>, value: ptr<u8>, source: bool, exception: ptr<ptr<u8>>) -> JsonText {
+    var result: JsonText = JsonText {
+        data: null, len: 0, cap: 0
+    }
+    ;
+    var text: ptr<u8> = wr_to_string(ctx, value, exception);
+    if (text == null) {
+        return result;
+    }
+    var length: i64 = wr_string_length(text);
+    if (length > JSON_TEXT_LIMIT) {
+        wr_string_release(text);
+        return result;
+    }
+    result.cap = length * 6 + 1;
+    result.data = mem_alloc(result.cap);
+    if (result.data == null) {
+        wr_string_release(text);
+        return result;
+    }
+    var units: ptr<u16> = wr_string_characters(text);
+    var inside: bool = !source;
+    var at: i64 = 0;
+    var i: i64 = 0;
+    while (i < length) {
+        var cp: u32 = units[i] as u32;
+        if (source && cp == 34) {
+            inside = !inside;
+            at = utf8(result.data, at, cp);
+            i += 1;
+            continue;
+        }
+        if (source && inside && cp == 92 && i + 1 < length) {
+            // Preserve grammar and invalid escapes for wjson to validate.
+            // Only transport escaped marker/surrogate units differently.
+            if (units[i + 1] == 117 && i + 5 < length) {
+                var code: i32 = 0;
+                var valid: bool = true;
+                for (var j: i64 = 2; j < 6; j++) {
+                    var h: i32 = hex(units[i + j]);
+                    if (h < 0) {
+                        valid = false;
+                    }
+                    code = code * 16 + h;
+                }
+                if (valid && ((code >= 55296 && code <= 57343) || code == 57344)) {
+                    at = mapped(result.data, at, code as u32);
+                    i += 6;
+                    continue;
+                }
+            }
+            at = utf8(result.data, at, cp);
+            at = utf8(result.data, at, units[i + 1] as u32);
+            i += 2;
+            continue;
+        }
+        if (cp >= 55296 && cp < 56320 && i + 1 < length && units[i + 1] >= 56320 && units[i + 1] < 57344) {
+            cp = 65536 + ((cp - 55296) << 10) + (units[i + 1] as u32) - 56320;
+            i += 1;
+        }
+        if (inside) {
+            at = mapped(result.data, at, cp);
+        } else {
+            at = utf8(result.data, at, cp);
+        }
+        i += 1;
+    }
+    deref result.data[at] = 0;
+    result.len = at;
+    wr_string_release(text);
+    return result;
+}
+
+pub fun free_json_text(text: JsonText) {
+    if (text.data != null) {
+        mem_free(text.data, text.cap);
+    }
+}
+
+// Input is valid UTF-8 produced by wjson or our transport encoder.
+fun next_code(data: ptr<u8>, position: ptr<i64>) -> u32 {
+    var at: i64 = deref position;
+    var cp: u32 = data[at] as u32;
+    var extra: i64 = 0;
+    if (cp >= 240) {
+        cp = cp & 7;
+        extra = 3;
+    } else if (cp >= 224) {
+        cp = cp & 15;
+        extra = 2;
+    } else if (cp >= 192) {
+        cp = cp & 31;
+        extra = 1;
+    }
+    for (var i: i64 = 0; i < extra; i++) {
+        cp = (cp << 6) | ((data[at + i + 1] as u32) & 63);
+    }
+    deref position = at + extra + 1;
+    return cp;
+}
+
+pub fun decode_json_text(data: ptr<u8>, length: i64, serialized: bool) -> ptr<u8> {
+    var buffer: ptr<u16> = mem_alloc((length + 1) * 2) as ptr<u16>;
+    if (buffer == null) {
+        return null;
+    }
+    var i: i64 = 0;
+    var n: i64 = 0;
+    var digits: str = "0123456789abcdef";
+    var hexes: ptr<u8> = digits as ptr<u8>;
+    while (i < length) {
+        // wjson escapes DEL, while ECMAScript QuoteJSONString leaves it literal.
+        if (serialized && data[i] == 92 && i + 1 < length) {
+            if (i + 5 < length && data[i + 1] == 117 && data[i + 2] == 48 && data[i + 3] == 48 && data[i + 4] == 55 && data[i + 5] == 102) {
+                deref buffer[n] = 127;
+                n += 1;
+                i += 6;
+                continue;
+            }
+            deref buffer[n] = data[i] as u16;
+            deref buffer[n + 1] = data[i + 1] as u16;
+            n += 2;
+            i += 2;
+            continue;
+        }
+        var cp: u32 = next_code(data, &i);
+        if (cp == 57344 && i < length) {
+            var tail: u32 = next_code(data, &i);
+            if (tail >= 57600 && tail < 59648) {
+                cp = 55296 + tail - 57600;
+                if (serialized) {
+                    deref buffer[n] = 92;
+                    deref buffer[n + 1] = 117;
+                    deref buffer[n + 2] = hexes[(cp >> 12) & 15] as u16;
+                    deref buffer[n + 3] = hexes[(cp >> 8) & 15] as u16;
+                    deref buffer[n + 4] = hexes[(cp >> 4) & 15] as u16;
+                    deref buffer[n + 5] = hexes[cp & 15] as u16;
+                    n += 6;
+                    continue;
+                }
+            } else {
+                cp = 57344;
+            }
+        }
+        if (cp >= 65536) {
+            cp -= 65536;
+            deref buffer[n] = (55296 + (cp >> 10)) as u16;
+            deref buffer[n + 1] = (56320 + (cp & 1023)) as u16;
+            n += 2;
+        } else {
+            deref buffer[n] = cp as u16;
+            n += 1;
+        }
+    }
+    var result: ptr<u8> = wr_string_utf16(buffer, n);
+    mem_free(buffer as ptr<u8>, (length + 1) * 2);
+    return result;
+}

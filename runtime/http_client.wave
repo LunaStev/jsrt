@@ -1,0 +1,1260 @@
+import("./context_state")::{owned_context_slot, active_context};
+struct HttpClientState {
+    clients: ptr<Client>;
+    multi: ptr<u8>;
+    initialized: bool;
+    methods: array<ptr<u8>, 13>;
+    https_exports: ptr<u8>;
+    object_keys: ptr<u8>;
+    header_states: ptr<u8>;
+}
+
+fun http_client_storage(ctx: ptr<u8>) -> ptr<HttpClientState> {
+    return owned_context_slot(ctx, 13, size_of<HttpClientState>() as i64) as ptr<HttpClientState>;
+}
+
+// libcurl drives DNS/TLS and transport. Wave owns validation, streams and JS dispatch.
+import("./url")::{url_input};
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::mem::ops")::{mem_copy, mem_zero};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("./values")::{get, put, text, plain, define, capture, fail};
+import("./collections")::{integer, weak_map, weak_get, weak_set, bind_one, append};
+import("./abort")::{abort_error, signal_aborted, signal_reason, subscribe_abort, unsubscribe_abort};
+import("./buffer")::{buffer_integer};
+import("./config")::{CLIENT_CONNECT_TIMEOUT_MS};
+import("./streams")::{create_stream, stream_invoke};
+import("./stream_state")::{stream_state, is_stream};
+import("./stream_utils")::{pipeline};
+import("./events")::{add_listener, emit_named};
+import("./body_collect")::{attach_body};
+import("./web_objects")::{brand_response, request_fetch_options, web_body_bytes, web_body_type};
+import("./web_stream_adapter")::{is_web_readable, from_web};
+import("./headers")::{create_headers, headers_record, append_response_header, join_header_values};
+import("./buffer_core")::{buffer_from_bytes, copy_byte_view};
+import("./buffer")::{copy_buffer_input};
+import("./system")::{encode_host_text, copy_host_path};
+import("./http_values")::{http_latin1};
+import("./http_response")::{header_token};
+import("./config")::{CLIENT_LIMIT, BUFFER_LIMIT, HTTP_HEADER_LIMIT, HTTP_HEADER_COUNT};
+import("./async_fs")::{file_completion_fd, file_completions_ready, async_pending};
+import("./network")::{network_fd, network_timeout};
+extern(c, "curl_global_init") fun curl_init(flags: i64) -> i32;
+extern(c, "curl_global_cleanup") fun curl_cleanup();
+extern(c, "curl_easy_init") fun easy_init() -> ptr<u8>;
+extern(c, "curl_easy_cleanup") fun easy_cleanup(easy: ptr<u8>);
+extern(c, "curl_easy_pause") fun easy_pause(easy: ptr<u8>, flags: i32) -> i32;
+extern(c, "curl_multi_init") fun multi_init() -> ptr<u8>;
+extern(c, "curl_multi_cleanup") fun multi_cleanup(multi: ptr<u8>) -> i32;
+extern(c, "curl_multi_add_handle") fun multi_add(multi: ptr<u8>, easy: ptr<u8>) -> i32;
+extern(c, "curl_multi_remove_handle") fun multi_remove(multi: ptr<u8>, easy: ptr<u8>) -> i32;
+extern(c, "curl_multi_perform") fun multi_perform(multi: ptr<u8>, running: ptr<i32>) -> i32;
+extern(c, "curl_slist_append") fun header_append(headers: ptr<u8>, line: str) -> ptr<u8>;
+extern(c, "curl_slist_free_all") fun headers_free(headers: ptr<u8>);
+extern(c, "curl_easy_strerror") fun curl_error(code: i32) -> str;
+extern(c, "curl_url") fun url_new() -> ptr<u8>;
+extern(c, "curl_url_cleanup") fun url_free(url: ptr<u8>);
+extern(c, "curl_url_set") fun url_set(url: ptr<u8>, part: i32, value: ptr<u8>, flags: u32) -> i32;
+extern(c, "curl_url_get") fun url_get(url: ptr<u8>, part: i32, value: ptr<ptr<u8>>, flags: u32) -> i32;
+extern(c, "curl_free") fun curl_free(value: ptr<u8>);
+extern(c, "jsrt_curl_set_long") fun set_long(easy: ptr<u8>, key: i32, value: i64) -> i32;
+extern(c, "jsrt_curl_set_ptr") fun set_ptr(easy: ptr<u8>, key: i32, value: ptr<u8>) -> i32;
+extern(c, "jsrt_curl_get_long") fun get_long(easy: ptr<u8>, key: i32) -> i64;
+extern(c, "jsrt_curl_get_ptr") fun get_ptr(easy: ptr<u8>, key: i32) -> ptr<u8>;
+extern(c, "jsrt_curl_message") fun message(multi: ptr<u8>, result: ptr<i32>) -> ptr<u8>;
+extern(c, "jsrt_curl_poll") fun poll(multi: ptr<u8>, fd1: i32, fd2: i32, millis: i32) -> i32;
+extern(c, "jsrt_curl_native_callback") fun native_callback(code: i32) -> ptr<u8>;
+extern(c, "jsrt_client_callback") fun callback(code: i32) -> ptr<u8>;
+extern(c, "jsrt_curl_features") fun curl_features() -> i32;
+extern(c, "jsrt_curl_version_number") fun curl_version_number() -> u32;
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_to_string") fun string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_get") fun dynamic_get(ctx: ptr<u8>, value: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_get_index") fun index(ctx: ptr<u8>, value: ptr<u8>, at: u32, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, values: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_promise") fun promise(ctx: ptr<u8>, resolve: ptr<ptr<u8>>, reject: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+import("./client_transfer")::{Client};
+
+fun find(owner: ptr<u8>) -> ptr<Client> {
+    var host_state: ptr<HttpClientState> = http_client_storage(active_context());
+    for (var i: i64 = 0; (deref host_state.clients) != null && i < CLIENT_LIMIT; i++) {
+        var c: ptr<Client> = (deref host_state.clients) + i;
+        if (deref c.active && (deref c.request == owner || deref c.body == owner)) {
+            return c;
+        }
+    }
+    return null;
+}
+
+fun dispose(ctx: ptr<u8>, c: ptr<Client>) {
+    var host_state: ptr<HttpClientState> = http_client_storage(ctx);
+    if (deref c.signal != null) {
+        var ignored: ptr<u8> = null;
+        if (deref c.abort_hook != null) {
+            unsubscribe_abort(ctx, deref c.signal, deref c.abort_hook, &ignored);
+            unprotect(ctx, deref c.abort_hook);
+        }
+        unprotect(ctx, deref c.signal);
+    }
+    if (deref c.abort_record != null) {
+        unprotect(ctx, deref c.abort_record);
+    }
+    if (deref c.abort_reason != null) {
+        unprotect(ctx, deref c.abort_reason);
+    }
+    if (deref c.upload_done != null) {
+        unprotect(ctx, deref c.upload_done);
+    }
+    if (deref c.started) {
+        multi_remove((deref host_state.multi), deref c.easy);
+    }
+    if (deref c.easy != null) {
+        easy_cleanup(deref c.easy);
+    }
+    if (deref c.headers != null) {
+        headers_free(deref c.headers);
+    }
+    if (deref c.url != null) {
+        mem_free(deref c.url, mem_len_cstr(deref c.url as str) + 1);
+    }
+    if (deref c.verb != null) {
+        mem_free(deref c.verb, 32);
+    }
+    if (deref c.upload != null) {
+        mem_free(deref c.upload, BUFFER_LIMIT + 1);
+    }
+    if (deref c.head != null) {
+        mem_free(deref c.head, 65537);
+    }
+    if (deref c.pending != null) {
+        mem_free(deref c.pending, 65536);
+    }
+    if (deref c.request != null) {
+        unprotect(ctx, deref c.request);
+    }
+    if (deref c.body != null) {
+        unprotect(ctx, deref c.body);
+    }
+    if (deref c.resolve != null) {
+        unprotect(ctx, deref c.resolve);
+    }
+    if (deref c.reject != null) {
+        unprotect(ctx, deref c.reject);
+    }
+    mem_zero(c as ptr<u8>, size_of<Client>() as i64);
+}
+
+fun option_long(ctx: ptr<u8>, c: ptr<Client>, key: i32, value: i64, ex: ptr<ptr<u8>>) {
+    if (deref ex == null && set_long(deref c.easy, key, value) != 0) {
+        fail(ctx, ex, 0, "libcurl option rejected");
+    }
+}
+
+fun option_ptr(ctx: ptr<u8>, c: ptr<Client>, key: i32, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (deref ex == null && set_ptr(deref c.easy, key, value) != 0) {
+        fail(ctx, ex, 0, "libcurl option rejected");
+    }
+}
+
+fun normalize_url(ctx: ptr<u8>, source: ptr<u8>, tls: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var value: ptr<u8> = url_input(ctx, source, ex);
+    var bytes: array<u8, 8193>;
+    var input_length: i64 = encode_host_text(ctx, value, &bytes[0], 8193, ex);
+    if (input_length < 0) {
+        return null;
+    }
+    for (var i: i64 = 0; i < input_length; i++) {
+        if (bytes[i] <= 32 || bytes[i] == 127) {
+            fail(ctx, ex, 1, "URL contains a control character or unescaped space");
+            return null;
+        }
+    }
+    var url: ptr<u8> = url_new();
+    if (url == null) {
+        fail(ctx, ex, 2, "cannot allocate URL parser");
+        return null;
+    }
+    var scheme: ptr<u8> = null;
+    var normalized: ptr<u8> = null;
+    var result: ptr<u8> = null;
+    if (url_set(url, 0, &bytes[0], 32) != 0 || url_get(url, 1, &scheme, 0) != 0) {
+        fail(ctx, ex, 1, "invalid URL or URL credentials");
+    } else if ((!mem_eq_cstr(scheme as str, "http") && !mem_eq_cstr(scheme as str, "https")) || (tls && !mem_eq_cstr(scheme as str,
+        "https"))) {
+        fail(ctx, ex, 1, "only HTTP/HTTPS URLs are supported");
+    } else {
+        url_set(url, 9, null, 0);
+        if (url_get(url, 0, &normalized, 0) != 0) {
+            fail(ctx, ex, 1, "invalid URL");
+        } else {
+            var n: i64 = mem_len_cstr(normalized as str);
+            result = mem_alloc(n + 1);
+            if (result == null) {
+                fail(ctx, ex, 2, "cannot allocate URL");
+            } else {
+                mem_copy(result, normalized, n + 1);
+            }
+        }
+    }
+    if (scheme != null) {
+        curl_free(scheme);
+    }
+    if (normalized != null) {
+        curl_free(normalized);
+    }
+    url_free(url);
+    return result;
+}
+
+fun add_headers(ctx: ptr<u8>, c: ptr<Client>, headers: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var host_state: ptr<HttpClientState> = http_client_storage(ctx);
+    if (kind(ctx, headers) == 0) {
+        return;
+    }
+    if (kind(ctx, headers) != 5) {
+        fail(ctx, ex, 1, "headers must be an object of string values");
+        return;
+    }
+    var branded: ptr<u8> = headers_record(ctx, headers, ex);
+    if (deref ex != null) {
+        return;
+    }
+    if (branded != null) {
+        headers = branded;
+    }
+    var args: array<ptr<u8>, 1> = [headers];
+    var names: ptr<u8> = call(ctx, (deref host_state.object_keys), null, 1, &args[0], ex);
+    if (names == null || deref ex != null) {
+        return;
+    }
+    protect(ctx, names);
+    var count: i64 = integer(ctx, names, "length", ex);
+    if (count > 64) {
+        fail(ctx, ex, 2, "too many request headers");
+    }
+    var line: ptr<u8> = mem_alloc(16385);
+    var total: i64 = 0;
+    if (line == null) {
+        fail(ctx, ex, 2, "cannot allocate request header");
+    }
+    for (var i: i64 = 0; i < count && deref ex == null; i++) {
+        var key: ptr<u8> = index(ctx, names, i as u32, ex);
+        protect(ctx, key);
+        var n: i64 = encode_host_text(ctx, key, line, 8192, ex);
+        if (n < 0 || deref ex != null) {
+            unprotect(ctx, key);
+            break;
+        }
+        for (var j: i64 = 0; j < n; j++) {
+            if (!header_token(line[j])) {
+                fail(ctx, ex, 1, "invalid request header name");
+            }
+            if (line[j] >= 65 && line[j] <= 90) {
+                line[j] += 32;
+            }
+        }
+        if (n == 0 || mem_eq_cstr(line as str, "content-length") || mem_eq_cstr(line as str, "transfer-encoding") || mem_eq_cstr(line as str,
+            "host") || mem_eq_cstr(line as str, "expect")) {
+            fail(ctx, ex, 1, "runtime-managed request header");
+        }
+        var name: ptr<u8> = string(ctx, key, ex);
+        var value: ptr<u8> = undefined(ctx);
+        if (deref ex == null) {
+            value = dynamic_get(ctx, headers, name, ex);
+        }
+        if (name != null) {
+            release(name);
+        }
+        if (deref ex != null || value == null) {
+            unprotect(ctx, key);
+            break;
+        }
+        protect(ctx, value);
+        if (n >= 0 && deref ex == null) {
+            var is_content_type: bool = mem_eq_cstr(line as str, "content-type");
+            line[n] = 58;
+            line[n + 1] = 32;
+            var size: i64 = encode_host_text(ctx, value, line + n + 2, 16383 - n, ex);
+            for (var j: i64 = 0; j < size; j++) {
+                if ((line[n + 2 + j] < 32 && line[n + 2 + j] != 9) || line[n + 2 + j] >= 127) {
+                    fail(ctx, ex, 1, "invalid request header value");
+                }
+            }
+            total += n + size + 4;
+            if (total > 16384) {
+                fail(ctx, ex, 2, "request header bytes exceeded");
+            }
+            if (deref ex == null) {
+                var updated: ptr<u8> = header_append(deref c.headers, line as str);
+                if (updated == null) {
+                    fail(ctx, ex, 2, "cannot allocate header list");
+                } else {
+                    deref c.headers = updated;
+                    deref c.request_header_count += 1;
+                    deref c.request_header_bytes = total;
+                    if (is_content_type) {
+                        deref c.content_type_set = true;
+                    }
+                }
+            }
+        }
+        unprotect(ctx, value);
+        unprotect(ctx, key);
+    }
+    if (line != null) {
+        mem_free(line, 16385);
+    }
+    unprotect(ctx, names);
+}
+
+fun new_client(ctx: ptr<u8>, url: ptr<u8>, supplied: ptr<ptr<u8>>, fetch_mode: bool, tls: bool, ex: ptr<ptr<u8>>) -> ptr<Client> {
+    var host_state: ptr<HttpClientState> = http_client_storage(ctx);
+    var c: ptr<Client> = null;
+    for (var i: i64 = 0; i < CLIENT_LIMIT; i++) {
+        var candidate: ptr<Client> = (deref host_state.clients) + i;
+        if (!deref candidate.active) {
+            c = candidate;
+            break;
+        }
+    }
+    if (c == null) {
+        fail(ctx, ex, 2, "pending HTTP client limit exceeded");
+        return null;
+    }
+    deref c.active = true;
+    var options: ptr<u8> = deref supplied;
+    if (fetch_mode) {
+        var normalized: ptr<u8> = request_fetch_options(ctx, url, options, ex);
+        if (normalized != null && deref ex == null) {
+            protect(ctx, normalized);
+            unprotect(ctx, options);
+            options = normalized;
+            deref supplied = options;
+            url = get(ctx, normalized, "url", ex);
+        }
+    }
+    if (deref ex != null) {
+        dispose(ctx, c);
+        return null;
+    }
+    deref c.url = normalize_url(ctx, url, tls, ex);
+    if (deref ex != null) {
+        dispose(ctx, c);
+        return null;
+    }
+    deref c.easy = easy_init();
+    deref c.verb = mem_alloc(32);
+    deref c.head = mem_alloc(65537);
+    deref c.pending = mem_alloc(65536);
+    if (deref c.easy == null || deref c.verb == null || deref c.head == null || deref c.pending == null) {
+        fail(ctx, ex, 2, "cannot allocate HTTP client");
+    }
+    if (deref ex != null) {
+        dispose(ctx, c);
+        return null;
+    }
+    option_long(ctx, c, 156, CLIENT_CONNECT_TIMEOUT_MS, ex);
+    mem_copy(deref c.verb, "GET" as ptr<u8>, 4);
+    deref c.follow = fetch_mode;
+    if (kind(ctx, options) != 0) {
+        if (kind(ctx, options) != 5) {
+            fail(ctx, ex, 1, "request options must be an object");
+        } else {
+            var method: ptr<u8> = get(ctx, options, "method", ex);
+            if (kind(ctx, method) != 0) {
+                var n: i64 = encode_host_text(ctx, method, deref c.verb, 32, ex);
+                if (n <= 0) {
+                    fail(ctx, ex, 1, "invalid HTTP method");
+                }
+                for (var j: i64 = 0; j < n; j++) {
+                    var b: u8 = (deref c.verb)[j];
+                    if (!header_token(b)) {
+                        fail(ctx, ex, 1, "invalid HTTP method");
+                    }
+                    if (b >= 97 && b <= 122) {
+                        (deref c.verb)[j] -= 32;
+                    }
+                }
+            }
+            var insecure: ptr<u8> = get(ctx, options, "rejectUnauthorized", ex);
+            if (equal(ctx, insecure, boolean(ctx, false))) {
+                fail(ctx, ex, 1, "TLS certificate verification cannot be disabled");
+            }
+            var signal: ptr<u8> = get(ctx, options, "signal", ex);
+            if (kind(ctx, signal) != 0 && kind(ctx, signal) != 1) {
+                protect(ctx, signal);
+                signal_aborted(ctx, signal, ex);
+                if (deref ex == null) {
+                    deref c.signal = signal;
+                } else {
+                    unprotect(ctx, signal);
+                }
+            }
+            var connect: ptr<u8> = get(ctx, options, "connectTimeout", ex);
+            if (kind(ctx, connect) != 0) {
+                option_long(ctx, c, 156, buffer_integer(ctx, connect, 1, 2147483647, ex), ex);
+            }
+            var timeout: ptr<u8> = get(ctx, options, "timeout", ex);
+            if (kind(ctx, timeout) != 0) {
+                option_long(ctx, c, 155, buffer_integer(ctx, timeout, 0, 2147483647, ex), ex);
+            }
+            var redirect: ptr<u8> = get(ctx, options, "redirect", ex);
+            if (kind(ctx, redirect) != 0) {
+                if (equal(ctx, redirect, text(ctx, "manual"))) {
+                    deref c.follow = false;
+                } else if (equal(ctx, redirect, text(ctx, "error"))) {
+                    deref c.follow = false;
+                    deref c.redirect_error = true;
+                } else if (!equal(ctx, redirect, text(ctx, "follow"))) {
+                    fail(ctx, ex, 1, "invalid redirect mode");
+                }
+            }
+            add_headers(ctx, c, get(ctx, options, "headers", ex), ex);
+            var ca: ptr<u8> = get(ctx, options, "caFile", ex);
+            if (kind(ctx, ca) != 0) {
+                var path: array<u8, 16385>;
+                if (copy_host_path(ctx, ca, &path[0], 16385, ex) >= 0) {
+                    option_ptr(ctx, c, 10065, &path[0], ex);
+                }
+            }
+        }
+    }
+    option_ptr(ctx, c, 10002, deref c.url, ex);
+    option_ptr(ctx, c, 10036, deref c.verb, ex);
+    option_long(ctx, c, 99, 1, ex);
+    option_long(ctx, c, 64, 1, ex);
+    option_long(ctx, c, 81, 2, ex);
+    option_ptr(ctx, c, 10318, "http,https" as ptr<u8>, ex);
+    var redirect_protocols: str = "http,https";
+    if ((deref c.url)[4] == 115) {
+        redirect_protocols = "https";
+    }
+    option_ptr(ctx, c, 10319, redirect_protocols as ptr<u8>, ex);
+    option_ptr(ctx, c, 10004, "" as ptr<u8>, ex);
+    var follow: i64 = 0;
+    if (deref c.follow) {
+        follow = 2;
+    }
+    option_long(ctx, c, 52, follow, ex);
+    option_long(ctx, c, 68, 10, ex);
+    option_ptr(ctx, c, 20011, native_callback(0), ex);
+    option_ptr(ctx, c, 10001, c as ptr<u8>, ex);
+    option_ptr(ctx, c, 20079, native_callback(1), ex);
+    option_ptr(ctx, c, 10029, c as ptr<u8>, ex);
+    option_ptr(ctx, c, 10023, deref c.headers, ex);
+    if (mem_eq_cstr(deref c.verb as str, "HEAD")) {
+        option_long(ctx, c, 44, 1, ex);
+    }
+    if (deref ex != null) {
+        dispose(ctx, c);
+        return null;
+    }
+    return c;
+}
+
+fun append_upload(ctx: ptr<u8>, c: ptr<Client>, chunk: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (deref c.upload == null) {
+        deref c.upload = mem_alloc(BUFFER_LIMIT + 1);
+        if (deref c.upload == null) {
+            fail(ctx, ex, 2, "cannot allocate request body");
+            return;
+        }
+    }
+    var n: i64 = copy_byte_view(ctx, chunk, deref c.upload + deref c.upload_length, BUFFER_LIMIT - deref c.upload_length,
+        ex);
+    if (n >= 0) {
+        deref c.upload_length += n;
+    }
+}
+
+fun start(ctx: ptr<u8>, c: ptr<Client>, ex: ptr<ptr<u8>>) {
+    var host_state: ptr<HttpClientState> = http_client_storage(ctx);
+    if (deref c.started || deref c.aborted) {
+        return;
+    }
+    if (deref c.streaming) {
+        // Unknown-size uploads otherwise add Expect: 100-continue; the server
+        // currently rejects Expect, so do not introduce that exchange implicitly.
+        var headers: ptr<u8> = header_append(deref c.headers, "Expect:");
+        if (headers == null) {
+            fail(ctx, ex, 2, "cannot allocate upload headers");
+        } else {
+            deref c.headers = headers;
+            option_ptr(ctx, c, 10023, headers, ex);
+        }
+        option_long(ctx, c, 46, 1, ex);
+        option_long(ctx, c, 14, -1, ex);
+        option_ptr(ctx, c, 20012, native_callback(2), ex);
+        option_ptr(ctx, c, 10009, c as ptr<u8>, ex);
+    } else if (deref c.upload != null) {
+        option_ptr(ctx, c, 10015, deref c.upload, ex);
+        option_long(ctx, c, 60, deref c.upload_length, ex);
+    }
+    if (deref ex == null && multi_add((deref host_state.multi), deref c.easy) == 0) {
+        deref c.started = true;
+    } else {
+        fail(ctx, ex, 0, "cannot start HTTP transfer");
+    }
+}
+
+fun attach_signal(ctx: ptr<u8>, c: ptr<Client>, ex: ptr<ptr<u8>>) {
+    var host_state: ptr<HttpClientState> = http_client_storage(ctx);
+    if (deref c.signal == null || deref ex != null) {
+        return;
+    }
+    deref c.abort_record = plain(ctx);
+    protect(ctx, deref c.abort_record);
+    deref c.abort_hook = bind_one(ctx, (deref host_state.methods)[11], null, deref c.abort_record, ex);
+    protect(ctx, deref c.abort_hook);
+    subscribe_abort(ctx, deref c.signal, deref c.abort_hook, ex);
+}
+
+fun request_stream(ctx: ptr<u8>, c: ptr<Client>, internal: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<HttpClientState> = http_client_storage(ctx);
+    var result: ptr<u8> = create_stream(ctx, 2, ex);
+    deref c.request = result;
+    protect(ctx, result);
+    // Request write completion starts transport; the native client owns close.
+    var state: ptr<u8> = stream_state(ctx, result, 2, ex);
+    put(ctx, state, "autoDestroy", boolean(ctx, false), ex);
+    define(ctx, result, "_write", (deref host_state.methods)[5], ex, false);
+    define(ctx, result, "_final", (deref host_state.methods)[6], ex, false);
+    define(ctx, result, "_destroy", (deref host_state.methods)[7], ex, false);
+    if (internal) {
+        add_listener(ctx, result, text(ctx, "error"), (deref host_state.methods)[10], false, false, ex);
+    }
+    return result;
+}
+
+export(c) fun jsrt_client_abort(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<HttpClientState> = http_client_storage(ctx);
+    if (equal(ctx, fn, (deref host_state.methods)[12])) {
+        var c: ptr<Client> = find(receiver);
+        if (c != null && count > 1 && kind(ctx, args[1]) != 0 && !deref c.aborted) {
+            deref c.abort_reason = args[1];
+            protect(ctx, deref c.abort_reason);
+            deref c.aborted = true;
+        }
+        return undefined(ctx);
+    }
+    if (count == 0) {
+        return undefined(ctx);
+    }
+    for (var i: i64 = 0; (deref host_state.clients) != null && i < CLIENT_LIMIT; i++) {
+        var c: ptr<Client> = (deref host_state.clients) + i;
+        if (deref c.active && deref c.abort_record == args[0] && !deref c.aborted) {
+            deref c.abort_reason = signal_reason(ctx, deref c.signal, ex);
+            protect(ctx, deref c.abort_reason);
+            deref c.aborted = true;
+            break;
+        }
+    }
+    return undefined(ctx);
+}
+
+fun singleton_response_header(name: str) -> bool {
+    var names: array<str, 17> = ["age", "authorization", "content-length", "content-type", "etag",
+        "expires", "from", "host", "if-modified-since", "if-unmodified-since", "last-modified",
+        "location", "max-forwards", "proxy-authorization", "referer", "retry-after", "user-agent"];
+    for (var i: i64 = 0; i < 17; i++) {
+        if (mem_eq_cstr(name, names[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fun append_node_response_header(ctx: ptr<u8>, headers: ptr<u8>, name: str, value: ptr<u8>,
+    ex: ptr<ptr<u8>>) {
+    var previous: ptr<u8> = get(ctx, headers, name, ex);
+    if (deref ex != null) {
+        return;
+    }
+    if (mem_eq_cstr(name, "set-cookie")) {
+        if (kind(ctx, previous) == 0) {
+            previous = array(ctx, 0, null, ex);
+            put(ctx, headers, name, previous, ex);
+        }
+        append(ctx, previous, value, ex);
+    } else if (kind(ctx, previous) == 0) {
+        put(ctx, headers, name, value, ex);
+    } else if (!singleton_response_header(name)) {
+        var separator: u16 = 44;
+        if (mem_eq_cstr(name, "cookie")) {
+            separator = 59;
+        }
+        put(ctx, headers, name, join_header_values(ctx, previous, value, separator, ex), ex);
+    }
+}
+
+fun response_headers(ctx: ptr<u8>, c: ptr<Client>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var result: ptr<u8> = plain(ctx);
+    protect(ctx, result);
+    var web: ptr<u8> = create_headers(ctx, undefined(ctx), false, ex);
+    protect(ctx, web);
+    var bytes: ptr<u8> = deref c.head;
+    var size: i64 = deref c.head_length;
+    var at: i64 = 0;
+    while (at + 1 < size && !(bytes[at] == 13 && bytes[at + 1] == 10)) {
+        at += 1;
+    }
+    at += 2;
+    while (at + 1 < size && bytes[at] != 13 && deref ex == null) {
+        var start: i64 = at;
+        while (at < size && bytes[at] != 58 && bytes[at] != 13) {
+            if (bytes[at] >= 65 && bytes[at] <= 90) {
+                bytes[at] += 32;
+            }
+            at += 1;
+        }
+        if (at >= size || bytes[at] != 58) {
+            break;
+        }
+        var separator: i64 = at;
+        bytes[separator] = 0;
+        at += 1;
+        while (at < size && (bytes[at] == 32 || bytes[at] == 9)) {
+            at += 1;
+        }
+        var value: i64 = at;
+        while (at + 1 < size && !(bytes[at] == 13 && bytes[at + 1] == 10)) {
+            at += 1;
+        }
+        var end: i64 = at;
+        while (end > value && (bytes[end - 1] == 32 || bytes[end - 1] == 9)) {
+            end -= 1;
+        }
+        var name: ptr<u8> = text(ctx, (bytes + start) as str);
+        protect(ctx, name);
+        var item: ptr<u8> = http_latin1(ctx, bytes + value, end - value);
+        protect(ctx, item);
+        append_response_header(ctx, web, name, item, ex);
+        if (deref c.resolve == null && deref ex == null) {
+            append_node_response_header(ctx, result, (bytes + start) as str, item, ex);
+        }
+        unprotect(ctx, item);
+        unprotect(ctx, name);
+        at += 2;
+    }
+    var returned: ptr<u8> = result;
+    if (deref c.resolve != null) {
+        returned = web;
+    }
+    unprotect(ctx, web);
+    unprotect(ctx, result);
+    return returned;
+}
+
+fun make_response(ctx: ptr<u8>, c: ptr<Client>, ex: ptr<ptr<u8>>) {
+    var host_state: ptr<HttpClientState> = http_client_storage(ctx);
+    var header_failure: ptr<u8> = null;
+    var headers: ptr<u8> = response_headers(ctx, c, &header_failure);
+    protect(ctx, headers);
+    if (header_failure != null) {
+        // Invalid or oversized remote headers fail this transfer, not the loop.
+        protect(ctx, header_failure);
+        var args: array<ptr<u8>, 1> = [header_failure];
+        if (deref c.reject != null && !deref c.settled) {
+            deref c.settled = true;
+            call(ctx, deref c.reject, null, 1, &args[0], ex);
+        } else if (deref c.request != null) {
+            stream_invoke(ctx, deref c.request, 6, 1, &args[0], ex);
+        }
+        dispose(ctx, c);
+        unprotect(ctx, header_failure);
+        unprotect(ctx, headers);
+        return;
+    }
+    deref c.body = create_stream(ctx, 1, ex);
+    protect(ctx, deref c.body);
+    define(ctx, deref c.body, "_destroy", (deref host_state.methods)[7], ex, false);
+    add_listener(ctx, deref c.body, text(ctx, "error"), (deref host_state.methods)[10], false, false,
+        ex);
+    if (deref c.resolve != null) {
+        var response: ptr<u8> = plain(ctx);
+        protect(ctx, response);
+        brand_response(ctx, response);
+        attach_body(ctx, response, deref c.body, ex);
+        define(ctx, response, "status", number(ctx, deref c.status as f64), ex, true);
+        define(ctx, response, "ok", boolean(ctx, deref c.status >= 200 && deref c.status < 300), ex,
+            true);
+        var url: ptr<u8> = get_ptr(deref c.easy, 1048577);
+        if (url == null) {
+            url = deref c.url;
+        }
+        define(ctx, response, "url", text(ctx, url as str), ex, true);
+        define(ctx, response, "redirected", boolean(ctx, get_long(deref c.easy, 2097172) > 0), ex, true);
+        define(ctx, response, "headers", headers, ex, true);
+        var args: array<ptr<u8>, 1> = [response];
+        deref c.settled = true;
+        call(ctx, deref c.resolve, null, 1, &args[0], ex);
+        unprotect(ctx, response);
+    } else {
+        define(ctx, deref c.body, "statusCode", number(ctx, deref c.status as f64), ex, true);
+        define(ctx, deref c.body, "headers", headers, ex, true);
+        var args: array<ptr<u8>, 1> = [deref c.body];
+        deref c.settled = true;
+        emit_named(ctx, deref c.request, "response", 1, &args[0], ex);
+    }
+    unprotect(ctx, headers);
+}
+
+export(c) fun jsrt_client_header_get(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<HttpClientState> = http_client_storage(ctx);
+    if (count == 0) {
+        fail(ctx, ex, 1, "header name required");
+        return undefined(ctx);
+    }
+    var name: array<u8, 8192>;
+    var n: i64 = encode_host_text(ctx, args[0], &name[0], 8192, ex);
+    for (var i: i64 = 0; i < n; i++) {
+        if (name[i] >= 65 && name[i] <= 90) {
+            name[i] += 32;
+        }
+    }
+    for (var i: i64 = 0; i < n; i++) {
+        if (!header_token(name[i])) {
+            fail(ctx, ex, 1, "invalid response header name");
+        }
+    }
+    if (n == 0 || kind(ctx, receiver) != 5) {
+        fail(ctx, ex, 1, "invalid Headers receiver/name");
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var headers: ptr<u8> = weak_get(ctx, (deref host_state.header_states), receiver, ex);
+    if (kind(ctx, headers) != 5) {
+        fail(ctx, ex, 1, "invalid Headers receiver");
+        return undefined(ctx);
+    }
+    var value: ptr<u8> = get(ctx, headers, &name[0] as str, ex);
+    if (equal(ctx, fn, (deref host_state.methods)[9])) {
+        return boolean(ctx, kind(ctx, value) != 0);
+    }
+    if (kind(ctx, value) == 0) {
+        return js_null(ctx);
+    }
+    return value;
+}
+
+export(c) fun jsrt_client_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<HttpClientState> = http_client_storage(ctx);
+    var fetch_mode: bool = equal(ctx, fn, (deref host_state.methods)[0]);
+    var tls: bool = equal(ctx, fn, (deref host_state.methods)[3]) || equal(ctx, fn, (deref host_state.methods)[4]);
+    var automatic: bool = equal(ctx, fn, (deref host_state.methods)[2]) || equal(ctx, fn, (deref host_state.methods)[4]);
+    var resolve: ptr<u8> = null;
+    var reject: ptr<u8> = null;
+    var result: ptr<u8> = undefined(ctx);
+    if (fetch_mode) {
+        result = promise(ctx, &resolve, &reject, ex);
+        protect(ctx, result);
+        protect(ctx, resolve);
+        protect(ctx, reject);
+    }
+    var options: ptr<u8> = undefined(ctx);
+    var listener: ptr<u8> = undefined(ctx);
+    var problem: ptr<u8> = null;
+    if (count > 1) {
+        options = args[1];
+        if (!fetch_mode && kind(ctx, options) == 5 && callable(ctx, options)) {
+            listener = options;
+            options = undefined(ctx);
+        }
+    }
+    if (!fetch_mode && count > 2) {
+        listener = args[2];
+    }
+    if (!fetch_mode && kind(ctx, listener) != 0 && (kind(ctx, listener) != 5 || !callable(ctx, listener))) {
+        fail(ctx, &problem, 1, "response callback must be a function");
+    }
+    var c: ptr<Client> = null;
+    protect(ctx, options);
+    if (count == 0) {
+        fail(ctx, &problem, 1, "request requires an HTTP/HTTPS URL");
+    } else if (problem == null) {
+        c = new_client(ctx, args[0], &options, fetch_mode, tls, &problem);
+    }
+    if (c != null) {
+        if (fetch_mode) {
+            deref c.resolve = resolve;
+            deref c.reject = reject;
+            protect(ctx, resolve);
+            protect(ctx, reject);
+            var source: ptr<u8> = undefined(ctx);
+            if (kind(ctx, options) == 5) {
+                var body: ptr<u8> = get(ctx, options, "body", &problem);
+                if (kind(ctx, body) != 0 && kind(ctx, body) != 1) {
+                    if (mem_eq_cstr(deref c.verb as str, "GET") || mem_eq_cstr(deref c.verb as str, "HEAD")) {
+                        fail(ctx, &problem, 1, "GET/HEAD fetch cannot have a body");
+                    } else if (is_stream(ctx, body, &problem) || is_web_readable(ctx, body, &problem)) {
+                        source = body;
+                        protect(ctx, source);
+                    } else {
+                        var chunk: ptr<u8> = web_body_bytes(ctx, body, &problem);
+                        protect(ctx, chunk);
+                        if (problem == null) {
+                            append_upload(ctx, c, chunk, &problem);
+                            default_body_header(ctx, c, body, &problem);
+                        }
+                        unprotect(ctx, chunk);
+                    }
+                }
+            }
+            attach_signal(ctx, c, &problem);
+            if (kind(ctx, source) == 5) {
+                if (problem == null && !deref c.aborted) {
+                    if (is_web_readable(ctx, source, &problem)) {
+                        var adapted: ptr<u8> = from_web(ctx, source, undefined(ctx), &problem);
+                        protect(ctx, adapted);
+                        unprotect(ctx, source);
+                        source = adapted;
+                    }
+                }
+                if (problem == null && !deref c.aborted) {
+                    request_stream(ctx, c, true, &problem);
+                    deref c.streaming = true;
+                    var pair: array<ptr<u8>, 2> = [source, deref c.request];
+                    var completion: ptr<u8> = bind_one(ctx, (deref host_state.methods)[12], deref c.request,
+                        undefined(ctx), &problem);
+                    protect(ctx, completion);
+                    pipeline(ctx, 2, &pair[0], completion, &problem);
+                    unprotect(ctx, completion);
+                }
+                unprotect(ctx, source);
+            } else if (problem == null) {
+                start(ctx, c, &problem);
+            }
+        } else {
+            result = request_stream(ctx, c, false, &problem);
+            if (kind(ctx, listener) == 5) {
+                add_listener(ctx, result, text(ctx, "response"), listener, false, false, &problem);
+            }
+            attach_signal(ctx, c, &problem);
+            if (automatic && problem == null) {
+                stream_invoke(ctx, result, 5, 0, null, &problem);
+            }
+        }
+    }
+    if (problem != null) {
+        protect(ctx, problem);
+        if (c != null) {
+            dispose(ctx, c);
+        }
+        if (fetch_mode) {
+            var rejected: array<ptr<u8>, 1> = [problem];
+            call(ctx, reject, null, 1, &rejected[0], ex);
+        } else {
+            deref ex = problem;
+        }
+        unprotect(ctx, problem);
+    }
+    unprotect(ctx, options);
+    if (fetch_mode) {
+        unprotect(ctx, reject);
+        unprotect(ctx, resolve);
+        unprotect(ctx, result);
+    }
+    return result;
+}
+
+export(c) fun jsrt_client_hook(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<HttpClientState> = http_client_storage(ctx);
+    if (equal(ctx, fn, (deref host_state.methods)[10])) {
+        return undefined(ctx);
+    }
+    var required: i64 = 1;
+    if (equal(ctx, fn, (deref host_state.methods)[5])) {
+        required = 3;
+    } else if (equal(ctx, fn, (deref host_state.methods)[7])) {
+        required = 2;
+    }
+    if (count < required || kind(ctx, args[required - 1]) != 5 || !callable(ctx, args[required - 1])) {
+        fail(ctx, ex, 1, "request hook callback required");
+        return undefined(ctx);
+    }
+    var c: ptr<Client> = find(receiver);
+    if (equal(ctx, fn, (deref host_state.methods)[7])) {
+        if (c != null) {
+            var first: bool = !deref c.cancelled;
+            deref c.cancelled = true;
+            if (first && deref c.request == receiver && deref c.body != null) {
+                stream_invoke(ctx, deref c.body, 6, 1, args, ex);
+            }
+        }
+        call(ctx, args[1], receiver, 0, null, ex);
+        return undefined(ctx);
+    }
+    if (c == null) {
+        fail(ctx, ex, 0, "HTTP request is closed");
+        return undefined(ctx);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[5])) {
+        if (deref c.upload_done != null || deref c.upload_eof || (deref c.started && !deref c.streaming)) {
+            fail(ctx, ex, 0, "request upload is busy or ended");
+            return undefined(ctx);
+        }
+        deref c.streaming = true;
+        deref c.upload_length = 0;
+        deref c.upload_offset = 0;
+        append_upload(ctx, c, args[0], ex);
+        if (deref ex == null) {
+            deref c.upload_done = args[2];
+            protect(ctx, deref c.upload_done);
+            start(ctx, c, ex);
+        }
+    } else {
+        deref c.upload_eof = true;
+        start(ctx, c, ex);
+        if (deref ex == null) {
+            call(ctx, args[0], receiver, 0, null, ex);
+        }
+    }
+    return undefined(ctx);
+}
+
+pub fun clients_pending() -> bool {
+    var host_state: ptr<HttpClientState> = http_client_storage(active_context());
+    for (var i: i64 = 0; (deref host_state.clients) != null && i < CLIENT_LIMIT; i++) {
+        var c: ptr<Client> = (deref host_state.clients) + i;
+        if (deref c.active && deref c.started) {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fun poll_clients(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> i32 {
+    var host_state: ptr<HttpClientState> = http_client_storage(ctx);
+    if ((deref host_state.multi) == null) {
+        return 0;
+    }
+    var running: i32 = 0;
+    var changed: bool = false;
+    for (var i: i64 = 0; (deref host_state.clients) != null && i < CLIENT_LIMIT && deref ex == null; i++) {
+        var c: ptr<Client> = (deref host_state.clients) + i;
+        if (!deref c.active) {
+            continue;
+        }
+        if (deref c.aborted) {
+            var args: array<ptr<u8>, 1> = [deref c.abort_reason];
+            if (deref c.reject != null && !deref c.settled) {
+                deref c.settled = true;
+                call(ctx, deref c.reject, null, 1, &args[0], ex);
+            }
+            if (deref c.body != null) {
+                stream_invoke(ctx, deref c.body, 6, 1, &args[0], ex);
+            }
+            if (deref c.request != null) {
+                var error: ptr<u8> = abort_error(ctx, false);
+                protect(ctx, error);
+                define(ctx, error, "cause", deref c.abort_reason, ex, false);
+                var request_args: array<ptr<u8>, 1> = [error];
+                stream_invoke(ctx, deref c.request, 6, 1, &request_args[0], ex);
+                unprotect(ctx, error);
+            }
+            dispose(ctx, c);
+            changed = true;
+            continue;
+        }
+        if (deref c.cancelled) {
+            dispose(ctx, c);
+            changed = true;
+            continue;
+        }
+        if (deref c.upload_paused && (deref c.upload_length > deref c.upload_offset || deref c.upload_eof)) {
+            deref c.upload_paused = false;
+            var pause_flags: i32 = 0;
+            if (deref c.paused) {
+                pause_flags = 1;
+            }
+            easy_pause(deref c.easy, pause_flags);
+            changed = true;
+        }
+    }
+    if (deref ex != null) {
+        return -1;
+    }
+    if (multi_perform((deref host_state.multi), &running) != 0) {
+        fail(ctx, ex, 0, "libcurl multi failure");
+        return -1;
+    }
+    while (true) {
+        var status: i32 = 0;
+        var easy: ptr<u8> = message((deref host_state.multi), &status);
+        if (easy == null) {
+            break;
+        }
+        for (var i: i64 = 0; i < CLIENT_LIMIT; i++) {
+            var c: ptr<Client> = (deref host_state.clients) + i;
+            if (deref c.active && deref c.easy == easy) {
+                deref c.done = true;
+                deref c.result = status;
+                break;
+            }
+        }
+    }
+    for (var i: i64 = 0; i < CLIENT_LIMIT && deref ex == null; i++) {
+        var c: ptr<Client> = (deref host_state.clients) + i;
+        if (!deref c.active || !deref c.started) {
+            if (deref c.active && deref c.cancelled) {
+                dispose(ctx, c);
+            }
+            continue;
+        }
+        if (deref c.cancelled) {
+            dispose(ctx, c);
+            changed = true;
+            continue;
+        }
+        if (deref c.upload_done != null && deref c.upload_offset == deref c.upload_length && !deref c.done) {
+            var done: ptr<u8> = deref c.upload_done;
+            deref c.upload_done = null;
+            call(ctx, done, deref c.request, 0, null, ex);
+            unprotect(ctx, done);
+            changed = true;
+        }
+        if (deref ex != null || deref c.cancelled || deref c.aborted) {
+            continue;
+        }
+        if (deref c.done && deref c.streaming && !deref c.upload_eof && deref c.result == 0) {
+            deref c.result = 26;
+        }
+        if (deref c.redirect_error && deref c.status >= 300 && deref c.status < 400 && deref c.ready) {
+            deref c.done = true;
+            deref c.result = 47;
+        }
+        if (deref c.done && deref c.result != 0) {
+            var problem: ptr<u8> = null;
+            fail(ctx, &problem, 0, curl_error(deref c.result));
+            protect(ctx, problem);
+            var code: str = "ERR_HTTP_CLIENT";
+            if (deref c.result == 28) {
+                code = "ETIMEDOUT";
+            }
+            define(ctx, problem, "code", text(ctx, code), ex, true);
+            define(ctx, problem, "curlCode", number(ctx, deref c.result as f64), ex, true);
+            var args: array<ptr<u8>, 1> = [problem];
+            if (deref c.resolve != null && !deref c.settled) {
+                call(ctx, deref c.reject, null, 1, &args[0], ex);
+            }
+            if (deref c.body != null) {
+                stream_invoke(ctx, deref c.body, 6, 1, &args[0], ex);
+            }
+            if (deref c.request != null) {
+                stream_invoke(ctx, deref c.request, 6, 1, &args[0], ex);
+            }
+            unprotect(ctx, problem);
+            dispose(ctx, c);
+            changed = true;
+            continue;
+        }
+        if ((deref c.ready || deref c.done) && !deref c.settled) {
+            make_response(ctx, c, ex);
+            changed = true;
+        }
+        if (deref c.cancelled || deref c.aborted || deref ex != null) {
+            continue;
+        }
+        if (deref c.body != null) {
+            var state: ptr<u8> = stream_state(ctx, deref c.body, 1, ex);
+            if (deref c.pending_length > 0 && integer(ctx, state, "rbytes", ex) < integer(ctx, state,
+                "high", ex)) {
+                var chunk: ptr<u8> = buffer_from_bytes(ctx, deref c.pending, deref c.pending_length,
+                    ex);
+                protect(ctx, chunk);
+                deref c.pending_length = 0;
+                var args: array<ptr<u8>, 1> = [chunk];
+                stream_invoke(ctx, deref c.body, 0, 1, &args[0], ex);
+                unprotect(ctx, chunk);
+                changed = true;
+            }
+            if (deref c.cancelled || deref c.aborted || deref ex != null) {
+                continue;
+            }
+            if (deref c.paused && integer(ctx, state, "rbytes", ex) < integer(ctx, state, "high", ex) && deref c.pending_length == 0) {
+                deref c.paused = false;
+                var pause_flags: i32 = 0;
+                if (deref c.upload_paused) {
+                    pause_flags = 4;
+                }
+                easy_pause(deref c.easy, pause_flags);
+                changed = true;
+            }
+            if (deref c.done && deref c.pending_length == 0) {
+                var args: array<ptr<u8>, 1> = [js_null(ctx)];
+                stream_invoke(ctx, deref c.body, 0, 1, &args[0], ex);
+                dispose(ctx, c);
+                changed = true;
+            }
+        }
+    }
+    if (deref ex != null) {
+        return -1;
+    }
+    if (changed) {
+        return 1;
+    }
+    return 0;
+}
+
+pub fun wait_clients(ctx: ptr<u8>, timeout: i32) -> bool {
+    var host_state: ptr<HttpClientState> = http_client_storage(ctx);
+    if (async_pending(ctx) > 0 && file_completions_ready(ctx)) {
+        return true;
+    }
+    var millis: i32 = timeout;
+    if (millis < 0) {
+        millis = 1000;
+    }
+    var next: i32 = network_timeout();
+    if (next >= 0 && next < millis) {
+        millis = next;
+    }
+    var fd: i32 = -1;
+    if (async_pending(ctx) > 0) {
+        fd = file_completion_fd(ctx) as i32;
+    }
+    return poll((deref host_state.multi), network_fd(), fd, millis) == 0;
+}
+
+pub fun install_client(ctx: ptr<u8>, http: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var host_state: ptr<HttpClientState> = http_client_storage(ctx);
+    if (curl_init(3) != 0) {
+        return false;
+    }
+    (deref host_state.initialized) = true;
+    if (curl_version_number() < 527616) {
+        fail(ctx, ex, 0, "libcurl 8.13.0 or newer is required");
+        return false;
+    }
+    if ((curl_features() & 128) == 0) {
+        fail(ctx, ex, 0, "libcurl requires an asynchronous DNS resolver");
+        return false;
+    }
+    if ((curl_features() & 4) == 0) {
+        fail(ctx, ex, 0, "libcurl requires a TLS backend");
+        return false;
+    }
+    (deref host_state.multi) = multi_init();
+    (deref host_state.clients) = mem_alloc_zeroed(CLIENT_LIMIT * (size_of<Client>() as i64)) as ptr<Client>;
+    if ((deref host_state.multi) == null || (deref host_state.clients) == null) {
+        return false;
+    }
+    (deref host_state.object_keys) = capture(ctx, get(ctx, global(ctx), "Object", ex), "keys", ex);
+    (deref host_state.header_states) = weak_map(ctx, ex);
+    protect(ctx, (deref host_state.header_states));
+    var names: array<str, 13> = ["fetch", "request", "get", "request", "get", "writeRequest", "finishRequest",
+        "destroyRequest", "get", "has", "ignoreBodyError", "abortTransfer", "uploadComplete"];
+    for (var i: i64 = 0; i < 13; i++) {
+        var name: ptr<u8> = utf8(names[i]);
+        (deref host_state.methods)[i] = function(ctx, name, callback(i as i32));
+        release(name);
+        protect(ctx, (deref host_state.methods)[i]);
+    }
+    define(ctx, global(ctx), "fetch", (deref host_state.methods)[0], ex, false);
+    define(ctx, http, "request", (deref host_state.methods)[1], ex, false);
+    define(ctx, http, "get", (deref host_state.methods)[2], ex, false);
+    (deref host_state.https_exports) = plain(ctx);
+    protect(ctx, (deref host_state.https_exports));
+    define(ctx, (deref host_state.https_exports), "request", (deref host_state.methods)[3], ex, false);
+    define(ctx, (deref host_state.https_exports), "get", (deref host_state.methods)[4], ex, false);
+    return deref ex == null;
+}
+
+pub fun https_module() -> ptr<u8> {
+    var host_state: ptr<HttpClientState> = http_client_storage(active_context());
+    return(deref host_state.https_exports);
+}
+
+pub fun shutdown_client(ctx: ptr<u8>) {
+    var host_state: ptr<HttpClientState> = http_client_storage(ctx);
+    if ((deref host_state.clients) != null) {
+        for (var i: i64 = 0; i < CLIENT_LIMIT; i++) {
+            var c: ptr<Client> = (deref host_state.clients) + i;
+            if (deref c.active) {
+                dispose(ctx, c);
+            }
+        }
+        mem_free((deref host_state.clients) as ptr<u8>, CLIENT_LIMIT * (size_of<Client>() as i64));
+        (deref host_state.clients) = null;
+    }
+    if ((deref host_state.multi) != null) {
+        multi_cleanup((deref host_state.multi));
+        (deref host_state.multi) = null;
+    }
+    if ((deref host_state.initialized)) {
+        curl_cleanup();
+        (deref host_state.initialized) = false;
+    }
+    if ((deref host_state.object_keys) != null) {
+        unprotect(ctx, (deref host_state.object_keys));
+        (deref host_state.object_keys) = null;
+    }
+    if ((deref host_state.https_exports) != null) {
+        unprotect(ctx, (deref host_state.https_exports));
+        (deref host_state.https_exports) = null;
+    }
+    if ((deref host_state.header_states) != null) {
+        unprotect(ctx, (deref host_state.header_states));
+        (deref host_state.header_states) = null;
+    }
+    for (var i: i64 = 0; i < 13; i++) {
+        if ((deref host_state.methods)[i] != null) {
+            unprotect(ctx, (deref host_state.methods)[i]);
+            (deref host_state.methods)[i] = null;
+        }
+    }
+}
+
+fun default_body_header(ctx: ptr<u8>, c: ptr<Client>, body: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (deref ex != null || deref c.content_type_set) {
+        return;
+    }
+    var mime: ptr<u8> = web_body_type(ctx, body, ex);
+    if (mime == null || deref ex != null || equal(ctx, mime, text(ctx, ""))) {
+        return;
+    }
+    protect(ctx, mime);
+    var line: array<u8, 16385>;
+    var prefix: str = "content-type: ";
+    var start: i64 = mem_len_cstr(prefix);
+    mem_copy(&line[0], prefix as ptr<u8>, start);
+    var n: i64 = encode_host_text(ctx, mime, &line[start], 16385 - start, ex);
+    if (deref ex == null && (deref c.request_header_count >= HTTP_HEADER_COUNT ||
+        n + start + 2 > HTTP_HEADER_LIMIT - deref c.request_header_bytes)) {
+        fail(ctx, ex, 2, "request header limit exceeded by body content type");
+    }
+    if (deref ex == null) {
+        var updated: ptr<u8> = header_append(deref c.headers, &line[0] as str);
+        if (updated == null) {
+            fail(ctx, ex, 2, "cannot allocate body content type header");
+        } else {
+            deref c.headers = updated;
+            deref c.request_header_count += 1;
+            deref c.request_header_bytes += n + start + 2;
+            deref c.content_type_set = true;
+            option_ptr(ctx, c, 10023, updated, ex);
+        }
+    }
+    unprotect(ctx, mime);
+}

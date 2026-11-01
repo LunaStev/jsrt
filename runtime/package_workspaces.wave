@@ -1,0 +1,465 @@
+// Local workspaces are immutable managed snapshots, never symlinks into user trees.
+import("./package_transaction")::{project_fd};
+import("./package_io")::{Blob, package_path, package_fail, integrity, free_blob, ensure_directory, create_file,
+    account_workspace_bytes};
+import("./package_graph")::{valid_name};
+import("./package_version")::{Version, parse_version};
+import("./package_semver")::{satisfies, valid_range};
+import("./config")::{PACKAGE_COUNT_LIMIT, PACKAGE_ENTRY_LIMIT, PACKAGE_DEPTH_LIMIT, PACKAGE_ARCHIVE_LIMIT,
+    PACKAGE_EXTRACT_LIMIT, FILE_LIMIT};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::ops")::{mem_copy};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("std::sys::fs")::{Stat, fstat};
+import("std::io::fd")::{io_close, io_read, io_write_all};
+import("wjson")::{Json, JsonDoc, JsonWriter, json_parse_bytes, json_ok, json_root, json_free, json_get,
+    json_as_str, json_null_str, json_is_valid, json_is_array, json_is_string, json_str_has_nul, json_len, json_at,
+    json_writer_new, json_writer_free, json_writer_finish, json_writer_len, json_begin_array,
+    json_end_array, json_write_str, JSON_STRICT};
+extern(c, "openat") fun open_at(fd: i32, path: str, flags: i32, mode: i32) -> i32;
+extern(c, "fdopendir") fun directory_open(fd: i32) -> ptr<u8>;
+extern(c, "closedir") fun directory_close(directory: ptr<u8>) -> i32;
+extern(c, "jsrt_directory_next") fun directory_next(directory: ptr<u8>, name: ptr<u8>, capacity: i64) -> i32;
+const DIR_FLAGS: i32 = 720896;
+const READ_FLAGS: i32 = 657408;
+pub struct Workspace {
+    path: str;
+    doc: JsonDoc;
+    manifest_bytes: Blob;
+    manifest: Json;
+    name: str;
+    version: str;
+    source: str;
+    fingerprint: array<u8, 96>;
+    fd: i32;
+}
+static entries: array<Workspace, 256>;
+static count: i64 = 0;
+static scanned: i64 = 0;
+static copied_bytes: i64 = 0;
+
+fun copy_string(value: str) -> str {
+    var n: i64 = mem_len_cstr(value);
+    var result: ptr<u8> = mem_alloc(n + 1);
+    if (result != null) {
+        mem_copy(result, value as ptr<u8>, n + 1);
+    }
+    return result as str;
+}
+fun drop_string(value: str) {
+    if ((value as ptr<u8>) != null) {
+        mem_free(value as ptr<u8>, mem_len_cstr(value) + 1);
+    }
+}
+fun checked_string(value: Json) -> str {
+    if (!json_is_string(value) || json_str_has_nul(value)) {
+        return json_null_str();
+    }
+    return json_as_str(value);
+}
+fun ignored(name: str) -> bool {
+    return mem_eq_cstr(name, ".") || mem_eq_cstr(name, "..") || mem_eq_cstr(name, ".git") ||
+        mem_eq_cstr(name, "node_modules") || mem_eq_cstr(name, ".jsrt-cache") ||
+        mem_eq_cstr(name, ".jsrt-transaction") || mem_eq_cstr(name, "jsrt.lock.wjson");
+}
+fun relative_path(path: str) -> bool {
+    if ((path as ptr<u8>) == null || path[0] == 0 || path[0] == 47) {
+        return false;
+    }
+    var begin: i64 = 0;
+    var n: i64 = mem_len_cstr(path);
+    if (n > 4095) {
+        return false;
+    }
+    for (var i: i64 = 0; i <= n; i++) {
+        if (path[i] == 42 || path[i] == 92) {
+            return false;
+        }
+        if (path[i] == 47 || path[i] == 0) {
+            if (i == begin || (i - begin == 1 && path[begin] == 46) ||
+                (i - begin == 2 && path[begin] == 46 && path[begin + 1] == 46)) {
+                return false;
+            }
+            begin = i + 1;
+        }
+    }
+    return true;
+}
+fun open_source(path: str) -> i32 {
+    if (!relative_path(path)) {
+        package_fail("workspace paths must remain inside the project without links or dot components");
+        return -1;
+    }
+    var fd: i32 = open_at(project_fd(), ".", DIR_FLAGS, 0);
+    var offset: i64 = 0;
+    while (fd >= 0 && path[offset] != 0) {
+        var component: array<u8, 4096>;
+        var n: i64 = 0;
+        while (path[offset] != 0 && path[offset] != 47) {
+            component[n] = path[offset];
+            n += 1;
+            offset += 1;
+        }
+        component[n] = 0;
+        var next: i32 = open_at(fd, &component[0] as str, DIR_FLAGS, 0);
+        io_close(fd as i64);
+        fd = next;
+        if (path[offset] == 47) {
+            offset += 1;
+        }
+    }
+    if (fd < 0) {
+        package_fail("cannot open workspace directory without following links");
+    }
+    return fd;
+}
+fun read_file(fd: i32, name: str, limit: i64) -> Blob {
+    var value: Blob = Blob {bytes: null, length: 0, capacity: limit + 1};
+    var file: i32 = open_at(fd, name, READ_FLAGS, 0);
+    var before: Stat;
+    if (file < 0 || fstat(file as i64, &before) < 0 || (before.mode & 61440) != 32768 ||
+        before.nlink != 1 || before.size < 0 || before.size > limit) {
+        if (file >= 0) {
+            io_close(file as i64);
+        }
+        package_fail("workspace input must be a bounded regular file with one link");
+        return value;
+    }
+    value.bytes = mem_alloc(value.capacity);
+    if (value.bytes == null) {
+        io_close(file as i64);
+        package_fail("cannot allocate workspace input");
+        return value;
+    }
+    var ok: bool = true;
+    while (value.length <= limit) {
+        var n: i64 = io_read(file as i64, value.bytes + value.length, value.capacity - value.length);
+        if (n < 0) {
+            ok = false;
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        value.length += n;
+    }
+    var after: Stat;
+    ok = ok && value.length <= limit && value.length == before.size &&
+        fstat(file as i64, &after) == 0 && after.dev == before.dev && after.ino == before.ino &&
+        after.size == before.size && after.mtime == before.mtime && after.mtime_nsec == before.mtime_nsec &&
+        after.nlink == 1;
+    io_close(file as i64);
+    if (!ok) {
+        free_blob(&value);
+        package_fail("workspace file changed while reading");
+    }
+    return value;
+}
+fun less(a: str, b: str) -> bool {
+    var i: i64 = 0;
+    while (a[i] == b[i] && a[i] != 0) {
+        i += 1;
+    }
+    return a[i] < b[i];
+}
+fun names(fd: i32, result: ptr<str>, total: ptr<i64>) -> bool {
+    deref total = 0;
+    var copy: i32 = open_at(fd, ".", DIR_FLAGS, 0);
+    if (copy < 0) {
+        return package_fail("cannot scan workspace directory");
+    }
+    var directory: ptr<u8> = directory_open(copy);
+    if (directory == null) {
+        io_close(copy as i64);
+        return package_fail("cannot scan workspace directory");
+    }
+    var ok: bool = true;
+    var name: array<u8, 256>;
+    while (ok) {
+        var status: i32 = directory_next(directory, &name[0], 256);
+        if (status == 0) {
+            break;
+        }
+        if (status < 0) {
+            ok = package_fail("cannot read workspace directory entry");
+            break;
+        }
+        if (ignored(&name[0] as str)) {
+            continue;
+        }
+        if (deref total >= PACKAGE_ENTRY_LIMIT || scanned >= PACKAGE_ENTRY_LIMIT) {
+            ok = package_fail("workspace entry budget exceeded");
+            break;
+        }
+        var entry: str = copy_string(&name[0] as str);
+        if ((entry as ptr<u8>) == null) {
+            ok = package_fail("cannot allocate workspace entry");
+            break;
+        }
+        result[deref total] = entry;
+        deref total += 1;
+        scanned += 1;
+    }
+    directory_close(directory);
+    var gap: i64 = deref total / 2;
+    while (gap > 0) {
+        for (var i: i64 = gap; i < deref total; i++) {
+            var entry: str = result[i];
+            var j: i64 = i;
+            while (j >= gap && less(entry, result[j - gap])) {
+                result[j] = result[j - gap];
+                j -= gap;
+            }
+            result[j] = entry;
+        }
+        gap /= 2;
+    }
+    return ok;
+}
+fun walk(fd: i32, prefix: str, destination: str, copying: bool, depth: i64, writer: ptr<JsonWriter>, manifest_hash: str) -> bool {
+    if (depth > PACKAGE_DEPTH_LIMIT) {
+        return package_fail("workspace directory depth exceeded");
+    }
+    var sorted: ptr<str> = mem_alloc(PACKAGE_ENTRY_LIMIT * 8) as ptr<str>;
+    if (sorted == null) {
+        return package_fail("cannot allocate workspace directory snapshot");
+    }
+    var total: i64 = 0;
+    var ok: bool = names(fd, sorted, &total);
+    for (var i: i64 = 0; i < total && ok; i++) {
+        var relative: array<u8, 8192>;
+        var target: array<u8, 8192>;
+        ok = package_path(&relative[0], prefix, sorted[i]);
+        if (copying) {
+            ok = ok && package_path(&target[0], destination, &relative[0] as str);
+        }
+        var child: i32 = -1;
+        if (ok) {
+            child = open_at(fd, sorted[i], DIR_FLAGS, 0);
+        }
+        if (child >= 0) {
+            ok = json_write_str(writer, "directory") && json_write_str(writer, &relative[0] as str);
+            if (copying) {
+                ok = ok && ensure_directory(&target[0] as str);
+            }
+            ok = ok && walk(child, &relative[0] as str, destination, copying, depth + 1, writer, manifest_hash);
+            io_close(child as i64);
+        } else if (ok) {
+            var bytes: Blob = read_file(fd, sorted[i], PACKAGE_ARCHIVE_LIMIT);
+            ok = bytes.bytes != null;
+            var hash: array<u8, 96>;
+            if (ok) {
+                if (bytes.length > PACKAGE_EXTRACT_LIMIT - copied_bytes) {
+                    ok = package_fail("workspace byte budget exceeded");
+                } else {
+                    copied_bytes += bytes.length;
+                    ok = integrity(bytes.bytes, bytes.length, &hash[0]) && json_write_str(writer, "file") &&
+                        json_write_str(writer, &relative[0] as str) && json_write_str(writer, &hash[0] as str);
+                }
+            }
+            if (ok && copying) {
+                ok = account_workspace_bytes(bytes.length);
+            }
+            if (ok && depth == 0 && mem_eq_cstr(sorted[i], "package.json") &&
+                !mem_eq_cstr(&hash[0] as str, manifest_hash)) {
+                ok = package_fail("workspace manifest changed after parsing");
+            }
+            if (ok && copying) {
+                var output: i32 = create_file(&target[0] as str);
+                ok = output >= 0;
+                if (output >= 0) {
+                    ok = io_write_all(output as i64, bytes.bytes, bytes.length) == bytes.length;
+                    io_close(output as i64);
+                }
+                if (!ok) {
+                    package_fail("cannot write workspace snapshot");
+                }
+            }
+            free_blob(&bytes);
+        }
+    }
+    for (var i: i64 = 0; i < total; i++) {
+        drop_string(sorted[i]);
+    }
+    mem_free(sorted as ptr<u8>, PACKAGE_ENTRY_LIMIT * 8);
+    return ok;
+}
+fun fingerprint(workspace: ptr<Workspace>, destination: str, copying: bool, output: ptr<u8>) -> bool {
+    scanned = 0;
+    copied_bytes = 0;
+    var writer: JsonWriter = json_writer_new(0);
+    var manifest_hash: array<u8, 96>;
+    var ok: bool = integrity(deref workspace.manifest_bytes.bytes, deref workspace.manifest_bytes.length, &manifest_hash[0]);
+    ok = ok && json_begin_array(&writer) && walk(deref workspace.fd, "", destination, copying, 0, &writer, &manifest_hash[0] as str) &&
+        json_end_array(&writer);
+    var source: str = json_null_str();
+    if (ok) {
+        source = json_writer_finish(&writer);
+        ok = (source as ptr<u8>) != null && json_writer_len(&writer) <= FILE_LIMIT;
+    }
+    if (ok) {
+        ok = integrity(source as ptr<u8>, json_writer_len(&writer), output);
+    }
+    json_writer_free(&writer);
+    return ok;
+}
+fun add_workspace(path: str) -> bool {
+    if (count >= PACKAGE_COUNT_LIMIT) {
+        return package_fail("workspace count exceeded");
+    }
+    var fd: i32 = open_source(path);
+    if (fd < 0) {
+        return false;
+    }
+    var bytes: Blob = read_file(fd, "package.json", FILE_LIMIT);
+    if (bytes.bytes == null) {
+        io_close(fd as i64);
+        return false;
+    }
+    var doc: JsonDoc = json_parse_bytes(bytes.bytes, bytes.length, 64, JSON_STRICT);
+    var manifest: Json = json_root(doc);
+    var name: str = checked_string(json_get(manifest, "name"));
+    var version: str = checked_string(json_get(manifest, "version"));
+    var valid_version: bool = false;
+    if ((version as ptr<u8>) != null) {
+        var parsed: Version = parse_version(version);
+        valid_version = parsed.valid;
+    }
+    var ok: bool = json_ok(doc) && valid_name(name) && valid_version && !json_is_valid(json_get(manifest, "workspaces"));
+    for (var i: i64 = 0; i < count && ok; i++) {
+        if (mem_eq_cstr(entries[i].name, name) || mem_eq_cstr(entries[i].path, path)) {
+            ok = false;
+        }
+    }
+    if (!ok) {
+        json_free(&doc);
+        free_blob(&bytes);
+        io_close(fd as i64);
+        return package_fail("workspace identities must be valid unique names and versions without nested workspaces");
+    }
+    var workspace: ptr<Workspace> = &entries[count];
+    deref workspace.fd = fd;
+    deref workspace.doc = doc;
+    deref workspace.manifest_bytes = bytes;
+    deref workspace.manifest = manifest;
+    deref workspace.name = name;
+    deref workspace.version = version;
+    deref workspace.path = copy_string(path);
+    var source: array<u8, 8192>;
+    source[0] = 0;
+    var n: i64 = mem_len_cstr(path);
+    mem_copy(&source[0], "workspace:" as ptr<u8>, 10);
+    mem_copy(&source[10], path as ptr<u8>, n + 1);
+    deref workspace.source = copy_string(&source[0] as str);
+    count += 1;
+    return (deref workspace.path as ptr<u8>) != null && (deref workspace.source as ptr<u8>) != null &&
+        fingerprint(workspace, "", false, &(deref workspace.fingerprint)[0]);
+}
+pub fun workspace_clear() {
+    while (count > 0) {
+        count -= 1;
+        var workspace: ptr<Workspace> = &entries[count];
+        io_close(deref workspace.fd as i64);
+        json_free(&(deref workspace.doc));
+        free_blob(&(deref workspace.manifest_bytes));
+        drop_string(deref workspace.path);
+        drop_string(deref workspace.source);
+    }
+}
+pub fun workspace_prepare(patterns: Json) -> bool {
+    workspace_clear();
+    if (!json_is_valid(patterns)) {
+        return true;
+    }
+    if (!json_is_array(patterns) || json_len(patterns) > PACKAGE_COUNT_LIMIT) {
+        return package_fail("workspaces must be a bounded Array of project-relative paths");
+    }
+    for (var i: i64 = 0; i < json_len(patterns); i++) {
+        var path: str = checked_string(json_at(patterns, i));
+        if ((path as ptr<u8>) == null) {
+            return package_fail("workspace paths must be strings without NUL");
+        }
+        var n: i64 = mem_len_cstr(path);
+        if (n > 2 && n < 4096 && path[n - 2] == 47 && path[n - 1] == 42) {
+            var parent: array<u8, 4096>;
+            mem_copy(&parent[0], path as ptr<u8>, n - 2);
+            parent[n - 2] = 0;
+            var fd: i32 = open_source(&parent[0] as str);
+            if (fd < 0) {
+                return false;
+            }
+            var sorted: ptr<str> = mem_alloc(PACKAGE_ENTRY_LIMIT * 8) as ptr<str>;
+            if (sorted == null) {
+                io_close(fd as i64);
+                return package_fail("cannot allocate workspace discovery snapshot");
+            }
+            scanned = 0;
+            var total: i64 = 0;
+            var ok: bool = names(fd, sorted, &total);
+            for (var j: i64 = 0; j < total && ok; j++) {
+                var child_path: array<u8, 8192>;
+                ok = package_path(&child_path[0], &parent[0] as str, sorted[j]) && add_workspace(&child_path[0] as str);
+            }
+            for (var j: i64 = 0; j < total; j++) {
+                drop_string(sorted[j]);
+            }
+            mem_free(sorted as ptr<u8>, PACKAGE_ENTRY_LIMIT * 8);
+            io_close(fd as i64);
+            if (!ok) {
+                return false;
+            }
+        } else if (!add_workspace(path)) {
+            return false;
+        }
+    }
+    return true;
+}
+pub fun workspace_count() -> i64 {
+    return count;
+}
+pub fun workspace_at(index: i64) -> ptr<Workspace> {
+    if (index < 0 || index >= count) {
+        return null;
+    }
+    return &entries[index];
+}
+pub fun workspace_find(name: str) -> ptr<Workspace> {
+    for (var i: i64 = 0; i < count; i++) {
+        if (mem_eq_cstr(entries[i].name, name)) {
+            return &entries[i];
+        }
+    }
+    return null;
+}
+pub fun workspace_range(name: str, requirement: str) -> bool {
+    if ((requirement as ptr<u8>) == null) {
+        return false;
+    }
+    var offset: i64 = 0;
+    var prefix: str = "workspace:";
+    while (offset < 10 && requirement[offset] == prefix[offset] && requirement[offset] != 0) {
+        offset += 1;
+    }
+    if (offset != 10) {
+        return valid_range(requirement);
+    }
+    var workspace: ptr<Workspace> = workspace_find(name);
+    if (workspace == null) {
+        return false;
+    }
+    var range: str = (requirement as ptr<u8> + 10) as str;
+    if (mem_eq_cstr(range, "*") || mem_eq_cstr(range, "^") || mem_eq_cstr(range, "~")) {
+        return true;
+    }
+    return valid_range(range) && satisfies(deref workspace.version, range);
+}
+pub fun workspace_matches(workspace: ptr<Workspace>, requirement: str) -> bool {
+    return workspace_range(deref workspace.name, requirement) &&
+        (requirement[0] == 119 || satisfies(deref workspace.version, requirement));
+}
+pub fun workspace_copy(workspace: ptr<Workspace>, location: str) -> bool {
+    var actual: array<u8, 96>;
+    return ensure_directory(location) && fingerprint(workspace, location, true, &actual[0]) &&
+        (mem_eq_cstr(&actual[0] as str, &(deref workspace.fingerprint)[0] as str) ||
+        package_fail("workspace changed between discovery and snapshot publication"));
+}

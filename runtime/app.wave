@@ -1,0 +1,27 @@
+// Application flow. Feature implementations are installed by host.wave.
+import("./cli")::{LaunchOptions, handle_cli, parse_launch};
+import("./engine")::{require_supported_engine};
+import("./session")::{execute};
+import("./resources")::{apply_memory_limit};
+import("./test_cli")::{run_tests};
+
+pub fun run() -> i32 {
+    var status: i32 = handle_cli();
+    if (status >= 0) {
+        return status;
+    }
+    if (status == -2) {
+        return run_tests();
+    }
+    if (!require_supported_engine()) {
+        return 70;
+    }
+    var options: LaunchOptions;
+    if (!parse_launch(&options)) {
+        return 2;
+    }
+    if (!apply_memory_limit(options.memory_bytes)) {
+        return 1;
+    }
+    return execute(options);
+}

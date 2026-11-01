@@ -1,0 +1,38 @@
+name: Sustained runtime stability
+on:
+  schedule:
+    - cron: '0 16 * * 6'
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Mixed-load duration in seconds
+        type: choice
+        default: '3600'
+        options: ['600', '3600', '86400']
+permissions:
+  contents: read
+concurrency:
+  group: jsrt-stability
+  cancel-in-progress: false
+jobs:
+  soak:
+    runs-on: [self-hosted, linux, x64, jsrt-wave-jsc]
+    timeout-minutes: 1500
+    env:
+      JSRT_JSC_LIBRARY: ${{ vars.JSRT_JSC_LIBRARY }}
+      JSRT_WAVEC: ${{ vars.JSRT_WAVEC || 'wavec' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Validate runtime before sustained load
+        run: ./bootstrap.sh test --require-tcp --probe-worker-termination
+      - name: Run independent I/O lanes, concurrent Workers and cancellation
+        run: ./bootstrap.sh soak --duration-seconds '${{ inputs.duration || '86400' }}' --report 'target/soak-${{ github.run_id }}.csv'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: jsrt-resource-series-${{ github.run_id }}
+          path: target/soak-*.csv
+          if-no-files-found: warn
+          retention-days: 30

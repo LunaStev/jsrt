@@ -1,0 +1,357 @@
+// Serialized sink operations and abort completion. Promise jobs remain JSC-owned.
+import("./web_stream_core")::{record, handle, capability, internal_capability, settle, resolved, rejected_type,
+    type_error, job, follow, initialize, field_number, queue_size, queue_entry, shift, WRITABLE, WRITER,
+    WRITE_CONTROLLER, OPEN, CLOSED, ERRORED, CLOSING, ERRORING, JOB_WRITE_START, JOB_WRITE,
+    JOB_WRITE_CLOSE, JOB_WRITE_ABORT};
+import("./values")::{get, put, plain, fail};
+import("./collections")::{list, length, at, integer, set_integer, flag, set_flag};
+import("./web_support")::{apply};
+import("./abort")::{fresh_signal, abort_signal};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+pub fun backpressure(ctx: ptr<u8>, r: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var writer: ptr<u8> = get(ctx, r, "writer", ex);
+    if (kind(ctx, writer) != 5) {
+        return;
+    }
+    var ready: ptr<u8> = get(ctx, writer, "ready", ex);
+    var phase: i64 = integer(ctx, r, "state", ex);
+    if (phase == ERRORING || phase == ERRORED) {
+        if (flag(ctx, ready, "settled", ex)) {
+            ready = internal_capability(ctx, ex);
+            put(ctx, writer, "ready", ready, ex);
+        }
+        settle(ctx, ready, get(ctx, r, "error", ex), true, ex);
+    } else if (phase == CLOSING || phase == CLOSED || field_number(ctx, r, "high", ex) > field_number(ctx, r, "total", ex)) {
+        settle(ctx, ready, undefined(ctx), false, ex);
+    } else if (flag(ctx, ready, "settled", ex)) {
+        put(ctx, writer, "ready", internal_capability(ctx, ex), ex);
+    }
+}
+fun complete_abort(ctx: ptr<u8>, request: ptr<u8>, value: ptr<u8>, failed: bool, ex: ptr<ptr<u8>>) {
+    if (flag(ctx, request, "hasListenerError", ex)) {
+        settle(ctx, request, get(ctx, request, "listenerError", ex), true, ex);
+    } else if (failed) {
+        settle(ctx, request, value, true, ex);
+    } else {
+        settle(ctx, request, undefined(ctx), false, ex);
+    }
+}
+fun finish_error(ctx: ptr<u8>, r: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (integer(ctx, r, "state", ex) != ERRORING || !flag(ctx, r, "started", ex) || kind(ctx, get(ctx, r, "inflight", ex)) == 5) {
+        return;
+    }
+    set_integer(ctx, r, "state", ERRORED, ex);
+    var reason: ptr<u8> = get(ctx, r, "error", ex);
+    protect(ctx, reason);
+    var queue: ptr<u8> = get(ctx, r, "queue", ex);
+    protect(ctx, queue);
+    put(ctx, r, "queue", list(ctx, ex), ex);
+    put(ctx, r, "total", number(ctx, 0.0), ex);
+    for (var i: i64 = 0; i < length(ctx, queue, ex); i++) {
+        settle(ctx, get(ctx, at(ctx, queue, i, ex), "deferred", ex), reason, true, ex);
+    }
+    settle(ctx, get(ctx, r, "closeRequest", ex), reason, true, ex);
+    var writer: ptr<u8> = get(ctx, r, "writer", ex);
+    if (kind(ctx, writer) == 5) {
+        settle(ctx, get(ctx, writer, "closed", ex), reason, true, ex);
+    }
+    backpressure(ctx, r, ex);
+    var request: ptr<u8> = get(ctx, r, "abortRequest", ex);
+    if (kind(ctx, request) == 5) {
+        var fn: ptr<u8> = get(ctx, r, "abort", ex);
+        var problem: ptr<u8> = null;
+        var result: ptr<u8> = undefined(ctx);
+        if (kind(ctx, fn) != 0) {
+            var call_args: array<ptr<u8>, 1> = [get(ctx, request, "reason", ex)];
+            result = apply(ctx, fn, get(ctx, r, "sink", ex), 1, &call_args[0], &problem);
+        }
+        if (problem != null) {
+            complete_abort(ctx, request, problem, true, ex);
+        } else {
+            follow(ctx, result, job(ctx, JOB_WRITE_ABORT, r, request, ex), ex);
+        }
+    }
+    unprotect(ctx, queue);
+    unprotect(ctx, reason);
+}
+pub fun error_writable(ctx: ptr<u8>, r: ptr<u8>, reason: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var phase: i64 = integer(ctx, r, "state", ex);
+    if (phase == CLOSED || phase == ERRORED) {
+        return;
+    }
+    if (phase != ERRORING) {
+        set_integer(ctx, r, "state", ERRORING, ex);
+        put(ctx, r, "error", reason, ex);
+        backpressure(ctx, r, ex);
+    }
+    finish_error(ctx, r, ex);
+}
+pub fun pump(ctx: ptr<u8>, r: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (!flag(ctx, r, "started", ex) || kind(ctx, get(ctx, r, "inflight", ex)) == 5) {
+        return;
+    }
+    var phase: i64 = integer(ctx, r, "state", ex);
+    if (phase == ERRORING) {
+        finish_error(ctx, r, ex);
+        return;
+    }
+    if (phase != OPEN && phase != CLOSING) {
+        return;
+    }
+    var queue: ptr<u8> = get(ctx, r, "queue", ex);
+    var entry: ptr<u8> = undefined(ctx);
+    var operation: i64 = JOB_WRITE;
+    var fn: ptr<u8> = undefined(ctx);
+    var result: ptr<u8> = undefined(ctx);
+    var problem: ptr<u8> = null;
+    if (length(ctx, queue, ex) > 0) {
+        entry = at(ctx, queue, 0, ex);
+        put(ctx, r, "inflight", entry, ex);
+        fn = get(ctx, r, "write", ex);
+        if (kind(ctx, fn) != 0) {
+            var call_args: array<ptr<u8>, 2> = [get(ctx, entry, "chunk", ex), get(ctx, r, "controller", ex)];
+            result = apply(ctx, fn, get(ctx, r, "sink", ex), 2, &call_args[0], &problem);
+        }
+    } else if (phase == CLOSING) {
+        operation = JOB_WRITE_CLOSE;
+        entry = get(ctx, r, "closeRequest", ex);
+        put(ctx, r, "inflight", entry, ex);
+        fn = get(ctx, r, "close", ex);
+        if (kind(ctx, fn) != 0) {
+            result = apply(ctx, fn, get(ctx, r, "sink", ex), 0, null, &problem);
+        }
+    } else {
+        return;
+    }
+    if (problem != null) {
+        write_job(ctx, r, operation, entry, problem, true, ex);
+    } else {
+        follow(ctx, result, job(ctx, operation, r, entry, ex), ex);
+    }
+}
+pub fun create_writable(ctx: ptr<u8>, sink: ptr<u8>, strategy: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var r: ptr<u8> = plain(ctx);
+    protect(ctx, r);
+    initialize(ctx, r, WRITABLE, strategy, 1.0, ex);
+    put(ctx, r, "sink", sink, ex);
+    var owner: ptr<u8> = handle(ctx, WRITABLE, r, ex);
+    protect(ctx, owner);
+    put(ctx, r, "owner", owner, ex);
+    var controller: ptr<u8> = plain(ctx);
+    protect(ctx, controller);
+    set_integer(ctx, controller, "kind", WRITE_CONTROLLER, ex);
+    put(ctx, controller, "stream", r, ex);
+    put(ctx, controller, "signal", fresh_signal(ctx, ex), ex);
+    put(ctx, r, "controller", handle(ctx, WRITE_CONTROLLER, controller, ex), ex);
+    put(ctx, r, "signal", get(ctx, controller, "signal", ex), ex);
+    unprotect(ctx, controller);
+    if (kind(ctx, sink) == 5) {
+        if (kind(ctx, get(ctx, sink, "type", ex)) != 0) {
+            fail(ctx, ex, 2, "WritableStream sink type is not supported");
+        }
+        var names: array<str, 4> = ["start", "write", "close", "abort"];
+        for (var i: i64 = 0; i < 4 && deref ex == null; i++) {
+            var fn: ptr<u8> = get(ctx, sink, names[i], ex);
+            if (kind(ctx, fn) != 0 && !callable(ctx, fn)) {
+                fail(ctx, ex, 1, "WritableStream sink callbacks must be callable");
+            }
+            put(ctx, r, names[i], fn, ex);
+        }
+    } else if (kind(ctx, sink) != 0 && kind(ctx, sink) != 1) {
+        fail(ctx, ex, 1, "WritableStream sink must be an object");
+    }
+    var start: ptr<u8> = get(ctx, r, "start", ex);
+    var result: ptr<u8> = undefined(ctx);
+    if (deref ex == null && kind(ctx, start) != 0) {
+        var call_args: array<ptr<u8>, 1> = [get(ctx, r, "controller", ex)];
+        result = apply(ctx, start, sink, 1, &call_args[0], ex);
+    }
+    if (deref ex == null) {
+        follow(ctx, result, job(ctx, JOB_WRITE_START, r, undefined(ctx), ex), ex);
+    } else {
+        var ignored: ptr<u8> = null;
+        set_flag(ctx, r, "started", true, &ignored);
+        error_writable(ctx, r, deref ex, &ignored);
+    }
+    unprotect(ctx, owner);
+    unprotect(ctx, r);
+    return owner;
+}
+pub fun writer(ctx: ptr<u8>, owner: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var r: ptr<u8> = record(ctx, owner, WRITABLE, ex);
+    if (deref ex != null || kind(ctx, get(ctx, r, "writer", ex)) == 5) {
+        fail(ctx, ex, 1, "WritableStream is locked");
+        return undefined(ctx);
+    }
+    var cursor: ptr<u8> = plain(ctx);
+    protect(ctx, cursor);
+    set_integer(ctx, cursor, "kind", WRITER, ex);
+    put(ctx, cursor, "stream", r, ex);
+    put(ctx, cursor, "ready", internal_capability(ctx, ex), ex);
+    put(ctx, cursor, "closed", internal_capability(ctx, ex), ex);
+    put(ctx, r, "writer", cursor, ex);
+    var phase: i64 = integer(ctx, r, "state", ex);
+    if (phase == CLOSED) {
+        settle(ctx, get(ctx, cursor, "closed", ex), undefined(ctx), false, ex);
+    } else if (phase == ERRORED) {
+        settle(ctx, get(ctx, cursor, "closed", ex), get(ctx, r, "error", ex), true, ex);
+    }
+    backpressure(ctx, r, ex);
+    var result: ptr<u8> = handle(ctx, WRITER, cursor, ex);
+    unprotect(ctx, cursor);
+    return result;
+}
+pub fun write(ctx: ptr<u8>, cursor: ptr<u8>, chunk: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var r: ptr<u8> = get(ctx, cursor, "stream", ex);
+    if (kind(ctx, r) != 5) {
+        return rejected_type(ctx, "writer lock has been released", ex);
+    }
+    var problem: ptr<u8> = null;
+    var size: f64 = queue_size(ctx, r, chunk, &problem);
+    if (problem != null) {
+        error_writable(ctx, r, problem, ex);
+        return resolved(ctx, problem, true, ex);
+    }
+    if (kind(ctx, get(ctx, cursor, "stream", ex)) != 5) {
+        return rejected_type(ctx, "writer was released during size conversion", ex);
+    }
+    var phase: i64 = integer(ctx, r, "state", ex);
+    if (phase == ERRORED || phase == ERRORING) {
+        return resolved(ctx, get(ctx, r, "error", ex), true, ex);
+    }
+    if (phase != OPEN) {
+        return rejected_type(ctx, "WritableStream is closing or closed", ex);
+    }
+    var deferred: ptr<u8> = capability(ctx, ex);
+    protect(ctx, deferred);
+    queue_entry(ctx, r, chunk, size, deferred, &problem);
+    if (problem != null) {
+        settle(ctx, deferred, problem, true, ex);
+        error_writable(ctx, r, problem, ex);
+    } else {
+        backpressure(ctx, r, ex);
+        pump(ctx, r, ex);
+    }
+    var result: ptr<u8> = get(ctx, deferred, "promise", ex);
+    unprotect(ctx, deferred);
+    return result;
+}
+pub fun close(ctx: ptr<u8>, r: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var phase: i64 = integer(ctx, r, "state", ex);
+    if (phase == ERRORED || phase == ERRORING) {
+        return resolved(ctx, get(ctx, r, "error", ex), true, ex);
+    }
+    if (phase != OPEN) {
+        return rejected_type(ctx, "WritableStream is already closing or closed", ex);
+    }
+    var deferred: ptr<u8> = capability(ctx, ex);
+    protect(ctx, deferred);
+    put(ctx, r, "closeRequest", deferred, ex);
+    set_integer(ctx, r, "state", CLOSING, ex);
+    backpressure(ctx, r, ex);
+    pump(ctx, r, ex);
+    var result: ptr<u8> = get(ctx, deferred, "promise", ex);
+    unprotect(ctx, deferred);
+    return result;
+}
+pub fun abort(ctx: ptr<u8>, r: ptr<u8>, reason: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var phase: i64 = integer(ctx, r, "state", ex);
+    if (phase == CLOSED || phase == ERRORED) {
+        return resolved(ctx, undefined(ctx), false, ex);
+    }
+    var request: ptr<u8> = get(ctx, r, "abortRequest", ex);
+    if (kind(ctx, request) == 5) {
+        return get(ctx, request, "promise", ex);
+    }
+    request = capability(ctx, ex);
+    protect(ctx, request);
+    put(ctx, request, "reason", reason, ex);
+    put(ctx, r, "abortRequest", request, ex);
+    // Publish erroring before firing private/user signal algorithms, which may
+    // reenter this writer. Native I/O callbacks never enter this path directly.
+    if (phase != ERRORING) {
+        set_integer(ctx, r, "state", ERRORING, ex);
+        put(ctx, r, "error", reason, ex);
+    }
+    var listener_error: ptr<u8> = null;
+    abort_signal(ctx, get(ctx, r, "signal", ex), reason, &listener_error);
+    if (listener_error != null) {
+        put(ctx, request, "listenerError", listener_error, ex);
+        set_flag(ctx, request, "hasListenerError", true, ex);
+    }
+    backpressure(ctx, r, ex);
+    finish_error(ctx, r, ex);
+    var result: ptr<u8> = get(ctx, request, "promise", ex);
+    unprotect(ctx, request);
+    return result;
+}
+pub fun release_writer(ctx: ptr<u8>, cursor: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var r: ptr<u8> = get(ctx, cursor, "stream", ex);
+    if (kind(ctx, r) != 5) {
+        return;
+    }
+    var problem: ptr<u8> = type_error(ctx, "writer lock has been released");
+    protect(ctx, problem);
+    var names: array<str, 2> = ["ready", "closed"];
+    for (var i: i64 = 0; i < 2; i++) {
+        var deferred: ptr<u8> = get(ctx, cursor, names[i], ex);
+        if (flag(ctx, deferred, "settled", ex)) {
+            deferred = internal_capability(ctx, ex);
+            put(ctx, cursor, names[i], deferred, ex);
+        }
+        settle(ctx, deferred, problem, true, ex);
+    }
+    put(ctx, r, "writer", undefined(ctx), ex);
+    put(ctx, cursor, "stream", undefined(ctx), ex);
+    unprotect(ctx, problem);
+}
+pub fun write_job(ctx: ptr<u8>, r: ptr<u8>, operation: i64, entry: ptr<u8>, value: ptr<u8>, failed: bool, ex: ptr<ptr<u8>>) {
+    if (operation == JOB_WRITE_ABORT) {
+        complete_abort(ctx, entry, value, failed, ex);
+        return;
+    }
+    if (operation == JOB_WRITE_START) {
+        set_flag(ctx, r, "started", true, ex);
+        if (failed) {
+            error_writable(ctx, r, value, ex);
+        } else {
+            pump(ctx, r, ex);
+        }
+        return;
+    }
+    put(ctx, r, "inflight", undefined(ctx), ex);
+    if (operation == JOB_WRITE) {
+        shift(ctx, r, ex);
+        if (failed) {
+            settle(ctx, get(ctx, entry, "deferred", ex), value, true, ex);
+        } else {
+            settle(ctx, get(ctx, entry, "deferred", ex), undefined(ctx), false, ex);
+        }
+        if (failed) {
+            error_writable(ctx, r, value, ex);
+        } else {
+            backpressure(ctx, r, ex);
+            pump(ctx, r, ex);
+        }
+    } else if (failed) {
+        settle(ctx, entry, value, true, ex);
+        error_writable(ctx, r, value, ex);
+    } else {
+        set_integer(ctx, r, "state", CLOSED, ex);
+        settle(ctx, entry, undefined(ctx), false, ex);
+        var writer: ptr<u8> = get(ctx, r, "writer", ex);
+        if (kind(ctx, writer) == 5) {
+            settle(ctx, get(ctx, writer, "closed", ex), undefined(ctx), false, ex);
+            settle(ctx, get(ctx, writer, "ready", ex), undefined(ctx), false, ex);
+        }
+        var request: ptr<u8> = get(ctx, r, "abortRequest", ex);
+        if (kind(ctx, request) == 5) {
+            complete_abort(ctx, request, undefined(ctx), false, ex);
+        }
+    }
+}

@@ -1,0 +1,127 @@
+// One engine session: source, context, execution, reporting and resource release.
+import("std::mem::alloc")::{mem_free};
+import("std::mem::cstr")::{mem_len_cstr};
+import("./cli")::{LaunchOptions};
+import("./config")::{SOURCE_LIMIT};
+import("./source")::{read_source};
+import("./output")::{write_text};
+import("./errors")::{report_exception};
+import("./host")::{install_host, shutdown_host};
+import("./worker_run")::{worker_runtime_link};
+import("./timers")::{unhandled_rejection_failed};
+import("./event_loop")::{run_event_loop};
+import("./system")::{system_exit_status};
+import("./process_events")::{emit_process_exit};
+import("./modules")::{check_commonjs, execute_main_module};
+import("./module_files")::{ends};
+import("./module_packages")::{esm_scope};
+import("./esm")::{execute_esm, esm_result, check_esm, esm_available};
+
+extern(c, "wr_context_create") fun wr_context_create(global_class: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_context_release") fun wr_context_release(context: ptr<u8>);
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_evaluate") fun wr_evaluate(context: ptr<u8>, source: ptr<u8>, this_object: ptr<u8>, url: ptr<u8>,
+    line: i32, exception: ptr<ptr<u8>>) -> ptr<u8>;
+
+pub fun execute(options: LaunchOptions) -> i32 {
+    worker_runtime_link();
+    var path: str = options.path;
+    var source_index: i32 = options.source_index;
+    var eval_mode: bool = options.eval_mode;
+    var check_only: bool = options.check_only;
+    var source: ptr<u8> = null;
+    if (eval_mode) {
+        source = path as ptr<u8>;
+        path = "<eval>";
+        if (mem_len_cstr(source as str) > SOURCE_LIMIT) {
+            write_text(2, "script exceeds 4 MiB\n");
+            return 1;
+        }
+    } else {
+        source = read_source(path);
+        if (source == null) {
+            return 1;
+        }
+    }
+    var context: ptr<u8> = wr_context_create(null);
+    if (context == null) {
+        if (!eval_mode) {
+            mem_free(source, SOURCE_LIMIT + 1);
+        }
+        write_text(2, "cannot create JavaScript engine context\n");
+        return 1;
+    }
+    var script: ptr<u8> = wr_string_utf8(source as str);
+    if (!eval_mode) {
+        mem_free(source, SOURCE_LIMIT + 1);
+    }
+    var url: ptr<u8> = wr_string_utf8(path);
+    var exception: ptr<u8> = null;
+    var status: i32 = 0;
+    if (script == null || url == null) {
+        write_text(2, "cannot create JavaScript source strings\n");
+        status = 1;
+    } else if (!install_host(context, source_index, eval_mode, path, &exception)) {
+        status = 1;
+    } else if (check_only) {
+        var valid: bool = false;
+        if (!eval_mode && esm_scope(context, path, &exception) && esm_available()) {
+            valid = check_esm(context, script, url, &exception);
+        } else {
+            valid = check_commonjs(context, script, url, &exception);
+        }
+        if (!valid) {
+            status = 1;
+        }
+    } else {
+        if (eval_mode) {
+            wr_evaluate(context, script, null, url, 1, &exception);
+        } else if (esm_scope(context, path, &exception)) {
+            execute_esm(context, path, &exception);
+        } else if (exception == null) {
+            execute_main_module(context, script, &exception);
+        }
+        if (exception != null) {
+            status = 1;
+        } else if (!run_event_loop(context, &exception)) {
+            status = 1;
+            if (exception == null) {
+                write_text(2, "event loop clock or wait failed\n");
+            }
+        }
+        if (status == 0 && !esm_result(context, &exception)) {
+            status = 1;
+        }
+        if (status == 0) {
+            status = system_exit_status(context);
+        }
+        if (exception == null) {
+            emit_process_exit(context, status, &exception);
+            if (exception != null) {
+                status = 1;
+            }
+        }
+    }
+    if (exception != null) {
+        if (unhandled_rejection_failed(context, exception)) {
+            write_text(2, "Unhandled Promise rejection: ");
+        }
+        report_exception(context, exception, path);
+    }
+    var closed: bool = shutdown_host(context);
+    if (!closed) {
+        status = 1;
+    }
+    if (script != null) {
+        wr_string_release(script);
+    }
+    if (url != null) {
+        wr_string_release(url);
+    }
+    // A failed worker join preserves storage that may still be in use.
+    if (closed) {
+        wr_context_release(context);
+    }
+    return status;
+}

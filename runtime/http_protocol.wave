@@ -1,0 +1,376 @@
+// Incremental llhttp adapter. Parsing callbacks store bytes and never call JSC.
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::mem::ops")::{mem_copy};
+import("std::mem::cstr")::{mem_eq_cstr};
+import("./config")::{HTTP_HEADER_LIMIT, HTTP_HEADER_COUNT, HTTP_BODY_LIMIT, HTTP_URL_LIMIT, HTTP_WIRE_OVERHEAD_LIMIT,
+    HTTP_REQUEST_LIMIT, HTTP_PIPELINE_LIMIT};
+
+extern(c, "jsrt_http_parser_size") fun parser_size() -> i64;
+extern(c, "jsrt_http_settings_size") fun settings_size() -> i64;
+extern(c, "jsrt_http_parser_init") fun parser_init(parser: ptr<u8>, settings: ptr<u8>, data: ptr<u8>);
+extern(c, "jsrt_http_paused_code") fun paused_code() -> i32;
+extern(c, "llhttp_execute") fun parser_execute(parser: ptr<u8>, data: ptr<u8>, length: i64) -> i32;
+extern(c, "llhttp_get_method") fun parser_method(parser: ptr<u8>) -> u8;
+extern(c, "llhttp_get_error_pos") fun parser_position(parser: ptr<u8>) -> ptr<u8>;
+extern(c, "llhttp_should_keep_alive") fun parser_keep_alive(parser: ptr<u8>) -> i32;
+extern(c, "llhttp_method_name") fun method_name(method: i32) -> str;
+
+pub struct HttpHeader {
+    name: i64;
+    value: i64;
+    length: i64;
+}
+
+pub struct HttpRequest {
+    parser: ptr<u8>;
+    settings: ptr<u8>;
+    url: ptr<u8>;
+    url_length: i64;
+    headers: ptr<u8>;
+    header_length: i64;
+    fields: ptr<HttpHeader>;
+    header_count: i64;
+    field_start: i64;
+    value_start: i64;
+    body: ptr<u8>;
+    body_length: i64;
+    body_capacity: i64;
+    streaming: bool;
+    body_total: i64;
+    head_bytes: i64;
+    head_match: i32;
+    raw_head_done: bool;
+    wire_bytes: i64;
+    headers_done: bool;
+    complete: bool;
+    status: i32;
+    major: i32;
+    minor: i32;
+    allow_pipeline: bool;
+    trailing: ptr<u8>;
+    trailing_length: i64;
+}
+
+pub fun free_request(r: ptr<HttpRequest>) {
+    if (r == null) {
+        return;
+    }
+    if (deref r.parser != null) {
+        mem_free(deref r.parser, parser_size());
+    }
+    if (deref r.settings != null) {
+        mem_free(deref r.settings, settings_size());
+    }
+    if (deref r.url != null) {
+        mem_free(deref r.url, HTTP_URL_LIMIT + 1);
+    }
+    if (deref r.headers != null) {
+        mem_free(deref r.headers, HTTP_HEADER_LIMIT + 1);
+    }
+    if (deref r.fields != null) {
+        mem_free(deref r.fields as ptr<u8>, HTTP_HEADER_COUNT * (size_of<HttpHeader>() as i64));
+    }
+    if (deref r.body != null) {
+        mem_free(deref r.body, deref r.body_capacity);
+    }
+    if (deref r.trailing != null) {
+        mem_free(deref r.trailing, HTTP_PIPELINE_LIMIT);
+    }
+    mem_free(r as ptr<u8>, size_of<HttpRequest>() as i64);
+}
+
+pub fun new_request() -> ptr<HttpRequest> {
+    var r: ptr<HttpRequest> = mem_alloc_zeroed(size_of<HttpRequest>() as i64) as ptr<HttpRequest>;
+    if (r == null) {
+        return null;
+    }
+    deref r.parser = mem_alloc(parser_size());
+    deref r.settings = mem_alloc(settings_size());
+    deref r.url = mem_alloc(HTTP_URL_LIMIT + 1);
+    deref r.headers = mem_alloc(HTTP_HEADER_LIMIT + 1);
+    deref r.fields = mem_alloc_zeroed(HTTP_HEADER_COUNT * (size_of<HttpHeader>() as i64)) as ptr<HttpHeader>;
+    if (deref r.parser == null || deref r.settings == null || deref r.url == null || deref r.headers == null || deref r.fields == null) {
+        free_request(r);
+        return null;
+    }
+    deref(deref r.url)[0] = 0;
+    deref(deref r.headers)[0] = 0;
+    parser_init(deref r.parser, deref r.settings, r as ptr<u8>);
+    return r;
+}
+
+fun reject(r: ptr<HttpRequest>, status: i32) -> i32 {
+    deref r.status = status;
+    return -1;
+}
+
+pub fun header_index(r: ptr<HttpRequest>, name: str) -> i64 {
+    for (var i: i64 = 0; i < deref r.header_count; i++) {
+        var field: ptr<HttpHeader> = deref r.fields + i;
+        if (mem_eq_cstr((deref r.headers + deref field.name) as str, name)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+pub fun request_method(r: ptr<HttpRequest>) -> str {
+    return method_name(parser_method(deref r.parser) as i32);
+}
+
+export(c) fun jsrt_http_span(data: ptr<u8>, kind: i32, bytes: ptr<u8>, length: i64) -> i32 {
+    var r: ptr<HttpRequest> = data as ptr<HttpRequest>;
+    if (deref r.status != 0) {
+        return -1;
+    }
+    if (kind == 0) {
+        if (length > HTTP_URL_LIMIT - deref r.url_length) {
+            return reject(r, 414);
+        }
+        mem_copy(deref r.url + deref r.url_length, bytes, length);
+        deref r.url_length += length;
+        deref(deref r.url)[deref r.url_length] = 0;
+    } else if (kind == 1 || kind == 2) {
+        // Trailers are deliberately unsupported in this first buffered API.
+        if (deref r.headers_done) {
+            return reject(r, 400);
+        }
+        if (length > HTTP_HEADER_LIMIT - deref r.header_length) {
+            return reject(r, 431);
+        }
+        var dest: ptr<u8> = deref r.headers + deref r.header_length;
+        for (var i: i64 = 0; i < length; i++) {
+            var octet: u8 = bytes[i];
+            if (kind == 1 && octet >= 65 && octet <= 90) {
+                octet += 32;
+            }
+            dest[i] = octet;
+        }
+        deref r.header_length += length;
+    } else if (kind == 4 || kind == 5) {
+        if (kind == 5) {
+            var storage: ptr<u8> = deref r.headers;
+            while (deref r.header_length > deref r.value_start) {
+                var last: u8 = storage[deref r.header_length - 1];
+                if (last != 32 && last != 9) {
+                    break;
+                }
+                deref r.header_length -= 1;
+            }
+        }
+        if (deref r.header_length >= HTTP_HEADER_LIMIT) {
+            return reject(r, 431);
+        }
+        var storage: ptr<u8> = deref r.headers;
+        storage[deref r.header_length] = 0;
+        deref r.header_length += 1;
+        if (kind == 4) {
+            deref r.value_start = deref r.header_length;
+        } else {
+            if (deref r.header_count >= HTTP_HEADER_COUNT) {
+                return reject(r, 431);
+            }
+            var field: ptr<HttpHeader> = deref r.fields + deref r.header_count;
+            deref field.name = deref r.field_start;
+            deref field.value = deref r.value_start;
+            deref field.length = deref r.header_length - deref r.value_start - 1;
+            deref r.header_count += 1;
+            deref r.field_start = deref r.header_length;
+        }
+    } else if (kind == 3) {
+        var limit: i64 = HTTP_BODY_LIMIT;
+        if (deref r.streaming) {
+            limit = HTTP_REQUEST_LIMIT;
+        }
+        if (length > limit - deref r.body_total) {
+            return reject(r, 413);
+        }
+        deref r.body_total += length;
+        var needed: i64 = deref r.body_length + length + 1;
+        if (needed > deref r.body_capacity) {
+            var capacity: i64 = deref r.body_capacity * 2;
+            if (capacity < 4096) {
+                capacity = 4096;
+            }
+            while (capacity < needed) {
+                capacity *= 2;
+            }
+            if (capacity > HTTP_BODY_LIMIT + 1) {
+                capacity = HTTP_BODY_LIMIT + 1;
+            }
+            var buffer: ptr<u8> = mem_alloc(capacity);
+            if (buffer == null) {
+                return reject(r, 503);
+            }
+            if (deref r.body_length > 0) {
+                mem_copy(buffer, deref r.body, deref r.body_length);
+            }
+            if (deref r.body != null) {
+                mem_free(deref r.body, deref r.body_capacity);
+            }
+            deref r.body = buffer;
+            deref r.body_capacity = capacity;
+        }
+        mem_copy(deref r.body + deref r.body_length, bytes, length);
+        deref r.body_length += length;
+        deref(deref r.body)[deref r.body_length] = 0;
+    }
+    return 0;
+}
+
+export(c) fun jsrt_http_headers(data: ptr<u8>, upgrade: i32, major: i32, minor: i32) -> i32 {
+    var r: ptr<HttpRequest> = data as ptr<HttpRequest>;
+    deref r.major = major;
+    deref r.minor = minor;
+    if (major != 1 || minor > 1) {
+        return reject(r, 505);
+    }
+    if (upgrade != 0) {
+        return reject(r, 400);
+    }
+    var url: ptr<u8> = deref r.url;
+    if (deref r.url_length == 0 || (url[0] != 47 && !(mem_eq_cstr(url as str, "*") && mem_eq_cstr(request_method(r),
+        "OPTIONS")))) {
+        return reject(r, 400);
+    }
+    var hosts: i64 = 0;
+    for (var i: i64 = 0; i < deref r.header_count; i++) {
+        var field: ptr<HttpHeader> = deref r.fields + i;
+        var name: str = (deref r.headers + deref field.name) as str;
+        if (mem_eq_cstr(name, "host")) {
+            hosts += 1;
+            if (deref field.length == 0) {
+                return reject(r, 400);
+            }
+            var value: ptr<u8> = deref r.headers + deref field.value;
+            for (var j: i64 = 0; j < deref field.length; j++) {
+                if (value[j] <= 32 || value[j] >= 127 || value[j] == 44) {
+                    return reject(r, 400);
+                }
+            }
+        }
+        if (mem_eq_cstr(name, "expect")) {
+            return reject(r, 417);
+        }
+        if (mem_eq_cstr(name, "transfer-encoding")) {
+            if (deref field.length != 7) {
+                return reject(r, 501);
+            }
+            var value: ptr<u8> = deref r.headers + deref field.value;
+            var expected: str = "chunked";
+            for (var j: i64 = 0; j < 7; j++) {
+                var octet: u8 = value[j];
+                if (octet >= 65 && octet <= 90) {
+                    octet += 32;
+                }
+                if (octet != expected[j]) {
+                    return reject(r, 501);
+                }
+            }
+        }
+        if (mem_eq_cstr(name, "content-length") && deref field.length > 0) {
+            var value: ptr<u8> = deref r.headers + deref field.value;
+            var size: i64 = 0;
+            for (var j: i64 = 0; j < deref field.length; j++) {
+                if (value[j] < 48 || value[j] > 57) {
+                    return reject(r, 400);
+                }
+                size = size * 10 + (value[j] - 48) as i64;
+                var limit: i64 = HTTP_BODY_LIMIT;
+                if (deref r.streaming) {
+                    limit = HTTP_REQUEST_LIMIT;
+                }
+                if (size > limit) {
+                    return reject(r, 413);
+                }
+            }
+        }
+    }
+    if (hosts > 1 || (minor == 1 && hosts != 1)) {
+        return reject(r, 400);
+    }
+    deref r.headers_done = true;
+    return 0;
+}
+
+export(c) fun jsrt_http_complete(data: ptr<u8>) -> i32 {
+    var r: ptr<HttpRequest> = data as ptr<HttpRequest>;
+    deref r.complete = true;
+    return 0;
+}
+
+pub fun request_keep_alive(r: ptr<HttpRequest>) -> bool {
+    return deref r.allow_pipeline && deref r.complete && parser_keep_alive(deref r.parser) != 0;
+}
+
+pub fun queue_request_bytes(r: ptr<HttpRequest>, bytes: ptr<u8>, length: i64) -> bool {
+    if (length < 0 || length > HTTP_PIPELINE_LIMIT - deref r.trailing_length) {
+        return false;
+    }
+    if (length == 0) {
+        return true;
+    }
+    if (deref r.trailing == null) {
+        deref r.trailing = mem_alloc(HTTP_PIPELINE_LIMIT);
+        if (deref r.trailing == null) {
+            return false;
+        }
+    }
+    mem_copy(deref r.trailing + deref r.trailing_length, bytes, length);
+    deref r.trailing_length += length;
+    return true;
+}
+
+pub fun feed_request(r: ptr<HttpRequest>, bytes: ptr<u8>, length: i64) -> bool {
+    if (deref r.complete || deref r.status != 0 || length < 0) {
+        return false;
+    }
+    var limit: i64 = HTTP_BODY_LIMIT;
+    if (deref r.streaming) {
+        limit = HTTP_REQUEST_LIMIT;
+    }
+    if (length > limit + HTTP_HEADER_LIMIT + HTTP_WIRE_OVERHEAD_LIMIT - deref r.wire_bytes) {
+        reject(r, 413);
+        return false;
+    }
+    deref r.wire_bytes += length;
+    var ending: array<u8, 4> = [13, 10, 13, 10];
+    for (var i: i64 = 0; i < length && !deref r.raw_head_done; i++) {
+        if (deref r.head_match == 2 && (bytes[i] == 32 || bytes[i] == 9)) {
+            reject(r, 400);
+            return false;
+        }
+        deref r.head_bytes += 1;
+        if (deref r.head_bytes > HTTP_HEADER_LIMIT) {
+            reject(r, 431);
+            return false;
+        }
+        if (bytes[i] == ending[deref r.head_match]) {
+            deref r.head_match += 1;
+        } else if (bytes[i] == 13) {
+            deref r.head_match = 1;
+        } else {
+            deref r.head_match = 0;
+        }
+        if (deref r.head_match == 4) {
+            deref r.raw_head_done = true;
+        }
+    }
+    var result: i32 = parser_execute(deref r.parser, bytes, length);
+    if (result == paused_code() && deref r.complete && deref r.allow_pipeline) {
+        var position: ptr<u8> = parser_position(deref r.parser);
+        var consumed: i64 = (position as i64) - (bytes as i64);
+        if (consumed < 0 || consumed > length || !queue_request_bytes(r, bytes + consumed, length - consumed)) {
+            reject(r, 413);
+            return false;
+        }
+    }
+    if (result == 0 || (result == paused_code() && deref r.complete)) {
+        return true;
+    }
+    if (deref r.status == 0) {
+        deref r.status = 400;
+    }
+    return false;
+}

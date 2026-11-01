@@ -1,0 +1,210 @@
+// Hierarchical HTTP(S) URL parsing uses libcurl. JS conversion and limits stay in Wave.
+import("./config")::{URL_CAP};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("./byte_codec")::{encode_utf8, decode_bytes};
+import("./values")::{text, fail};
+extern(c, "wr_to_string") fun stringify(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_value") fun string_value(ctx: ptr<u8>, value: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "curl_url") fun url_new() -> ptr<u8>;
+extern(c, "curl_url_cleanup") fun url_free(value: ptr<u8>);
+extern(c, "curl_url_get") fun url_get(value: ptr<u8>, part: i32, result: ptr<ptr<u8>>, flags: u32) -> i32;
+extern(c, "curl_url_set") fun url_set(value: ptr<u8>, part: i32, data: ptr<u8>, flags: u32) -> i32;
+extern(c, "curl_free") fun curl_free(value: ptr<u8>);
+pub fun usv(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var source: ptr<u8> = stringify(ctx, value, ex);
+    if (source == null || deref ex != null) {
+        return undefined(ctx);
+    }
+    var js: ptr<u8> = string_value(ctx, source);
+    release(source);
+    protect(ctx, js);
+    var bytes: array<u8, 8192>;
+    var n: i64 = encode_utf8(ctx, js, &bytes[0], URL_CAP, false, ex);
+    unprotect(ctx, js);
+    if (n < 0) {
+        return undefined(ctx);
+    }
+    return decode_bytes(ctx, &bytes[0], n, 0, ex);
+}
+
+fun encoded(ctx: ptr<u8>, value: ptr<u8>, result: ptr<u8>, trim: bool, ex: ptr<ptr<u8>>) -> i64 {
+    var bytes: array<u8, 8192>;
+    var n: i64 = encode_utf8(ctx, value, &bytes[0], URL_CAP, false, ex);
+    if (n < 0) {
+        return -1;
+    }
+    var first: i64 = 0;
+    var end: i64 = n;
+    if (trim) {
+        while (first < end && bytes[first] <= 32) {
+            first += 1;
+        }
+        while (end > first && bytes[end - 1] <= 32) {
+            end -= 1;
+        }
+    }
+    var used: i64 = 0;
+    var hex: str = "0123456789ABCDEF";
+    for (var i: i64 = first; i < end; i++) {
+        var c: u8 = bytes[i];
+        if (c == 9 || c == 10 || c == 13) {
+            continue;
+        }
+        if (c == 92) {
+            fail(ctx, ex, 1, "URL backslashes are not supported");
+            return -1;
+        }
+        var escape: bool = c <= 32 || c >= 127 || c == 34 || c == 60 || c == 62 || c == 96;
+        var width: i64 = 1;
+        if (escape) {
+            width = 3;
+        }
+        if (used + width >= URL_CAP) {
+            fail(ctx, ex, 2, "URL byte limit exceeded");
+            return -1;
+        }
+        if (escape) {
+            result[used] = 37;
+            result[used + 1] = hex[c >> 4];
+            result[used + 2] = hex[c & 15];
+        } else {
+            result[used] = c;
+        }
+        used += width;
+    }
+    result[used] = 0;
+    return used;
+}
+
+fun canonical(ctx: ptr<u8>, handle: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var scheme: ptr<u8> = null;
+    var host: ptr<u8> = null;
+    var whole: ptr<u8> = null;
+    var result: ptr<u8> = undefined(ctx);
+    if (url_get(handle, 1, &scheme, 0) != 0 || (!mem_eq_cstr(scheme as str, "http") && !mem_eq_cstr(scheme as str,
+        "https"))) {
+        fail(ctx, ex, 1, "URL currently supports HTTP and HTTPS schemes");
+    } else if (url_get(handle, 5, &host, 4096) != 0) {
+        fail(ctx, ex, 1, "invalid URL hostname");
+    } else {
+        var lower: array<u8, 8192>;
+        var n: i64 = mem_len_cstr(host as str);
+        if (n >= URL_CAP) {
+            fail(ctx, ex, 2, "URL hostname too long");
+        } else {
+            for (var i: i64 = 0; i < n; i++) {
+                var c: u8 = host[i];
+                if (c >= 65 && c <= 90) {
+                    c += 32;
+                }
+                lower[i] = c;
+            }
+            lower[n] = 0;
+            if (url_set(handle, 5, &lower[0], 0) != 0 || url_get(handle, 0, &whole, 16386) != 0) {
+                fail(ctx, ex, 1, "invalid URL");
+            } else if (mem_len_cstr(whole as str) >= URL_CAP) {
+                fail(ctx, ex, 2, "URL byte limit exceeded");
+            } else {
+                result = text(ctx, whole as str);
+            }
+        }
+    }
+    if (scheme != null) {
+        curl_free(scheme);
+    }
+    if (host != null) {
+        curl_free(host);
+    }
+    if (whole != null) {
+        curl_free(whole);
+    }
+    return result;
+}
+
+pub fun parse_url(ctx: ptr<u8>, value: ptr<u8>, base: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var bytes: array<u8, 8192>;
+    if (encoded(ctx, value, &bytes[0], true, ex) < 0) {
+        return undefined(ctx);
+    }
+    var handle: ptr<u8> = url_new();
+    if (handle == null) {
+        fail(ctx, ex, 2, "cannot allocate URL parser");
+        return undefined(ctx);
+    }
+    var ok: bool = true;
+    if (base != null) {
+        var previous: array<u8, 8192>;
+        if (encoded(ctx, base, &previous[0], true, ex) < 0 || url_set(handle, 0, &previous[0], 0) != 0) {
+            ok = false;
+        }
+    }
+    if (!ok || url_set(handle, 0, &bytes[0], 0) != 0) {
+        fail(ctx, ex, 1, "invalid URL or base URL");
+    }
+    var result: ptr<u8> = undefined(ctx);
+    if (deref ex == null) {
+        result = canonical(ctx, handle, ex);
+    }
+    url_free(handle);
+    return result;
+}
+
+pub fun url_part(ctx: ptr<u8>, href: ptr<u8>, part: i32, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var bytes: array<u8, 8192>;
+    if (encode_utf8(ctx, href, &bytes[0], URL_CAP, false, ex) < 0) {
+        return undefined(ctx);
+    }
+    var handle: ptr<u8> = url_new();
+    if (handle == null) {
+        fail(ctx, ex, 2, "cannot allocate URL parser");
+        return undefined(ctx);
+    }
+    var data: ptr<u8> = null;
+    var result: ptr<u8> = text(ctx, "");
+    if (url_set(handle, 0, &bytes[0], 0) != 0) {
+        fail(ctx, ex, 1, "invalid URL");
+    } else {
+        var status: i32 = url_get(handle, part, &data, 4098);
+        if (status == 0) {
+            result = text(ctx, data as str);
+        } else if (status != 11 && status != 12 && status != 15 && status != 16 && status != 17) {
+            fail(ctx, ex, 0, "URL component unavailable");
+        }
+    }
+    if (data != null) {
+        curl_free(data);
+    }
+    url_free(handle);
+    return result;
+}
+
+pub fun change_url(ctx: ptr<u8>, href: ptr<u8>, part: i32, value: ptr<u8>, remove: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var bytes: array<u8, 8192>;
+    var next: array<u8, 8192>;
+    if (encode_utf8(ctx, href, &bytes[0], URL_CAP, false, ex) < 0 || encoded(ctx, value, &next[0], false,
+        ex) < 0) {
+        return undefined(ctx);
+    }
+    var handle: ptr<u8> = url_new();
+    if (handle == null) {
+        fail(ctx, ex, 2, "cannot allocate URL parser");
+        return undefined(ctx);
+    }
+    var data: ptr<u8> = &next[0];
+    if (remove) {
+        data = null;
+    }
+    if (url_set(handle, 0, &bytes[0], 0) != 0 || url_set(handle, part, data, 0) != 0) {
+        fail(ctx, ex, 1, "invalid URL component");
+    }
+    var result: ptr<u8> = undefined(ctx);
+    if (deref ex == null) {
+        result = canonical(ctx, handle, ex);
+    }
+    url_free(handle);
+    return result;
+}

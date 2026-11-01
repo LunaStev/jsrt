@@ -1,0 +1,181 @@
+// Wave chooses host exports and runs CJS/JSON policy. JSC owns synthetic bindings.
+import("./context_state")::{context_slot, allocate_context_slot, release_context_slot};
+import("./config")::{MODULE_LIMIT, MODULE_EXPORT_LIMIT};
+import("./module_support")::{builtin};
+import("./module_files")::{ends};
+import("./module_packages")::{esm_scope};
+import("./modules")::{load_esm_dependency};
+import("./system")::{copy_host_path};
+import("./values")::{capture, get, text, define, plain, fail};
+import("./collections")::{list, append, length, at, bind_one};
+import("std::mem::layout")::{size_of};
+extern(c, "jsrt_esm_synthetic_available") fun available() -> bool;
+extern(c, "jsrt_esm_callback") fun callback(code: i32) -> ptr<u8>;
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_get") fun property(ctx: ptr<u8>, object: ptr<u8>, name: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+const SLOT: i64 = 35;
+const PATH_CAP: i64 = 8192;
+const JSON_TYPE: i32 = 3;
+struct State {
+    keys: ptr<u8>;
+    evaluator: ptr<u8>;
+}
+fun storage(ctx: ptr<u8>) -> ptr<State> {
+    return context_slot(ctx, SLOT) as ptr<State>;
+}
+pub fun synthetic_available() -> bool {
+    return available();
+}
+pub fun canonical_builtin(ctx: ptr<u8>, request: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var index: i64 = builtin(request);
+    if (index < 0) {
+        return null;
+    }
+    if (!available()) {
+        fail(ctx, ex, 1, "ESM builtin interop requires the matching synthetic module ABI");
+        return null;
+    }
+    var names: array<str, 21> = ["node:fs", "node:process", "node:timers", "node:console", "node:fs/promises",
+        "node:http", "node:buffer", "node:events", "node:stream", "node:stream/promises", "node:https",
+        "node:path", "node:os", "node:util", "node:assert", "node:crypto", "node:url", "node:child_process",
+        "node:worker_threads", "node:querystring", "node:stream/web"];
+    return utf8(names[index]);
+}
+export(c) fun jsrt_esm_cjs(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (storage(ctx) == null) {
+        return undefined(ctx);
+    }
+    if (count < 1) {
+        fail(ctx, ex, 0, "missing private CommonJS module key");
+        return undefined(ctx);
+    }
+    var path: array<u8, 8192>;
+    if (copy_host_path(ctx, args[0], &path[0], PATH_CAP, ex) < 0) {
+        return undefined(ctx);
+    }
+    return load_esm_dependency(ctx, &path[0] as str, ex);
+}
+pub fun host_exports(ctx: ptr<u8>, key: ptr<u8>, fetch_type: i32, count: ptr<i64>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<State> = storage(ctx);
+    if (state == null) {
+        fail(ctx, ex, 0, "synthetic module host has stopped");
+        return undefined(ctx);
+    }
+    if (fetch_type != 0 && fetch_type != 1 && fetch_type != JSON_TYPE) {
+        fail(ctx, ex, 1, "unsupported synthetic module type");
+        return undefined(ctx);
+    }
+    var path: array<u8, 8192>;
+    if (copy_host_path(ctx, key, &path[0], PATH_CAP, ex) < 0) {
+        return undefined(ctx);
+    }
+    var native: bool = builtin(&path[0] as str) >= 0;
+    var json: bool = ends(&path[0] as str, ".json");
+    if (!native && !json && esm_scope(ctx, &path[0] as str, ex)) {
+        return undefined(ctx);
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if ((json && fetch_type != JSON_TYPE) || (!json && fetch_type == JSON_TYPE)) {
+        fail(ctx, ex, 1, "JSON imports require type json and a JSON file");
+        return undefined(ctx);
+    }
+    if (deref count >= MODULE_LIMIT) {
+        fail(ctx, ex, 2, "ESM source count exceeds module limit");
+        return undefined(ctx);
+    }
+    deref count += 1;
+    var descriptor: ptr<u8> = plain(ctx);
+    protect(ctx, descriptor);
+    var names: ptr<u8> = list(ctx, ex);
+    protect(ctx, names);
+    var values: ptr<u8> = list(ctx, ex);
+    protect(ctx, values);
+    append(ctx, names, text(ctx, "default"), ex);
+    if (!native && !json) {
+        // JSC invokes this private bound callback during evaluation, after linking.
+        append(ctx, values, undefined(ctx), ex);
+        append(ctx, names, text(ctx, "module.exports"), ex);
+        append(ctx, values, undefined(ctx), ex);
+        var evaluator: ptr<u8> = bind_one(ctx, deref state.evaluator, undefined(ctx), key, ex);
+        define(ctx, descriptor, "evaluate", evaluator, ex, true);
+    } else {
+        var value: ptr<u8> = load_esm_dependency(ctx, &path[0] as str, ex);
+        if (deref ex == null) {
+            protect(ctx, value);
+            append(ctx, values, value, ex);
+            if (native) {
+                var arg: array<ptr<u8>, 1> = [value];
+                var keys: ptr<u8> = call(ctx, deref state.keys, null, 1, &arg[0], ex);
+                if (deref ex == null) {
+                    protect(ctx, keys);
+                    var size: i64 = length(ctx, keys, ex);
+                    if (size >= MODULE_EXPORT_LIMIT) {
+                        fail(ctx, ex, 2, "synthetic export count exceeds limit");
+                    }
+                    for (var i: i64 = 0; i < size && deref ex == null; i++) {
+                        var name: ptr<u8> = at(ctx, keys, i, ex);
+                        if (equal(ctx, name, text(ctx, "default"))) {
+                            continue;
+                        }
+                        var exported: ptr<u8> = property(ctx, value, name, ex);
+                        if (deref ex == null) {
+                            append(ctx, names, name, ex);
+                            append(ctx, values, exported, ex);
+                        }
+                    }
+                    unprotect(ctx, keys);
+                }
+            }
+            unprotect(ctx, value);
+        }
+    }
+    define(ctx, descriptor, "names", names, ex, true);
+    define(ctx, descriptor, "values", values, ex, true);
+    unprotect(ctx, values);
+    unprotect(ctx, names);
+    unprotect(ctx, descriptor);
+    return descriptor;
+}
+pub fun install_interop(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (!available()) {
+        return true;
+    }
+    if (!allocate_context_slot(ctx, SLOT, size_of<State>() as i64)) {
+        return false;
+    }
+    var state: ptr<State> = storage(ctx);
+    var obj: ptr<u8> = get(ctx, global(ctx), "Object", ex);
+    deref state.keys = capture(ctx, obj, "keys", ex);
+    var name: ptr<u8> = utf8("CommonJS synthetic module evaluator");
+    deref state.evaluator = function(ctx, name, callback(6));
+    release(name);
+    protect(ctx, deref state.evaluator);
+    return deref ex == null;
+}
+pub fun shutdown_interop(ctx: ptr<u8>) {
+    var state: ptr<State> = storage(ctx);
+    if (state == null) {
+        return;
+    }
+    if (deref state.keys != null) {
+        unprotect(ctx, deref state.keys);
+    }
+    if (deref state.evaluator != null) {
+        unprotect(ctx, deref state.evaluator);
+    }
+    release_context_slot(ctx, SLOT, size_of<State>() as i64);
+}

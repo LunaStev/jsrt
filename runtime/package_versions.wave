@@ -1,0 +1,68 @@
+// Select registry versions without evaluating package JavaScript.
+import("wjson")::{Json, json_len, json_key_at, json_get, json_is_object, json_null_str};
+import("./package_version")::{Version, parse_version, compare_versions};
+import("./package_semver")::{Range, parse_range, matches_range};
+import("./config")::{PACKAGE_REGISTRY_VERSION_LIMIT};
+import("./package_graph")::{Peer, peer_at};
+import("./package_semver")::{satisfies};
+import("std::mem::cstr")::{mem_eq_cstr};
+
+pub fun registry_exact_version(requirement: str) -> bool {
+    var parsed: Version = parse_version(requirement);
+    if (!parsed.valid) {
+        return false;
+    }
+    // Build metadata is ignored by precedence. Resolve it through the version
+    // index instead of assuming that the registry publishes a matching key.
+    for (var i: i64 = 0; requirement[i] != 0; i++) {
+        if (requirement[i] == 43) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fun select_version(versions: Json, requirement: str) -> str {
+    return select_matching_version(versions, requirement, "", "", false);
+}
+
+pub fun peer_version_matches(version: str, name: str, scope: str) -> bool {
+    var index: i64 = 0;
+    while (true) {
+        var peer: ptr<Peer> = peer_at(index);
+        if (peer == null) {
+            return true;
+        }
+        if (mem_eq_cstr(deref peer.name, name) && mem_eq_cstr(deref peer.scope, scope) &&
+            !satisfies(version, deref peer.range)) {
+            return false;
+        }
+        index += 1;
+    }
+    return true;
+}
+
+pub fun select_peer_version(versions: Json, requirement: str, name: str, scope: str) -> str {
+    return select_matching_version(versions, requirement, name, scope, true);
+}
+
+fun select_matching_version(versions: Json, requirement: str, name: str, scope: str, peers: bool) -> str {
+    var selected: str = json_null_str();
+    var best: Version = parse_version("");
+    var range: Range = parse_range(requirement);
+    if (!range.valid || !json_is_object(versions) || json_len(versions) > PACKAGE_REGISTRY_VERSION_LIMIT) {
+        return selected;
+    }
+    for (var i: i64 = 0; i < json_len(versions); i++) {
+        var version: str = json_key_at(versions, i);
+        var candidate: Version = parse_version(version);
+        if (json_is_object(json_get(versions, version)) && matches_range(candidate, &range) &&
+            (!peers || peer_version_matches(version, name, scope))) {
+            if (!best.valid || compare_versions(candidate, best) > 0) {
+                selected = version;
+                best = candidate;
+            }
+        }
+    }
+    return selected;
+}

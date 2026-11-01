@@ -1,0 +1,113 @@
+// Native state is attached to the engine global's private data, never JS properties.
+// Each context is owned by its execution thread; no process-global state registry.
+import("std::mem::alloc")::{mem_alloc_zeroed, mem_free};
+extern(c, "wr_context_data") fun context_data(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_context_set_data") fun context_set_data(ctx: ptr<u8>, data: ptr<u8>) -> bool;
+const SLOT_COUNT: i64 = 46;
+extern(c, "wr_active_context") fun current_context() -> ptr<u8>;
+pub fun active_context() -> ptr<u8> {
+    return current_context();
+}
+
+extern(c, "abort") fun allocation_abort();
+pub const VALUES_SLOT: i64 = 0;
+pub const JSON_SLOT: i64 = 1;
+pub const COLLECTIONS_SLOT: i64 = 2;
+pub const BUFFER_SLOT: i64 = 3;
+pub const EVENTS_SLOT: i64 = 4;
+pub const TIMERS_SLOT: i64 = 5;
+pub const ASYNC_FS_SLOT: i64 = 6;
+pub const SYSTEM_SLOT: i64 = 7;
+pub fun context_slot(ctx: ptr<u8>, index: i64) -> ptr<u8> {
+    if (index < 0 || index >= SLOT_COUNT) {
+        return null;
+    }
+    var slots: ptr<ptr<u8>> = context_data(ctx) as ptr<ptr<u8>>;
+    if (slots == null) {
+        return null;
+    }
+    return slots[index];
+}
+
+pub fun allocate_context_slot(ctx: ptr<u8>, index: i64, bytes: i64) -> bool {
+    if (index < 0 || index >= SLOT_COUNT || bytes <= 0) {
+        return false;
+    }
+    var slots: ptr<ptr<u8>> = context_data(ctx) as ptr<ptr<u8>>;
+    var fresh: bool = slots == null;
+    if (fresh) {
+        slots = mem_alloc_zeroed(SLOT_COUNT * 16) as ptr<ptr<u8>>;
+        if (slots == null) {
+            return false;
+        }
+        if (!context_set_data(ctx, slots as ptr<u8>)) {
+            mem_free(slots as ptr<u8>, SLOT_COUNT * 16);
+            return false;
+        }
+    }
+    if (slots[index] != null) {
+        return false;
+    }
+    slots[index] = mem_alloc_zeroed(bytes);
+    if (slots[index] == null && fresh) {
+        context_set_data(ctx, null);
+        mem_free(slots as ptr<u8>, SLOT_COUNT * 16);
+        return false;
+    }
+    if (slots[index] != null) {
+        (slots as ptr<i64>)[SLOT_COUNT + index] = bytes;
+    }
+    return slots[index] != null;
+}
+
+pub fun release_context_slot(ctx: ptr<u8>, index: i64, bytes: i64) {
+    if (index < 0 || index >= SLOT_COUNT) {
+        return;
+    }
+    var slots: ptr<ptr<u8>> = context_data(ctx) as ptr<ptr<u8>>;
+    if (slots == null) {
+        return;
+    }
+    if (slots[index] != null) {
+        mem_free(slots[index], bytes);
+        slots[index] = null;
+    }
+    for (var i: i64 = 0; i < SLOT_COUNT; i++) {
+        if (slots[i] != null) {
+            return;
+        }
+    }
+    context_set_data(ctx, null);
+    mem_free(slots as ptr<u8>, SLOT_COUNT * 16);
+}
+
+// Lazy allocation preserves the existing host's infallible storage access contract.
+// Exhaustion is fatal; never return a null pointer to a native callback.
+pub fun owned_context_slot(ctx: ptr<u8>, index: i64, bytes: i64) -> ptr<u8> {
+    if (ctx == null) {
+        allocation_abort();
+        return null;
+    }
+    var value: ptr<u8> = context_slot(ctx, index);
+    if (value == null) {
+        if (!allocate_context_slot(ctx, index, bytes)) {
+            allocation_abort();
+            return null;
+        }
+        value = context_slot(ctx, index);
+    }
+    return value;
+}
+
+pub fun release_host_slots(ctx: ptr<u8>) {
+    for (var i: i64 = 8; i < 27; i++) {
+        var slots: ptr<ptr<u8>> = context_data(ctx) as ptr<ptr<u8>>;
+        if (slots == null) {
+            return;
+        }
+        var bytes: i64 = (slots as ptr<i64>)[SLOT_COUNT + i];
+        if (slots[i] != null) {
+            release_context_slot(ctx, i, bytes);
+        }
+    }
+}

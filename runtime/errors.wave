@@ -1,0 +1,35 @@
+// Exception reporting preserves the original error if conversion throws.
+import("./output")::{write_text, print_value};
+
+extern(c, "wr_protect") fun wr_protect(context: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_is_object") fun wr_is_object(context: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_get") fun wr_get(context: ptr<u8>, object: ptr<u8>, name: ptr<u8>, exception: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_is_undefined") fun wr_is_undefined(context: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_unprotect") fun wr_unprotect(context: ptr<u8>, value: ptr<u8>);
+
+pub fun report_exception(context: ptr<u8>, exception: ptr<u8>, path: str) {
+    wr_protect(context, exception);
+    write_text(2, path);
+    write_text(2, ": ");
+    var conversion_exception: ptr<u8> = null;
+    if (!print_value(context, exception, 2, &conversion_exception)) {
+        write_text(2, "JavaScript exception (display failed)");
+    }
+    write_text(2, "\n");
+    if (wr_is_object(context, exception)) {
+        var key: ptr<u8> = wr_string_utf8("stack");
+        var stack_exception: ptr<u8> = null;
+        var stack: ptr<u8> = wr_get(context, exception, key, &stack_exception);
+        wr_string_release(key);
+        if (stack_exception == null && stack != null && !wr_is_undefined(context, stack)) {
+            wr_protect(context, stack);
+            conversion_exception = null;
+            print_value(context, stack, 2, &conversion_exception);
+            write_text(2, "\n");
+            wr_unprotect(context, stack);
+        }
+    }
+    wr_unprotect(context, exception);
+}

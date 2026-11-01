@@ -1,0 +1,342 @@
+// Wave owns Buffer numeric overloads and bounds. JSC DataView owns IEEE-754/BigInt conversion.
+import("./context_state")::{context_slot, allocate_context_slot, release_context_slot};
+import("./values")::{get, capture, define, fail, coerce_number};
+import("./buffer_core")::{byte_view_length};
+import("std::mem::layout")::{size_of};
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_to_number") fun numeric(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_to_string") fun to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_characters") fun characters(value: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_length") fun string_length(value: ptr<u8>) -> i64;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_construct") fun construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_typed_buffer") fun backing(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_typed_offset") fun byte_offset(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64;
+extern(c, "wr_typed_bytes") fun bytes(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "jsrt_buffer_numeric_callback") fun callback() -> ptr<u8>;
+const SLOT: i64 = 27;
+const FIXED_METHOD_COUNT: i64 = 18;
+const VARIABLE_READ_START: i64 = 36;
+const VARIABLE_WRITE_START: i64 = 40;
+const METHOD_COUNT: i64 = 44;
+const FLOAT_KIND_START: i64 = 6;
+const BIGINT_KIND_START: i64 = 8;
+const SETTER_OFFSET: i64 = 10;
+struct NumericState {
+    ctor: ptr<u8>;
+    intrinsics: array<ptr<u8>, 20>;
+    methods: array<ptr<u8>, 44>;
+}
+
+fun storage(ctx: ptr<u8>) -> ptr<NumericState> {
+    return context_slot(ctx, SLOT) as ptr<NumericState>;
+}
+
+fun arg(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, at: i64) -> ptr<u8> {
+    if (count > at) {
+        return args[at];
+    }
+    return undefined(ctx);
+}
+
+fun integer(ctx: ptr<u8>, value: ptr<u8>, maximum: i64, ex: ptr<ptr<u8>>) -> i64 {
+    if (kind(ctx, value) != 3) {
+        fail(ctx, ex, 1, "offset and byteLength must be numbers");
+        return 0;
+    }
+    var n: f64 = numeric(ctx, value, ex);
+    if (!(n >= 0.0 && n <= maximum as f64) || n != (n as i64) as f64) {
+        fail(ctx, ex, 2, "numeric Buffer offset or width is out of range");
+        return 0;
+    }
+    return n as i64;
+}
+
+fun bigint_range(ctx: ptr<u8>, value: ptr<u8>, signed: bool, ex: ptr<ptr<u8>>) {
+    if (kind(ctx, value) != 7) {
+        fail(ctx, ex, 1, "value must be a bigint");
+        return;
+    }
+    var string: ptr<u8> = to_string(ctx, value, ex);
+    if (string == null || deref ex != null) {
+        return;
+    }
+    var units: ptr<u16> = characters(string);
+    var n: i64 = string_length(string);
+    var start: i64 = 0;
+    var maximum: str = "18446744073709551615";
+    var digits: i64 = 20;
+    var negative: bool = n > 0 && units[0] == 45;
+    if (negative) {
+        start = 1;
+    }
+    if (signed) {
+        digits = 19;
+        maximum = "9223372036854775807";
+        if (negative) {
+            maximum = "9223372036854775808";
+        }
+    }
+    var invalid: bool = (!signed && negative) || n - start > digits;
+    if (!invalid && n - start == digits) {
+        for (var i: i64 = 0; i < digits; i++) {
+            if (units[start+i] > maximum[i] as u16) {
+                invalid = true;
+                break;
+            }
+            if (units[start+i] < maximum[i] as u16) {
+                break;
+            }
+        }
+    }
+    release(string);
+    if (invalid) {
+        fail(ctx, ex, 2, "bigint Buffer value is out of range");
+    }
+}
+
+fun integer_value(ctx: ptr<u8>, value: ptr<u8>, width: i64, signed: bool, ex: ptr<ptr<u8>>) -> f64 {
+    var n: f64 = coerce_number(ctx, value, ex);
+    if (deref ex != null) {
+        return 0.0;
+    }
+
+    var bound: i64 = 1;
+    for (var i: i64 = 0; i < width * 8; i++) {
+        bound *= 2;
+    }
+    var minimum: f64 = 0.0;
+    var maximum: f64 = (bound - 1) as f64;
+    if (signed) {
+        minimum = -(bound / 2) as f64;
+        maximum = (bound / 2 - 1) as f64;
+    }
+    if (n == n && (n < minimum || n > maximum)) {
+        fail(ctx, ex, 2, "numeric Buffer value is out of range");
+    }
+    if (n != n) {
+        return 0.0;
+    }
+    return n;
+}
+
+export(c) fun jsrt_buffer_numeric(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<NumericState> = storage(ctx);
+    var method: i64 = -1;
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        if (equal(ctx, fn, (deref s.methods)[i])) {
+            method = i;
+            break;
+        }
+    }
+    if (method < 0) {
+        fail(ctx, ex, 1, "invalid numeric Buffer method");
+        return undefined(ctx);
+    }
+    var variable: bool = method >= VARIABLE_READ_START;
+    var writing: bool = (method >= FIXED_METHOD_COUNT && method < VARIABLE_READ_START) || method >= VARIABLE_WRITE_START;
+    var id: i64 = method;
+    if (writing && !variable) {
+        id -= FIXED_METHOD_COUNT;
+    }
+    var types: array<i64, 18> = [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9];
+    var widths: array<i64, 18> = [1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 4, 8, 8, 8, 8, 8, 8];
+    var width: i64 = 0;
+    var numeric_kind: i64 = 0;
+    var signed: bool = false;
+    var little: bool = id % 2 == 0;
+    if (variable) {
+        signed = ((method - VARIABLE_READ_START) % 4) >= 2;
+        var width_arg: i64 = 1;
+        if (writing) {
+            width_arg = 2;
+        }
+        width = integer(ctx, arg(ctx, count, args, width_arg), 6, ex);
+        if (width == 0 && deref ex == null) {
+            fail(ctx, ex, 2, "byteLength must be between 1 and 6");
+        }
+    } else {
+        width = widths[id];
+        numeric_kind = types[id];
+        signed = numeric_kind == 0 || numeric_kind == 2 || numeric_kind == 4;
+    }
+    var value: ptr<u8> = arg(ctx, count, args, 0);
+    var n: f64 = 0.0;
+    if (writing && deref ex == null) {
+        if (!variable && numeric_kind >= BIGINT_KIND_START) {
+            bigint_range(ctx, value, numeric_kind == BIGINT_KIND_START, ex);
+        } else if (variable || numeric_kind < FLOAT_KIND_START) {
+            n = integer_value(ctx, value, width, signed, ex);
+        } else {
+            n = coerce_number(ctx, value, ex);
+        }
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var length: i64 = byte_view_length(ctx, receiver, ex);
+    var offset_arg: i64 = 0;
+    if (writing) {
+        offset_arg = 1;
+    }
+    var offset: i64 = 0;
+    var requested: ptr<u8> = arg(ctx, count, args, offset_arg);
+    if (variable || kind(ctx, requested) != 0) {
+        offset = integer(ctx, requested, length, ex);
+    }
+    if (width > length || offset > length - width) {
+        fail(ctx, ex, 2, "numeric Buffer access exceeds view bounds");
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (variable) {
+        var base: i64 = byte_offset(ctx, receiver, ex);
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        var pointer: ptr<u8> = bytes(ctx, receiver, ex);
+        if (pointer == null || deref ex != null) {
+            fail(ctx, ex, 1, "unavailable Buffer storage");
+            return undefined(ctx);
+        }
+        var limit: i64 = 1;
+        for (var i: i64 = 0; i < width * 8; i++) {
+            limit *= 2;
+        }
+        var result: i64 = 0;
+        if (writing) {
+            // Truncate toward zero before two's complement conversion.
+            result = n as i64;
+            if (result < 0) {
+                result += limit;
+            }
+            for (var i: i64 = 0; i < width; i++) {
+                var at: i64 = i;
+                if (!little) {
+                    at = width - 1 - i;
+                }
+                pointer[base+offset+at] = (result & 255) as u8;
+                result = result >> 8;
+            }
+        } else {
+            for (var i: i64 = width; i > 0; i--) {
+                var at: i64 = i - 1;
+                if (!little) {
+                    at = width - i;
+                }
+                result = result * 256 + pointer[base+offset+at] as i64;
+            }
+            if (signed && result >= limit / 2) {
+                result -= limit;
+            }
+        }
+        if (writing) {
+            return number(ctx, (offset+width) as f64);
+        }
+        return number(ctx, result as f64);
+    }
+    var buffer: ptr<u8> = backing(ctx, receiver, ex);
+    if (buffer == null || deref ex != null) {
+        return undefined(ctx);
+    }
+    protect(ctx, buffer);
+    var base: i64 = byte_offset(ctx, receiver, ex);
+    var view_args: array<ptr<u8>, 3> = [buffer, number(ctx, base as f64), number(ctx, length as f64)];
+    var view: ptr<u8> = null;
+    if (deref ex == null) {
+        view = construct(ctx, deref s.ctor, 3, &view_args[0], ex);
+    }
+    unprotect(ctx, buffer);
+    if (view == null || deref ex != null) {
+        return undefined(ctx);
+    }
+    protect(ctx, view);
+    var result: ptr<u8> = undefined(ctx);
+    if (writing) {
+        if (numeric_kind < BIGINT_KIND_START) {
+            value = number(ctx, n);
+        }
+        var setter: array<ptr<u8>, 3> = [number(ctx, offset as f64), value, boolean(ctx, little)];
+        call(ctx, (deref s.intrinsics)[numeric_kind+SETTER_OFFSET], view, 3, &setter[0], ex);
+        result = number(ctx, (offset+width) as f64);
+    } else {
+        var getter: array<ptr<u8>, 2> = [number(ctx, offset as f64), boolean(ctx, little)];
+        result = call(ctx, (deref s.intrinsics)[numeric_kind], view, 2, &getter[0], ex);
+    }
+    unprotect(ctx, view);
+    return result;
+}
+
+pub fun install_buffer_numbers(ctx: ptr<u8>, parent: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (!allocate_context_slot(ctx, SLOT, size_of<NumericState>() as i64)) {
+        return false;
+    }
+    var s: ptr<NumericState> = storage(ctx);
+    deref s.ctor = capture(ctx, global(ctx), "DataView", ex);
+    var prototype: ptr<u8> = get(ctx, deref s.ctor, "prototype", ex);
+    var intrinsics: array<str, 20> = ["getInt8", "getUint8", "getInt16", "getUint16", "getInt32", "getUint32",
+        "getFloat32", "getFloat64", "getBigInt64", "getBigUint64", "setInt8", "setUint8", "setInt16",
+        "setUint16", "setInt32", "setUint32", "setFloat32", "setFloat64", "setBigInt64", "setBigUint64"];
+    for (var i: i64 = 0; i < 20; i++) {
+        (deref s.intrinsics)[i] = capture(ctx, prototype, intrinsics[i], ex);
+    }
+    var names: array<str, 44> = ["readInt8", "readUInt8", "readInt16LE", "readInt16BE", "readUInt16LE",
+        "readUInt16BE", "readInt32LE", "readInt32BE", "readUInt32LE", "readUInt32BE", "readFloatLE",
+        "readFloatBE", "readDoubleLE", "readDoubleBE", "readBigInt64LE", "readBigInt64BE", "readBigUInt64LE",
+        "readBigUInt64BE", "writeInt8", "writeUInt8", "writeInt16LE", "writeInt16BE", "writeUInt16LE",
+        "writeUInt16BE", "writeInt32LE", "writeInt32BE", "writeUInt32LE", "writeUInt32BE", "writeFloatLE",
+        "writeFloatBE", "writeDoubleLE", "writeDoubleBE", "writeBigInt64LE", "writeBigInt64BE", "writeBigUInt64LE",
+        "writeBigUInt64BE", "readUIntLE", "readUIntBE", "readIntLE", "readIntBE", "writeUIntLE", "writeUIntBE",
+        "writeIntLE", "writeIntBE"];
+    for (var i: i64 = 0; i < 44; i++) {
+        var name: ptr<u8> = utf8(names[i]);
+        (deref s.methods)[i] = function(ctx, name, callback());
+        release(name);
+        protect(ctx, (deref s.methods)[i]);
+        define(ctx, parent, names[i], (deref s.methods)[i], ex, false);
+    }
+    var aliases: array<str, 18> = ["readUint8", "readUint16LE", "readUint16BE", "readUint32LE", "readUint32BE",
+        "readBigUint64LE", "readBigUint64BE", "writeUint8", "writeUint16LE", "writeUint16BE", "writeUint32LE",
+        "writeUint32BE", "writeBigUint64LE", "writeBigUint64BE", "readUintLE", "readUintBE", "writeUintLE",
+        "writeUintBE"];
+    var ids: array<i64, 18> = [1, 4, 5, 8, 9, 16, 17, 19, 22, 23, 26, 27, 34, 35, 36, 37, 40, 41];
+    for (var i: i64 = 0; i < 18; i++) {
+        define(ctx, parent, aliases[i], (deref s.methods)[ids[i]], ex, false);
+    }
+    return deref ex == null;
+}
+
+pub fun shutdown_buffer_numbers(ctx: ptr<u8>) {
+    var s: ptr<NumericState> = storage(ctx);
+    if (s == null) {
+        return;
+    }
+    for (var i: i64 = 0; i < 44; i++) {
+        if ((deref s.methods)[i] != null) {
+            unprotect(ctx, (deref s.methods)[i]);
+        }
+    }
+    for (var i: i64 = 0; i < 20; i++) {
+        if ((deref s.intrinsics)[i] != null) {
+            unprotect(ctx, (deref s.intrinsics)[i]);
+        }
+    }
+    if (deref s.ctor != null) {
+        unprotect(ctx, deref s.ctor);
+    }
+    release_context_slot(ctx, SLOT, size_of<NumericState>() as i64);
+}

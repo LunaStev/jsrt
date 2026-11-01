@@ -1,0 +1,206 @@
+// CommonJS JS values, metadata, error reporting and builtin specifier lookup.
+import("./module_state")::{modules_storage, ModulesState};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::ops")::{mem_copy};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+extern(c, "wr_object") fun wr_object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun wr_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_undefined") fun wr_undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_boolean") fun wr_boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_type") fun wr_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_set_prototype") fun wr_set_prototype(ctx: ptr<u8>, object: ptr<u8>, prototype: ptr<u8>);
+extern(c, "wr_get") fun wr_get(ctx: ptr<u8>, object: ptr<u8>, name: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun wr_protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_to_string") fun wr_to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_utf16") fun wr_string_utf16(text: ptr<u16>, count: i64) -> ptr<u8>;
+extern(c, "wr_string_length") fun wr_string_length(text: ptr<u8>) -> i64;
+extern(c, "wr_string_characters") fun wr_string_characters(text: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_value") fun wr_string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_construct") fun wr_construct(ctx: ptr<u8>, constructor: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_call") fun wr_call(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set") fun wr_set(ctx: ptr<u8>, object: ptr<u8>, key: ptr<u8>, value: ptr<u8>, flags: u32,
+    ex: ptr<ptr<u8>>);
+extern(c, "wr_to_boolean") fun wr_to_boolean(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+
+pub fun text(ctx: ptr<u8>, value: str) -> ptr<u8> {
+    var string: ptr<u8> = wr_string_utf8(value);
+    var result: ptr<u8> = wr_string_value(ctx, string);
+    wr_string_release(string);
+    return result;
+}
+
+pub fun get(ctx: ptr<u8>, object: ptr<u8>, name: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var key: ptr<u8> = wr_string_utf8(name);
+    var result: ptr<u8> = wr_get(ctx, object, key, ex);
+    wr_string_release(key);
+    return result;
+}
+
+// A descriptor with a null prototype cannot inherit hostile getters/setters.
+pub fun define(ctx: ptr<u8>, object: ptr<u8>, name: str, value: ptr<u8>, ex: ptr<ptr<u8>>, writable: bool) {
+    var host_state: ptr<ModulesState> = modules_storage(ctx);
+    if (deref ex != null) {
+        return;
+    }
+    wr_protect(ctx, value);
+    var descriptor: ptr<u8> = wr_object(ctx, null, null);
+    wr_protect(ctx, descriptor);
+    wr_set_prototype(ctx, descriptor, wr_null(ctx));
+    // These descriptor properties are defined through the same engine setter
+    // used by the captured JSON adapter, on a fresh null-prototype object.
+    raw_set(ctx, descriptor, "value", value, ex);
+    raw_set(ctx, descriptor, "writable", wr_boolean(ctx, writable), ex);
+    raw_set(ctx, descriptor, "enumerable", wr_boolean(ctx, true), ex);
+    raw_set(ctx, descriptor, "configurable", wr_boolean(ctx, writable), ex);
+    var args: array<ptr<u8>, 3> = [object, text(ctx, name), descriptor];
+    wr_protect(ctx, args[1]);
+    var result: ptr<u8> = wr_call(ctx, (deref host_state.define_fn), null, 3, &args[0], ex);
+    if (deref ex == null && result != null && !wr_to_boolean(ctx, result)) {
+        // Avoid recursion through define() when error metadata cannot be set.
+        basic_error(ctx, ex, 1, "cannot update module metadata");
+    }
+    wr_unprotect(ctx, args[1]);
+    wr_unprotect(ctx, descriptor);
+    wr_unprotect(ctx, value);
+}
+
+pub fun raw_set(ctx: ptr<u8>, object: ptr<u8>, name: str, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    wr_protect(ctx, value);
+    var key: ptr<u8> = wr_string_utf8(name);
+    wr_set(ctx, object, key, value, 0, ex);
+    wr_string_release(key);
+    wr_unprotect(ctx, value);
+}
+
+pub fun own_get(ctx: ptr<u8>, object: ptr<u8>, name: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<ModulesState> = modules_storage(ctx);
+    var args: array<ptr<u8>, 2> = [object, text(ctx, name)];
+    wr_protect(ctx, args[1]);
+    var descriptor: ptr<u8> = wr_call(ctx, (deref host_state.descriptor_fn), null, 2, &args[0], ex);
+    wr_unprotect(ctx, args[1]);
+    if (deref ex != null || descriptor == null || wr_type(ctx, descriptor) == 0) {
+        return wr_undefined(ctx);
+    }
+    wr_protect(ctx, descriptor);
+    var result: ptr<u8> = get(ctx, descriptor, "value", ex);
+    wr_unprotect(ctx, descriptor);
+    return result;
+}
+
+pub fun basic_error(ctx: ptr<u8>, ex: ptr<ptr<u8>>, kind: i32, message: str) {
+    var host_state: ptr<ModulesState> = modules_storage(ctx);
+    if (deref ex != null) {
+        return;
+    }
+    var args: array<ptr<u8>, 1> = [text(ctx, message)];
+    wr_protect(ctx, args[0]);
+    var nested: ptr<u8> = null;
+    var error: ptr<u8> = wr_construct(ctx, (deref host_state.constructors)[kind], 1, &args[0], &nested);
+    deref ex = error;
+    if (nested != null) {
+        deref ex = nested;
+    }
+    wr_unprotect(ctx, args[0]);
+}
+
+pub fun error(ctx: ptr<u8>, ex: ptr<ptr<u8>>, kind: i32, message: str, code: str) {
+    if (deref ex != null) {
+        return;
+    }
+    basic_error(ctx, ex, kind, message);
+    var value: ptr<u8> = deref ex;
+    wr_protect(ctx, value);
+    var nested: ptr<u8> = null;
+    define(ctx, value, "code", text(ctx, code), &nested, true);
+    wr_unprotect(ctx, value);
+}
+
+pub fun missing(ctx: ptr<u8>, request: str, ex: ptr<ptr<u8>>) {
+    var message: array<u8, 8256>;
+    var prefix: str = "Cannot find module: ";
+    var a: i64 = mem_len_cstr(prefix);
+    var b: i64 = mem_len_cstr(request);
+    mem_copy(&message[0], prefix as ptr<u8>, a);
+    mem_copy(&message[a], request as ptr<u8>, b + 1);
+    error(ctx, ex, 0, &message[0] as str, "MODULE_NOT_FOUND");
+}
+
+// JSC's function-creation syntax errors may only show the caller in stack.
+// Preserve the original exception and attach the actual dependency filename.
+pub fun annotate(ctx: ptr<u8>, value: ptr<u8>, path: str) {
+    wr_protect(ctx, value);
+    var nested: ptr<u8> = null;
+    define(ctx, value, "fileName", text(ctx, path), &nested, true);
+    var message: ptr<u8> = own_get(ctx, value, "message", &nested);
+    if (nested == null && wr_type(ctx, message) == 4) {
+        var original: ptr<u8> = wr_to_string(ctx, message, &nested);
+        var prefix: ptr<u8> = wr_string_utf8(path);
+        var a: i64 = wr_string_length(prefix);
+        var b: i64 = wr_string_length(original);
+        if (a + b < 4194304) {
+            var joined: ptr<u16> = mem_alloc((a + b + 2) * 2) as ptr<u16>;
+            if (joined != null) {
+                mem_copy(joined as ptr<u8>, wr_string_characters(prefix) as ptr<u8>, a * 2);
+                deref joined[a] = 58;
+                deref joined[a + 1] = 32;
+                mem_copy((joined + a + 2) as ptr<u8>, wr_string_characters(original) as ptr<u8>, b * 2);
+                var result: ptr<u8> = wr_string_utf16(joined, a + b + 2);
+                define(ctx, value, "message", wr_string_value(ctx, result), &nested, true);
+                wr_string_release(result);
+                mem_free(joined as ptr<u8>, (a + b + 2) * 2);
+            }
+        }
+        wr_string_release(prefix);
+        wr_string_release(original);
+    }
+    wr_unprotect(ctx, value);
+}
+
+pub fun builtin(request: str) -> i64 {
+    if (mem_eq_cstr(request, "stream/web") || mem_eq_cstr(request, "node:stream/web")) {
+        return 20;
+    }
+    if (mem_eq_cstr(request, "querystring") || mem_eq_cstr(request, "node:querystring")) {
+        return 19;
+    }
+    if (mem_eq_cstr(request, "worker_threads") || mem_eq_cstr(request, "node:worker_threads")) {
+        return 18;
+    }
+    if (mem_eq_cstr(request, "child_process") || mem_eq_cstr(request, "node:child_process")) {
+        return 17;
+    }
+    if (mem_eq_cstr(request, "path/posix") || mem_eq_cstr(request, "node:path/posix")) {
+        return 11;
+    }
+    if (mem_eq_cstr(request, "os") || mem_eq_cstr(request, "node:os")) {
+        return 12;
+    }
+    if (mem_eq_cstr(request, "util") || mem_eq_cstr(request, "node:util")) {
+        return 13;
+    }
+    if (mem_eq_cstr(request, "assert") || mem_eq_cstr(request, "node:assert") || mem_eq_cstr(request,
+        "assert/strict") || mem_eq_cstr(request, "node:assert/strict")) {
+        return 14;
+    }
+    if (mem_eq_cstr(request, "crypto") || mem_eq_cstr(request, "node:crypto")) {
+        return 15;
+    }
+    if (mem_eq_cstr(request, "url") || mem_eq_cstr(request, "node:url")) {
+        return 16;
+    }
+    var names: array<str, 24> = ["fs", "node:fs", "process", "node:process", "timers", "node:timers",
+        "console", "node:console", "fs/promises", "node:fs/promises", "http", "node:http", "buffer",
+        "node:buffer", "events", "node:events", "stream", "node:stream", "stream/promises", "node:stream/promises",
+        "https", "node:https", "path", "node:path"];
+    for (var i: i64 = 0; i < 24; i++) {
+        if (mem_eq_cstr(request, names[i])) {
+            return i / 2;
+        }
+    }
+    return -1;
+}

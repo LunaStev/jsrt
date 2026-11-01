@@ -1,0 +1,154 @@
+// API installation and teardown. Preserve order and clean partial initialization.
+import("./console")::{install_console};
+import("./context_state")::{release_host_slots};
+import("./child_process")::{shutdown_children};
+import("./addons")::{install_addons, shutdown_addons};
+import("./json")::{install_json, shutdown_json};
+import("./timers")::{install_timers, shutdown_timers};
+import("./system")::{install_system, shutdown_system};
+import("./fs_sync")::{install_fs_sync, shutdown_fs_sync};
+import("./fs_directory")::{install_fs_directory, shutdown_fs_directory};
+import("./async_fs")::{install_async_fs, shutdown_async_fs};
+import("./file_handles")::{install_file_handles, shutdown_file_handles};
+import("./modules")::{install_modules, shutdown_modules};
+import("./output")::{write_text};
+import("./http_server")::{install_http, shutdown_http, http_module};
+import("./body_collect")::{install_body_collect, shutdown_body_collect};
+import("./http_client")::{install_client, shutdown_client};
+import("./values")::{install_values, shutdown_values};
+import("./buffer")::{install_buffer, shutdown_buffer};
+import("./collections")::{install_collections, shutdown_collections};
+import("./events")::{install_events, shutdown_events};
+import("./streams")::{install_streams, shutdown_streams};
+import("./file_streams")::{install_file_streams, shutdown_file_streams};
+import("./stream_utils")::{install_stream_utils, shutdown_stream_utils};
+import("./abort")::{install_abort, shutdown_abort};
+import("./path")::{install_path, shutdown_path};
+import("./os")::{install_os, shutdown_os};
+import("./util")::{install_util, shutdown_util};
+import("./assert")::{install_assert, shutdown_assert};
+import("./crypto")::{install_crypto, shutdown_crypto};
+import("./url")::{install_url, shutdown_url};
+extern(c, "wr_bind_context") fun bind_context(ctx: ptr<u8>);
+import("./esm")::{install_esm, shutdown_esm};
+import("./headers")::{install_headers, shutdown_headers};
+import("./web_objects")::{install_web_objects, shutdown_web_objects};
+import("./web_support")::{install_web_support, shutdown_web_support};
+import("./text_codec")::{install_text_codec, shutdown_text_codec};
+import("./web_events")::{install_web_events, shutdown_web_events};
+import("./web_streams")::{install_web_streams, shutdown_web_streams};
+import("./clone")::{install_clone, shutdown_clone};
+import("./workers")::{install_workers, shutdown_workers};
+import("./process_events")::{install_process_events, shutdown_process_events};
+import("./process_io")::{shutdown_process_io};
+import("./next_tick")::{install_next_ticks, shutdown_next_ticks};
+import("./values")::{get};
+extern(c, "wr_context_global") fun process_global(ctx: ptr<u8>) -> ptr<u8>;
+
+pub fun install_host(context: ptr<u8>, source_index: i32, eval_mode: bool, path: str, exception: ptr<ptr<u8>>) -> bool {
+    bind_context(context);
+    if (!install_console(context)) {
+        write_text(2, "cannot install console API\n");
+        return false;
+    } else if (!install_values(context, exception) || !install_buffer(context, exception)) {
+        write_text(2, "cannot install binary buffer APIs\n");
+        return false;
+    } else if (!install_json(context)) {
+        write_text(2, "cannot install wjson JSON APIs\n");
+        return false;
+    } else if (!install_timers(context)) {
+        write_text(2, "cannot install event loop APIs\n");
+        return false;
+    } else if ( !install_collections(context, exception) || !install_events(context, exception) || !install_streams(context,
+        exception)) {
+        write_text(2, "cannot install event and stream APIs\n");
+        return false;
+    } else if (!install_web_support(context, exception) || !install_text_codec(context, exception) ||
+        !install_web_events(context, exception) || !install_url(context, exception) || !install_abort(context, exception) || !install_stream_utils(context,
+        exception) || !install_web_streams(context, exception)) {
+        write_text(2, "cannot install URL, cancellation and stream utilities\n");
+        return false;
+    } else if (!install_system(context, source_index, eval_mode)) {
+        write_text(2, "cannot install process and filesystem APIs\n");
+        return false;
+    } else if (!install_fs_sync(context, exception) || !install_fs_directory(context, exception)) {
+        write_text(2, "cannot install synchronous file APIs\n");
+        return false;
+    } else if (!install_async_fs(context)) {
+        write_text(2, "cannot install asynchronous file APIs\n");
+        return false;
+    } else if (!install_file_handles(context, exception) || !install_file_streams(context, exception)) {
+        write_text(2, "cannot install file stream APIs\n");
+        return false;
+    } else if (!install_http(context, exception)) {
+        write_text(2, "cannot install HTTP APIs\n");
+        return false;
+    } else if (!install_headers(context, exception) || !install_body_collect(context, exception) ||
+        !install_web_objects(context, exception) || !install_client(context, http_module(), exception)) {
+        write_text(2, "cannot install HTTP client APIs\n");
+        return false;
+    } else if ( !install_path(context, exception) || !install_os(context, exception) || !install_util(context,
+        exception) || !install_assert(context, exception) || !install_crypto(context, exception) || !install_addons(context) || !install_workers(context, exception) || !install_modules(context,
+        path, eval_mode, exception)) {
+        write_text(2, "cannot install CommonJS module loader\n");
+        return false;
+    }
+    install_next_ticks(context, exception);
+    install_process_events(context, get(context, process_global(context), "process", exception), exception);
+    return deref exception == null && install_clone(context, exception) && install_esm(context, exception);
+}
+
+pub fun shutdown_host(context: ptr<u8>) -> bool {
+    bind_context(context);
+    var workers_ok: bool = shutdown_workers(context);
+    shutdown_esm(context);
+    shutdown_clone(context);
+    shutdown_next_ticks(context);
+    shutdown_timers(context);
+    shutdown_client(context);
+    shutdown_headers(context);
+    shutdown_process_events(context);
+    shutdown_process_io(context);
+    var ok: bool = shutdown_http(context) && workers_ok;
+    ok = shutdown_children(context) && ok;
+    if (!ok) {
+        write_text(2, "cannot close network event loop\n");
+    }
+    if (!shutdown_async_fs(context)) {
+        write_text(2, "cannot join file workers\n");
+        // A failed join leaves descriptors and JS roots visible to a worker.
+        // Preserve the context and all dependent resource storage in that case.
+        return false;
+    }
+    shutdown_file_streams(context);
+    shutdown_file_handles(context);
+    shutdown_addons(context);
+    shutdown_modules(context);
+    shutdown_url(context);
+    shutdown_crypto(context);
+    shutdown_path(context);
+    shutdown_os(context);
+    shutdown_util(context);
+    shutdown_assert(context);
+    shutdown_body_collect(context);
+    shutdown_web_objects(context);
+    shutdown_text_codec(context);
+    shutdown_stream_utils(context);
+    shutdown_web_streams(context);
+    shutdown_abort(context);
+    shutdown_web_events(context);
+    shutdown_web_support(context);
+    shutdown_streams(context);
+    shutdown_events(context);
+    shutdown_collections(context);
+    shutdown_fs_directory(context);
+    shutdown_fs_sync(context);
+    shutdown_system(context);
+    shutdown_json(context);
+    shutdown_buffer(context);
+    shutdown_values(context);
+    if (ok) {
+        release_host_slots(context);
+    }
+    return ok;
+}

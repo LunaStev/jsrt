@@ -1,0 +1,377 @@
+import("./context_state")::{owned_context_slot, active_context};
+import("std::mem::layout")::{size_of};
+struct BodyCollectState {
+    states: ptr<u8>;
+    parse_json: ptr<u8>;
+    methods: array<ptr<u8>, 8>;
+}
+
+fun body_collect_storage(ctx: ptr<u8>) -> ptr<BodyCollectState> {
+    return owned_context_slot(ctx, 10, size_of<BodyCollectState>() as i64) as ptr<BodyCollectState>;
+}
+
+// Fetch body consumption is a one-shot operation on the native byte stream.
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./values")::{get, put, text, plain, define, getter, capture, fail};
+import("./web_support")::{readonly};
+import("./collections")::{weak_map, weak_get, weak_set, list, length, at, append, flag, set_flag, integer,
+    set_integer, bind_one};
+import("./events")::{add_listener, remove_listener, event_state};
+import("./buffer")::{copy_buffer_input};
+import("./buffer_core")::{copy_byte_view, buffer_from_bytes};
+import("./byte_codec")::{decode_bytes};
+import("./streams")::{stream_invoke};
+import("./stream_state")::{stream_state};
+import("./stream_utils")::{premature_error};
+import("./config")::{BUFFER_LIMIT, BUFFER_PART_LIMIT, EVENT_LISTENER_LIMIT};
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_typed_buffer") fun backing(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_promise") fun promise(ctx: ptr<u8>, resolve: ptr<ptr<u8>>, reject: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "jsrt_body_callback") fun callback(code: i32) -> ptr<u8>;
+
+fun cleanup(ctx: ptr<u8>, record: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var body: ptr<u8> = get(ctx, record, "body", ex);
+    var hooks: ptr<u8> = get(ctx, record, "hooks", ex);
+    var names: array<str, 4> = ["data", "end", "error", "close"];
+    for (var i: i64 = 0; i < length(ctx, hooks, ex); i++) {
+        remove_listener(ctx, body, text(ctx, names[i]), at(ctx, hooks, i, ex), null, ex);
+    }
+}
+
+fun finish(ctx: ptr<u8>, record: ptr<u8>, error: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (flag(ctx, record, "done", ex)) {
+        return;
+    }
+    set_flag(ctx, record, "done", true, ex);
+    protect(ctx, error);
+    protect(ctx, value);
+    var rooted: ptr<u8> = value;
+    cleanup(ctx, record, ex);
+    var cb: ptr<u8> = get(ctx, record, "resolve", ex);
+    if (kind(ctx, error) != 0) {
+        cb = get(ctx, record, "reject", ex);
+        value = error;
+    }
+    var args: array<ptr<u8>, 1> = [value];
+    call(ctx, cb, null, 1, &args[0], ex);
+    unprotect(ctx, error);
+    unprotect(ctx, rooted);
+}
+
+export(c) fun jsrt_body_event(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<BodyCollectState> = body_collect_storage(ctx);
+    var record: ptr<u8> = args[0];
+    if (flag(ctx, record, "done", ex)) {
+        return undefined(ctx);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[0])) {
+        var chunks: ptr<u8> = get(ctx, record, "chunks", ex);
+        var size: i64 = integer(ctx, record, "size", ex);
+        var n: i64 = raw_length(ctx, args[1], ex);
+        if (n > BUFFER_LIMIT - size || length(ctx, chunks, ex) >= BUFFER_PART_LIMIT) {
+            var problem: ptr<u8> = null;
+            fail(ctx, &problem, 2, "fetch body exceeds buffered consumption limit");
+            protect(ctx, problem);
+            finish(ctx, record, problem, undefined(ctx), ex);
+            var stop: array<ptr<u8>, 1> = [problem];
+            stream_invoke(ctx, receiver, 6, 1, &stop[0], ex);
+            unprotect(ctx, problem);
+        } else {
+            // Other data listeners can mutate the exposed Buffer after this hook.
+            var snapshot: ptr<u8> = copy_buffer_input(ctx, args[1], undefined(ctx), ex);
+            if (deref ex != null || snapshot == null) {
+                return undefined(ctx);
+            }
+            protect(ctx, snapshot);
+            append(ctx, chunks, snapshot, ex);
+            set_integer(ctx, record, "size", size + n, ex);
+            unprotect(ctx, snapshot);
+        }
+    } else if (equal(ctx, fn, (deref host_state.methods)[1])) {
+        var size: i64 = integer(ctx, record, "size", ex);
+        var bytes: ptr<u8> = mem_alloc(size + 1);
+        var problem: ptr<u8> = null;
+        var value: ptr<u8> = undefined(ctx);
+        if (bytes == null) {
+            fail(ctx, &problem, 2, "cannot allocate fetch body");
+        } else {
+            var chunks: ptr<u8> = get(ctx, record, "chunks", ex);
+            var used: i64 = 0;
+            for (var i: i64 = 0; i < length(ctx, chunks, ex) && problem == null; i++) {
+                var n: i64 = copy_byte_view(ctx, at(ctx, chunks, i, ex), bytes + used, size - used, &problem);
+                if (n >= 0) {
+                    used += n;
+                }
+            }
+            if (problem == null && used != size) {
+                fail(ctx, &problem, 1, "fetch body byte count changed during collection");
+            }
+            var mode: i64 = integer(ctx, record, "mode", ex);
+            if (problem == null && mode == 6) {
+                var buffer: ptr<u8> = buffer_from_bytes(ctx, bytes, size, &problem);
+                protect(ctx, buffer);
+                value = backing(ctx, buffer, &problem);
+                unprotect(ctx, buffer);
+            } else if (problem == null) {
+                var start: i64 = 0;
+                if (size >= 3 && bytes[0] == 239 && bytes[1] == 187 && bytes[2] == 191) {
+                    start = 3;
+                }
+                value = decode_bytes(ctx, bytes + start, size - start, 0, &problem);
+                protect(ctx, value);
+                if (mode == 5 && problem == null) {
+                    var parsed: array<ptr<u8>, 1> = [value];
+                    var result: ptr<u8> = call(ctx, (deref host_state.parse_json), null, 1, &parsed[0],
+                        &problem);
+                    unprotect(ctx, value);
+                    value = result;
+                } else {
+                    unprotect(ctx, value);
+                }
+            }
+            mem_free(bytes, size + 1);
+        }
+        if (problem == null) {
+            problem = undefined(ctx);
+        }
+        finish(ctx, record, problem, value, ex);
+    } else {
+        var problem: ptr<u8> = premature_error(ctx);
+        if (equal(ctx, fn, (deref host_state.methods)[2]) && count > 1) {
+            problem = args[1];
+        }
+        finish(ctx, record, problem, undefined(ctx), ex);
+    }
+    return undefined(ctx);
+}
+
+extern(c, "wr_typed_length") fun raw_length(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64;
+export(c) fun jsrt_body_consume(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<BodyCollectState> = body_collect_storage(ctx);
+    var base: ptr<u8> = weak_get(ctx, (deref host_state.states), receiver, ex);
+    var disturbed: bool = false;
+    var closed: bool = false;
+    if (kind(ctx, base) == 5 && kind(ctx, get(ctx, base, "body", ex)) == 5) {
+        var state: ptr<u8> = stream_state(ctx, get(ctx, base, "body", ex), 0, ex);
+        if (state != null) {
+            disturbed = flag(ctx, state, "disturbed", ex);
+            closed = flag(ctx, state, "destroyed", ex);
+        }
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[7])) {
+        if (kind(ctx, base) != 5) {
+            fail(ctx, ex, 1, "invalid Body receiver");
+            return undefined(ctx);
+        }
+        return boolean(ctx, kind(ctx, base) == 5 && (flag(ctx, base, "used", ex) || disturbed));
+    }
+    var resolve: ptr<u8> = null;
+    var reject: ptr<u8> = null;
+    var result: ptr<u8> = promise(ctx, &resolve, &reject, ex);
+    protect(ctx, result);
+    protect(ctx, resolve);
+    protect(ctx, reject);
+    if (kind(ctx, base) == 5 && kind(ctx, get(ctx, base, "body", ex)) == 1) {
+        // A null body has no stream to disturb and may be consumed repeatedly.
+        var empty: ptr<u8> = text(ctx, "");
+        var problem: ptr<u8> = null;
+        if (equal(ctx, fn, (deref host_state.methods)[5])) {
+            var call_args: array<ptr<u8>, 1> = [empty];
+            empty = call(ctx, deref host_state.parse_json, null, 1, &call_args[0], &problem);
+        } else if (equal(ctx, fn, (deref host_state.methods)[6])) {
+            var bytes: ptr<u8> = buffer_from_bytes(ctx, null, 0, &problem);
+            protect(ctx, bytes);
+            empty = backing(ctx, bytes, &problem);
+            unprotect(ctx, bytes);
+        }
+        var done: ptr<u8> = resolve;
+        if (problem != null) {
+            done = reject;
+            empty = problem;
+        }
+        var output: array<ptr<u8>, 1> = [empty];
+        call(ctx, done, null, 1, &output[0], ex);
+        unprotect(ctx, reject);
+        unprotect(ctx, resolve);
+        unprotect(ctx, result);
+        return result;
+    }
+    var problem: ptr<u8> = null;
+    if (kind(ctx, base) != 5) {
+        fail(ctx, &problem, 1, "invalid Response receiver");
+    } else if (flag(ctx, base, "used", ex) || disturbed) {
+        fail(ctx, &problem, 1, "response body already consumed");
+    } else if (closed) {
+        set_flag(ctx, base, "used", true, ex);
+        var state: ptr<u8> = stream_state(ctx, get(ctx, base, "body", ex), 0, ex);
+        problem = get(ctx, state, "failure", ex);
+        if (kind(ctx, problem) == 0) {
+            problem = premature_error(ctx);
+        }
+    }
+    if (problem == null) {
+        var listeners: ptr<u8> = event_state(ctx, get(ctx, base, "body", ex), ex);
+        if (length(ctx, get(ctx, listeners, "listeners", ex), ex) > EVENT_LISTENER_LIMIT - 4) {
+            fail(ctx, &problem, 2, "fetch body listener limit exceeded");
+        }
+    }
+    if (problem != null) {
+        var rejected: array<ptr<u8>, 1> = [problem];
+        call(ctx, reject, null, 1, &rejected[0], ex);
+    } else {
+        set_flag(ctx, base, "used", true, ex);
+        var body: ptr<u8> = get(ctx, base, "body", ex);
+        var record: ptr<u8> = plain(ctx);
+        protect(ctx, record);
+        put(ctx, record, "body", body, ex);
+        put(ctx, record, "resolve", resolve, ex);
+        put(ctx, record, "reject", reject, ex);
+        put(ctx, record, "chunks", list(ctx, ex), ex);
+        set_integer(ctx, record, "size", 0, ex);
+        var mode: i64 = 4;
+        if (equal(ctx, fn, (deref host_state.methods)[5])) {
+            mode = 5;
+        } else if (equal(ctx, fn, (deref host_state.methods)[6])) {
+            mode = 6;
+        }
+        set_integer(ctx, record, "mode", mode, ex);
+        var hooks: ptr<u8> = list(ctx, ex);
+        protect(ctx, hooks);
+        put(ctx, record, "hooks", hooks, ex);
+        var names: array<str, 4> = ["data", "end", "error", "close"];
+        for (var i: i64 = 0; i < 4 && deref ex == null; i++) {
+            var hook: ptr<u8> = bind_one(ctx, (deref host_state.methods)[i], body, record, ex);
+            protect(ctx, hook);
+            append(ctx, hooks, hook, ex);
+            add_listener(ctx, body, text(ctx, names[i]), hook, false, false, ex);
+            unprotect(ctx, hook);
+        }
+        unprotect(ctx, hooks);
+        unprotect(ctx, record);
+    }
+    unprotect(ctx, reject);
+    unprotect(ctx, resolve);
+    unprotect(ctx, result);
+    return result;
+}
+
+pub fun attach_body(ctx: ptr<u8>, response: ptr<u8>, body: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var host_state: ptr<BodyCollectState> = body_collect_storage(ctx);
+    var base: ptr<u8> = plain(ctx);
+    protect(ctx, base);
+    put(ctx, base, "body", body, ex);
+    weak_set(ctx, (deref host_state.states), response, base, ex);
+    unprotect(ctx, base);
+    readonly(ctx, response, "body", body, ex);
+    define(ctx, response, "text", (deref host_state.methods)[4], ex, false);
+    define(ctx, response, "json", (deref host_state.methods)[5], ex, false);
+    define(ctx, response, "arrayBuffer", (deref host_state.methods)[6], ex, false);
+    getter(ctx, response, "bodyUsed", (deref host_state.methods)[7], ex);
+}
+
+pub fun body_consumed(ctx: ptr<u8>, owner: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var host_state: ptr<BodyCollectState> = body_collect_storage(ctx);
+    var base: ptr<u8> = weak_get(ctx, (deref host_state.states), owner, ex);
+    if (kind(ctx, base) != 5) {
+        return false;
+    }
+    var body: ptr<u8> = get(ctx, base, "body", ex);
+    if (kind(ctx, body) != 5) {
+        return false;
+    }
+    var state: ptr<u8> = stream_state(ctx, body, 0, ex);
+    return flag(ctx, base, "used", ex) || (state != null && flag(ctx, state, "disturbed", ex));
+}
+
+pub fun mark_body_consumed(ctx: ptr<u8>, owner: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var host_state: ptr<BodyCollectState> = body_collect_storage(ctx);
+    var base: ptr<u8> = weak_get(ctx, (deref host_state.states), owner, ex);
+    if (kind(ctx, base) == 5) {
+        set_flag(ctx, base, "used", true, ex);
+    }
+}
+
+pub fun body_failure(ctx: ptr<u8>, owner: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<BodyCollectState> = body_collect_storage(ctx);
+    var base: ptr<u8> = weak_get(ctx, deref host_state.states, owner, ex);
+    if (kind(ctx, base) != 5) {
+        return undefined(ctx);
+    }
+    var body: ptr<u8> = get(ctx, base, "body", ex);
+    if (kind(ctx, body) != 5) {
+        return undefined(ctx);
+    }
+    var state: ptr<u8> = stream_state(ctx, body, 0, ex);
+    if (state == null || !flag(ctx, state, "destroyed", ex)) {
+        return undefined(ctx);
+    }
+    var reason: ptr<u8> = get(ctx, state, "failure", ex);
+    if (kind(ctx, reason) == 0) {
+        reason = premature_error(ctx);
+    }
+    return reason;
+}
+
+pub fun fail_buffered_body(ctx: ptr<u8>, owner: ptr<u8>, reason: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var host_state: ptr<BodyCollectState> = body_collect_storage(ctx);
+    var base: ptr<u8> = weak_get(ctx, deref host_state.states, owner, ex);
+    var body: ptr<u8> = get(ctx, base, "body", ex);
+    var state: ptr<u8> = stream_state(ctx, body, 0, ex);
+    if (state == null) {
+        return;
+    }
+    // A newly cloned buffered body has no native resource or pending write.
+    // Preserve its existing error without scheduling a second error event.
+    put(ctx, state, "failure", reason, ex);
+    put(ctx, state, "reads", list(ctx, ex), ex);
+    set_integer(ctx, state, "rbytes", 0, ex);
+    set_flag(ctx, state, "destroyed", true, ex);
+    set_flag(ctx, state, "closed", true, ex);
+}
+
+pub fun install_body_collect(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var host_state: ptr<BodyCollectState> = body_collect_storage(ctx);
+    (deref host_state.states) = weak_map(ctx, ex);
+    protect(ctx, (deref host_state.states));
+    (deref host_state.parse_json) = capture(ctx, get(ctx, global(ctx), "JSON", ex), "parse", ex);
+    var names: array<str, 8> = ["collectData", "collectEnd", "collectError", "collectClose", "text",
+        "json", "arrayBuffer", "bodyUsed"];
+    for (var i: i64 = 0; i < 8; i++) {
+        var name: ptr<u8> = utf8(names[i]);
+        (deref host_state.methods)[i] = function(ctx, name, callback(i as i32));
+        release(name);
+        protect(ctx, (deref host_state.methods)[i]);
+    }
+    return deref ex == null;
+}
+
+pub fun shutdown_body_collect(ctx: ptr<u8>) {
+    var host_state: ptr<BodyCollectState> = body_collect_storage(ctx);
+    if ((deref host_state.states) != null) {
+        unprotect(ctx, (deref host_state.states));
+        (deref host_state.states) = null;
+    }
+    if ((deref host_state.parse_json) != null) {
+        unprotect(ctx, (deref host_state.parse_json));
+        (deref host_state.parse_json) = null;
+    }
+    for (var i: i64 = 0; i < 8; i++) {
+        if ((deref host_state.methods)[i] != null) {
+            unprotect(ctx, (deref host_state.methods)[i]);
+            (deref host_state.methods)[i] = null;
+        }
+    }
+}

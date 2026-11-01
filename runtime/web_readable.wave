@@ -1,0 +1,269 @@
+// Default readable streams. Byte/BYOB modes are rejected until implemented.
+import("./web_stream_core")::{record, handle, capability, internal_capability, settle, resolved, rejected_type, type_error, job, follow, read_result, initialize, field_number, queue_size, queue_entry, shift, close_readable, error_readable, READABLE, READER, READ_CONTROLLER, OPEN, CLOSED, ERRORED, JOB_READ_START, JOB_READ_PULL, JOB_READ_CANCEL};
+import("./values")::{get, put, plain, fail};
+import("./collections")::{list, length, at, append, remove_at, integer, set_integer, flag, set_flag};
+import("./web_support")::{apply};
+import("./config")::{STREAM_CHUNK_LIMIT};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+pub fun pull(ctx: ptr<u8>, r: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (integer(ctx, r, "state", ex) != OPEN || flag(ctx, r, "closeRequested", ex) || !flag(ctx, r, "started", ex)) {
+        return;
+    }
+    if (length(ctx, get(ctx, r, "requests", ex), ex) == 0 &&
+        field_number(ctx, r, "high", ex) <= field_number(ctx, r, "total", ex)) {
+        return;
+    }
+    if (flag(ctx, r, "pulling", ex)) {
+        set_flag(ctx, r, "pullAgain", true, ex);
+        return;
+    }
+    set_flag(ctx, r, "pulling", true, ex);
+    var fn: ptr<u8> = get(ctx, r, "pull", ex);
+    var problem: ptr<u8> = null;
+    var result: ptr<u8> = undefined(ctx);
+    if (kind(ctx, fn) != 0) {
+        var call_args: array<ptr<u8>, 1> = [get(ctx, r, "controller", ex)];
+        result = apply(ctx, fn, get(ctx, r, "source", ex), 1, &call_args[0], &problem);
+    }
+    if (problem != null) {
+        error_readable(ctx, r, problem, ex);
+        set_flag(ctx, r, "pulling", false, ex);
+    } else {
+        follow(ctx, result, job(ctx, JOB_READ_PULL, r, undefined(ctx), ex), ex);
+    }
+}
+pub fun create_readable(ctx: ptr<u8>, source: ptr<u8>, strategy: ptr<u8>, high: f64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var r: ptr<u8> = plain(ctx);
+    protect(ctx, r);
+    initialize(ctx, r, READABLE, strategy, high, ex);
+    put(ctx, r, "requests", list(ctx, ex), ex);
+    put(ctx, r, "source", source, ex);
+    var owner: ptr<u8> = handle(ctx, READABLE, r, ex);
+    protect(ctx, owner);
+    put(ctx, r, "owner", owner, ex);
+    var controller: ptr<u8> = plain(ctx);
+    protect(ctx, controller);
+    set_integer(ctx, controller, "kind", READ_CONTROLLER, ex);
+    put(ctx, controller, "stream", r, ex);
+    put(ctx, r, "controller", handle(ctx, READ_CONTROLLER, controller, ex), ex);
+    unprotect(ctx, controller);
+    var start: ptr<u8> = undefined(ctx);
+    if (kind(ctx, source) == 5) {
+        if (kind(ctx, get(ctx, source, "type", ex)) != 0) {
+            fail(ctx, ex, 1, "ReadableStream byte/BYOB mode is not supported");
+        }
+        var names: array<str, 3> = ["start", "pull", "cancel"];
+        for (var i: i64 = 0; i < 3 && deref ex == null; i++) {
+            var fn: ptr<u8> = get(ctx, source, names[i], ex);
+            if (kind(ctx, fn) != 0 && !callable(ctx, fn)) {
+                fail(ctx, ex, 1, "ReadableStream source callbacks must be callable");
+            }
+            put(ctx, r, names[i], fn, ex);
+        }
+        start = get(ctx, r, "start", ex);
+    } else if (kind(ctx, source) != 0 && kind(ctx, source) != 1) {
+        fail(ctx, ex, 1, "ReadableStream source must be an object");
+    }
+    var result: ptr<u8> = undefined(ctx);
+    if (deref ex == null && kind(ctx, start) != 0) {
+        var call_args: array<ptr<u8>, 1> = [get(ctx, r, "controller", ex)];
+        result = apply(ctx, start, source, 1, &call_args[0], ex);
+    }
+    if (deref ex == null) {
+        follow(ctx, result, job(ctx, JOB_READ_START, r, undefined(ctx), ex), ex);
+    } else {
+        var reason: ptr<u8> = deref ex;
+        var ignored: ptr<u8> = null;
+        error_readable(ctx, r, reason, &ignored);
+    }
+    unprotect(ctx, owner);
+    unprotect(ctx, r);
+    return owner;
+}
+pub fun enqueue_readable(ctx: ptr<u8>, r: ptr<u8>, chunk: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (integer(ctx, r, "state", ex) != OPEN || flag(ctx, r, "closeRequested", ex)) {
+        fail(ctx, ex, 1, "cannot enqueue into a closed or errored stream");
+        return;
+    }
+    var requests: ptr<u8> = get(ctx, r, "requests", ex);
+    if (length(ctx, requests, ex) > 0) {
+        var deferred: ptr<u8> = at(ctx, requests, 0, ex);
+        protect(ctx, deferred);
+        remove_at(ctx, requests, 0, ex);
+        settle(ctx, deferred, read_result(ctx, chunk, false, ex), false, ex);
+        unprotect(ctx, deferred);
+    } else {
+        var size: f64 = queue_size(ctx, r, chunk, ex);
+        if (deref ex == null && (integer(ctx, r, "state", ex) != OPEN || flag(ctx, r, "closeRequested", ex))) {
+            fail(ctx, ex, 1, "stream changed during size conversion");
+        }
+        if (deref ex == null) {
+            queue_entry(ctx, r, chunk, size, undefined(ctx), ex);
+        }
+        if (deref ex != null) {
+            var problem: ptr<u8> = deref ex;
+            var ignored: ptr<u8> = null;
+            error_readable(ctx, r, problem, &ignored);
+            return;
+        }
+    }
+    pull(ctx, r, ex);
+}
+pub fun request_close(ctx: ptr<u8>, r: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (integer(ctx, r, "state", ex) != OPEN || flag(ctx, r, "closeRequested", ex)) {
+        fail(ctx, ex, 1, "ReadableStream is already closing or closed");
+        return;
+    }
+    set_flag(ctx, r, "closeRequested", true, ex);
+    if (length(ctx, get(ctx, r, "queue", ex), ex) == 0) {
+        close_readable(ctx, r, ex);
+    }
+}
+pub fun reader(ctx: ptr<u8>, owner: ptr<u8>, options: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var r: ptr<u8> = record(ctx, owner, READABLE, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (kind(ctx, options) == 5) {
+        if (kind(ctx, get(ctx, options, "mode", ex)) != 0) {
+            fail(ctx, ex, 1, "BYOB readers are not supported");
+        }
+    } else if (kind(ctx, options) != 0 && kind(ctx, options) != 1) {
+        fail(ctx, ex, 1, "reader options must be an object");
+    }
+    if (deref ex != null || kind(ctx, get(ctx, r, "reader", ex)) == 5) {
+        fail(ctx, ex, 1, "ReadableStream is locked");
+        return undefined(ctx);
+    }
+    var cursor: ptr<u8> = plain(ctx);
+    protect(ctx, cursor);
+    set_integer(ctx, cursor, "kind", READER, ex);
+    put(ctx, cursor, "stream", r, ex);
+    var closed: ptr<u8> = internal_capability(ctx, ex);
+    put(ctx, cursor, "closed", closed, ex);
+    var phase: i64 = integer(ctx, r, "state", ex);
+    if (phase == CLOSED) {
+        settle(ctx, closed, undefined(ctx), false, ex);
+    } else if (phase == ERRORED) {
+        settle(ctx, closed, get(ctx, r, "error", ex), true, ex);
+    }
+    put(ctx, r, "reader", cursor, ex);
+    var result: ptr<u8> = handle(ctx, READER, cursor, ex);
+    unprotect(ctx, cursor);
+    return result;
+}
+pub fun read(ctx: ptr<u8>, owner: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var cursor: ptr<u8> = record(ctx, owner, READER, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var r: ptr<u8> = get(ctx, cursor, "stream", ex);
+    if (kind(ctx, r) != 5) {
+        return rejected_type(ctx, "reader lock has been released", ex);
+    }
+    set_flag(ctx, r, "disturbed", true, ex);
+    var phase: i64 = integer(ctx, r, "state", ex);
+    if (phase == CLOSED) {
+        return resolved(ctx, read_result(ctx, undefined(ctx), true, ex), false, ex);
+    }
+    if (phase == ERRORED) {
+        return resolved(ctx, get(ctx, r, "error", ex), true, ex);
+    }
+    var deferred: ptr<u8> = capability(ctx, ex);
+    protect(ctx, deferred);
+    var queue: ptr<u8> = get(ctx, r, "queue", ex);
+    if (length(ctx, queue, ex) > 0) {
+        var entry: ptr<u8> = shift(ctx, r, ex);
+        settle(ctx, deferred, read_result(ctx, get(ctx, entry, "chunk", ex), false, ex), false, ex);
+        if (flag(ctx, r, "closeRequested", ex) && length(ctx, queue, ex) == 0) {
+            close_readable(ctx, r, ex);
+        } else {
+            pull(ctx, r, ex);
+        }
+    } else {
+        var requests: ptr<u8> = get(ctx, r, "requests", ex);
+        if (length(ctx, requests, ex) >= STREAM_CHUNK_LIMIT) {
+            settle(ctx, deferred, type_error(ctx, "pending read limit exceeded"), true, ex);
+        } else {
+            append(ctx, requests, deferred, ex);
+            pull(ctx, r, ex);
+        }
+    }
+    var result: ptr<u8> = get(ctx, deferred, "promise", ex);
+    unprotect(ctx, deferred);
+    return result;
+}
+pub fun cancel(ctx: ptr<u8>, r: ptr<u8>, reason: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    set_flag(ctx, r, "disturbed", true, ex);
+    var phase: i64 = integer(ctx, r, "state", ex);
+    if (phase == CLOSED) {
+        return resolved(ctx, undefined(ctx), false, ex);
+    }
+    if (phase == ERRORED) {
+        return resolved(ctx, get(ctx, r, "error", ex), true, ex);
+    }
+    put(ctx, r, "queue", list(ctx, ex), ex);
+    put(ctx, r, "total", number(ctx, 0.0), ex);
+    close_readable(ctx, r, ex);
+    var fn: ptr<u8> = get(ctx, r, "cancel", ex);
+    var problem: ptr<u8> = null;
+    var result: ptr<u8> = undefined(ctx);
+    if (kind(ctx, fn) != 0) {
+        var call_args: array<ptr<u8>, 1> = [reason];
+        result = apply(ctx, fn, get(ctx, r, "source", ex), 1, &call_args[0], &problem);
+    }
+    if (problem != null) {
+        return resolved(ctx, problem, true, ex);
+    }
+    var deferred: ptr<u8> = capability(ctx, ex);
+    protect(ctx, deferred);
+    follow(ctx, result, job(ctx, JOB_READ_CANCEL, r, deferred, ex), ex);
+    var output: ptr<u8> = get(ctx, deferred, "promise", ex);
+    unprotect(ctx, deferred);
+    return output;
+}
+pub fun release_reader(ctx: ptr<u8>, cursor: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var r: ptr<u8> = get(ctx, cursor, "stream", ex);
+    if (kind(ctx, r) != 5) {
+        return;
+    }
+    var problem: ptr<u8> = type_error(ctx, "reader lock has been released");
+    protect(ctx, problem);
+    var closed: ptr<u8> = get(ctx, cursor, "closed", ex);
+    if (flag(ctx, closed, "settled", ex)) {
+        closed = internal_capability(ctx, ex);
+        put(ctx, cursor, "closed", closed, ex);
+    }
+    settle(ctx, closed, problem, true, ex);
+    var requests: ptr<u8> = get(ctx, r, "requests", ex);
+    protect(ctx, requests);
+    put(ctx, r, "requests", list(ctx, ex), ex);
+    for (var i: i64 = 0; i < length(ctx, requests, ex); i++) {
+        settle(ctx, at(ctx, requests, i, ex), problem, true, ex);
+    }
+    put(ctx, r, "reader", undefined(ctx), ex);
+    put(ctx, cursor, "stream", undefined(ctx), ex);
+    unprotect(ctx, requests);
+    unprotect(ctx, problem);
+}
+pub fun read_job(ctx: ptr<u8>, r: ptr<u8>, operation: i64, value: ptr<u8>, failed: bool, ex: ptr<ptr<u8>>) {
+    if (failed) {
+        error_readable(ctx, r, value, ex);
+        return;
+    }
+    if (operation == JOB_READ_START) {
+        set_flag(ctx, r, "started", true, ex);
+        pull(ctx, r, ex);
+    } else {
+        set_flag(ctx, r, "pulling", false, ex);
+        if (flag(ctx, r, "pullAgain", ex)) {
+            set_flag(ctx, r, "pullAgain", false, ex);
+            pull(ctx, r, ex);
+        }
+    }
+}

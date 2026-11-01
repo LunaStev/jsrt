@@ -1,0 +1,489 @@
+// Package exports/imports target selection and nearest-package policy.
+import("./module_state")::{modules_storage, ModulesState, PATH_CAP};
+import("./module_support")::{text, get, own_get, error, missing, builtin};
+import("./module_files")::{ends, file, parsed_file, canonical};
+import("std::mem::alloc")::{mem_free};
+import("./system")::{copy_host_path};
+import("std::fs::file")::{Metadata, metadata};
+import("std::path::copy")::{path_join2, path_dirname_copy};
+import("std::mem::ops")::{mem_copy};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+extern(c, "wr_null") fun wr_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_undefined") fun wr_undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun wr_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_protect") fun wr_protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_to_string") fun wr_to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_string_equal") fun wr_string_equal(left: ptr<u8>, right: ptr<u8>) -> bool;
+extern(c, "wr_call") fun wr_call(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_get_index") fun wr_index(ctx: ptr<u8>, value: ptr<u8>, index: u32, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_to_number") fun wr_numeric(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_is_array") fun wr_is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+// Expand targets before array fallback selection, without probing file existence.
+pub fun expanded_target(ctx: ptr<u8>, value: ptr<u8>, pattern: ptr<u8>, imports: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var source: array<u8, 8192>;
+    var result: array<u8, 8192>;
+    var n: i64 = copy_host_path(ctx, value, &source[0], PATH_CAP, ex);
+    if (n < 0) {
+        return wr_undefined(ctx);
+    }
+    var capture_size: i64 = 0;
+    if (pattern != null) {
+        capture_size = mem_len_cstr(pattern as str);
+    }
+    var used: i64 = 0;
+    for (var i: i64 = 0; i < n; i++) {
+        if (source[i] == 42 && pattern != null) {
+            if (used + capture_size >= PATH_CAP) {
+                error(ctx, ex, 2, "package expansion limit exceeded", "ERR_MODULE_LIMIT");
+                return wr_undefined(ctx);
+            }
+            mem_copy(&result[used], pattern, capture_size);
+            used += capture_size;
+        } else {
+            if (used >= PATH_CAP - 1) {
+                error(ctx, ex, 2, "package expansion limit exceeded", "ERR_MODULE_LIMIT");
+                return wr_undefined(ctx);
+            }
+            result[used] = source[i];
+            used += 1;
+        }
+    }
+    result[used] = 0;
+    var local: bool = used >= 2 && result[0] == 46 && result[1] == 47;
+    if ((local && used <= 2) || (!local && (!imports || used == 0 || result[0] == 46 || result[0] == 47 || result[0] == 35))) {
+        error(ctx, ex, 1, "invalid package target", "ERR_INVALID_PACKAGE_TARGET");
+        return wr_undefined(ctx);
+    }
+    for (var i: i64 = 0; i < used; i++) {
+        if (result[i] == 92 || result[i] == 37 || result[i] == 63 || result[i] == 35 || result[i] == 42 || (result[i] == 58 && builtin(&result[0] as str) < 0)) {
+            error(ctx, ex, 1, "unsupported package target character", "ERR_INVALID_PACKAGE_TARGET");
+            return wr_undefined(ctx);
+        }
+    }
+    var cursor: i64 = 0;
+    if (local) {
+        cursor = 2;
+    }
+    while (cursor < used) {
+        var first: i64 = cursor;
+        while (cursor < used && result[cursor] != 47) {
+            cursor += 1;
+        }
+        var segment: array<u8, 8192>;
+        var size: i64 = cursor - first;
+        for (var i: i64 = 0; i < size; i++) {
+            var c: u8 = result[first + i];
+            if (c >= 65 && c <= 90) {
+                c += 32;
+            }
+            segment[i] = c;
+        }
+        segment[size] = 0;
+        if (size == 0 || mem_eq_cstr(&segment[0] as str, ".") || mem_eq_cstr(&segment[0] as str, "..") || mem_eq_cstr(&segment[0] as str,
+            "node_modules")) {
+            error(ctx, ex, 1, "forbidden package target segment", "ERR_INVALID_PACKAGE_TARGET");
+            return wr_undefined(ctx);
+        }
+        cursor += 1;
+    }
+    return text(ctx, &result[0] as str);
+}
+
+pub fun select_target(ctx: ptr<u8>, value: ptr<u8>, level: i64, pattern: ptr<u8>, imports: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<ModulesState> = modules_storage(ctx);
+    if (level > 16) {
+        error(ctx, ex, 2, "package condition nesting limit exceeded", "ERR_MODULE_LIMIT");
+        return wr_undefined(ctx);
+    }
+    var value_kind: i32 = wr_type(ctx, value);
+    if (value_kind == 0 || value_kind == 1) {
+        return value;
+    }
+    if (value_kind == 4) {
+        return expanded_target(ctx, value, pattern, imports, ex);
+    }
+    if (value_kind != 5) {
+        error(ctx, ex, 1, "package target must be a string, null, array or condition object", "ERR_INVALID_PACKAGE_TARGET");
+        return wr_undefined(ctx);
+    }
+    if (wr_is_array(ctx, value)) {
+        var n: i64 = wr_numeric(ctx, get(ctx, value, "length", ex), ex) as i64;
+        if (n > 128) {
+            error(ctx, ex, 2, "package fallback count limit exceeded", "ERR_MODULE_LIMIT");
+            return wr_undefined(ctx);
+        }
+        var last: ptr<u8> = null;
+        for (var i: i64 = 0; i < n && deref ex == null; i++) {
+            var nested: ptr<u8> = null;
+            var result: ptr<u8> = select_target(ctx, wr_index(ctx, value, i as u32, ex), level + 1, pattern,
+                imports, &nested);
+            if (nested != null) {
+                wr_protect(ctx, nested);
+                var ignored: ptr<u8> = null;
+                var code: ptr<u8> = get(ctx, nested, "code", &ignored);
+                var bytes: array<u8, 8192>;
+                var invalid: bool = copy_host_path(ctx, code, &bytes[0], PATH_CAP, &ignored) >= 0 && mem_eq_cstr(&bytes[0] as str,
+                    "ERR_INVALID_PACKAGE_TARGET");
+                if (last != null) {
+                    wr_unprotect(ctx, last);
+                }
+                last = nested;
+                if (!invalid) {
+                    deref ex = nested;
+                    break;
+                }
+            } else if (wr_type(ctx, result) != 0) {
+                if (last != null) {
+                    wr_unprotect(ctx, last);
+                }
+                return result;
+            }
+        }
+        if (last != null) {
+            if (deref ex == null) {
+                deref ex = last;
+            }
+            wr_unprotect(ctx, last);
+        }
+        return wr_null(ctx);
+    }
+    var args: array<ptr<u8>, 1> = [value];
+    var keys: ptr<u8> = wr_call(ctx, (deref host_state.keys_fn), null, 1, &args[0], ex);
+    if (deref ex != null) {
+        return wr_undefined(ctx);
+    }
+    wr_protect(ctx, keys);
+    var amount: i64 = wr_numeric(ctx, get(ctx, keys, "length", ex), ex) as i64;
+    if (amount > 128) {
+        error(ctx, ex, 2, "package condition count limit exceeded", "ERR_MODULE_LIMIT");
+    }
+    var result: ptr<u8> = wr_undefined(ctx);
+    for (var i: i64 = 0; i < amount && deref ex == null; i++) {
+        var key: ptr<u8> = wr_index(ctx, keys, i as u32, ex);
+        var bytes: array<u8, 8192>;
+        if (copy_host_path(ctx, key, &bytes[0], PATH_CAP, ex) < 0) {
+            break;
+        }
+        if (bytes[0] == 46 || (bytes[0] >= 48 && bytes[0] <= 57)) {
+            error(ctx, ex, 1, "invalid package condition key", "ERR_INVALID_PACKAGE_CONFIG");
+            break;
+        }
+        var mode: str = "require";
+        if (deref host_state.esm_resolving) {
+            mode = "import";
+        }
+        if (mem_eq_cstr(&bytes[0] as str, mode) || mem_eq_cstr(&bytes[0] as str, "node") || mem_eq_cstr(&bytes[0] as str,
+            "default")) {
+            result = select_target(ctx, own_get(ctx, value, &bytes[0] as str, ex), level + 1, pattern,
+                imports, ex);
+            if (wr_type(ctx, result) != 0) {
+                break;
+            }
+        }
+    }
+    wr_unprotect(ctx, keys);
+    return result;
+}
+
+pub fun select_mapping(ctx: ptr<u8>, mapping: ptr<u8>, request: str, imports: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<ModulesState> = modules_storage(ctx);
+    var size: i64 = mem_len_cstr(request);
+    if (size == 0 || request[size - 1] == 47) {
+        error(ctx, ex, 1, "invalid package subpath", "ERR_INVALID_MODULE_SPECIFIER");
+        return wr_undefined(ctx);
+    }
+    var exact: ptr<u8> = own_get(ctx, mapping, request, ex);
+    if (wr_type(ctx, exact) != 0) {
+        return select_target(ctx, exact, 0, null, imports, ex);
+    }
+    var args: array<ptr<u8>, 1> = [mapping];
+    var keys: ptr<u8> = wr_call(ctx, (deref host_state.keys_fn), null, 1, &args[0], ex);
+    if (deref ex != null) {
+        return wr_undefined(ctx);
+    }
+    wr_protect(ctx, keys);
+    var n: i64 = wr_numeric(ctx, get(ctx, keys, "length", ex), ex) as i64;
+    var best: i64 = -1;
+    var best_prefix: i64 = -1;
+    var best_size: i64 = -1;
+    var capture: array<u8, 8192>;
+    if (n > 128) {
+        error(ctx, ex, 2, "package map count limit exceeded", "ERR_MODULE_LIMIT");
+    }
+    for (var i: i64 = 0; i < n && deref ex == null; i++) {
+        var key: array<u8, 8192>;
+        var k: i64 = copy_host_path(ctx, wr_index(ctx, keys, i as u32, ex), &key[0], PATH_CAP, ex);
+        if (k < 0) {
+            break;
+        }
+        var star: i64 = -1;
+        var stars: i64 = 0;
+        for (var j: i64 = 0; j < k; j++) {
+            if (key[j] == 42) {
+                star = j;
+                stars += 1;
+            }
+        }
+        if (stars != 1 || size < k || size <= star) {
+            continue;
+        }
+        var tail: i64 = k - star - 1;
+        var matches: bool = true;
+        for (var j: i64 = 0; j < star; j++) {
+            if (key[j] != request[j]) {
+                matches = false;
+                break;
+            }
+        }
+        for (var j: i64 = 0; j < tail && matches; j++) {
+            if (key[star + 1 + j] != request[size - tail + j]) {
+                matches = false;
+            }
+        }
+        if (matches && (star > best_prefix || (star == best_prefix && k > best_size))) {
+            best = i;
+            best_prefix = star;
+            best_size = k;
+            mem_copy(&capture[0], (request as ptr<u8>) + star, size - star - tail);
+            capture[size - star - tail] = 0;
+        }
+    }
+    var result: ptr<u8> = wr_undefined(ctx);
+    if (best >= 0 && deref ex == null) {
+        var key: array<u8, 8192>;
+        if (copy_host_path(ctx, wr_index(ctx, keys, best as u32, ex), &key[0], PATH_CAP, ex) >= 0) {
+            result = select_target(ctx, own_get(ctx, mapping, &key[0] as str, ex), 0, &capture[0], imports,
+                ex);
+        }
+    }
+    wr_unprotect(ctx, keys);
+    return result;
+}
+
+pub fun map_file(ctx: ptr<u8>, root: str, target: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var relative_path: array<u8, 8192>;
+    var n: i64 = copy_host_path(ctx, target, &relative_path[0], PATH_CAP, ex);
+    if (n < 0) {
+        return null;
+    }
+    if (n < 3 || relative_path[0] != 46 || relative_path[1] != 47) {
+        error(ctx, ex, 1, "package target must start with ./", "ERR_INVALID_PACKAGE_TARGET");
+        return null;
+    }
+    for (var i: i64 = 2; i < n; i++) {
+        if (relative_path[i] == 92 || relative_path[i] == 37 || relative_path[i] == 63 || relative_path[i] == 35 || relative_path[i] == 42) {
+            error(ctx, ex, 1, "unsupported package target URL or pattern", "ERR_INVALID_PACKAGE_TARGET");
+            return null;
+        }
+    }
+    var at: i64 = 2;
+    while (at < n) {
+        var begin: i64 = at;
+        while (at < n && relative_path[at] != 47) {
+            at += 1;
+        }
+        var saved: u8 = relative_path[at];
+        relative_path[at] = 0;
+        var segment: str = &relative_path[begin] as str;
+        var invalid: bool = mem_eq_cstr(segment, ".") || mem_eq_cstr(segment, "..") || mem_eq_cstr(segment,
+            "node_modules");
+        relative_path[at] = saved;
+        if (invalid) {
+            error(ctx, ex, 1, "package target contains a forbidden path segment", "ERR_INVALID_PACKAGE_TARGET");
+            return null;
+        }
+        at += 1;
+    }
+    var joined: array<u8, 8192>;
+    if (path_join2(&joined[0], 8192, root, &relative_path[2] as str) < 0) {
+        error(ctx, ex, 2, "package target path limit exceeded", "ERR_MODULE_LIMIT");
+        return null;
+    }
+    var result: ptr<u8> = file(&joined[0] as str);
+    if (result == null) {
+        missing(ctx, &joined[0] as str, ex);
+    }
+    return result;
+}
+
+pub fun package_export(ctx: ptr<u8>, root: str, subpath: str, found: ptr<bool>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<ModulesState> = modules_storage(ctx);
+    var manifest: array<u8, 8192>;
+    var info: Metadata;
+    if (path_join2(&manifest[0], 8192, root, "package.json") < 0 || metadata(&manifest[0] as str, &info) < 0 || !info.is_file) {
+        return null;
+    }
+    var package: ptr<u8> = parsed_file(ctx, &manifest[0] as str, ex);
+    if (deref ex != null) {
+        return null;
+    }
+    wr_protect(ctx, package);
+    if (wr_type(ctx, package) != 5 || wr_is_array(ctx, package)) {
+        error(ctx, ex, 1, "package.json must contain an object", "ERR_INVALID_PACKAGE_CONFIG");
+        wr_unprotect(ctx, package);
+        return null;
+    }
+    var mapping: ptr<u8> = own_get(ctx, package, "exports", ex);
+    if (wr_type(ctx, mapping) == 0) {
+        wr_unprotect(ctx, package);
+        return null;
+    }
+    deref found = true;
+    var target: ptr<u8> = wr_undefined(ctx);
+    if (wr_type(ctx, mapping) == 5 && !wr_is_array(ctx, mapping)) {
+        var args: array<ptr<u8>, 1> = [mapping];
+        var keys: ptr<u8> = wr_call(ctx, (deref host_state.keys_fn), null, 1, &args[0], ex);
+        if (deref ex == null) {
+            wr_protect(ctx, keys);
+            var n: i64 = wr_numeric(ctx, get(ctx, keys, "length", ex), ex) as i64;
+            var paths: bool = false;
+            var conditions: bool = false;
+            for (var i: i64 = 0; i < n && deref ex == null; i++) {
+                var name: array<u8, 8192>;
+                if (copy_host_path(ctx, wr_index(ctx, keys, i as u32, ex), &name[0], PATH_CAP, ex) >= 0) {
+                    if (name[0] == 46) {
+                        paths = true;
+                    } else {
+                        conditions = true;
+                    }
+                }
+            }
+            if (paths && conditions) {
+                error(ctx, ex, 1, "package exports cannot mix paths and conditions", "ERR_INVALID_PACKAGE_CONFIG");
+            }
+            if (paths) {
+                target = select_mapping(ctx, mapping, subpath, false, ex);
+            } else if (mem_eq_cstr(subpath, ".")) {
+                target = select_target(ctx, mapping, 0, null, false, ex);
+            }
+            wr_unprotect(ctx, keys);
+        }
+    } else if (mem_eq_cstr(subpath, ".")) {
+        target = select_target(ctx, mapping, 0, null, false, ex);
+    }
+    var result: ptr<u8> = null;
+    if (deref ex == null) {
+        if (wr_type(ctx, target) != 4) {
+            error(ctx, ex, 0, "package subpath is not exported", "ERR_PACKAGE_PATH_NOT_EXPORTED");
+        } else {
+            result = map_file(ctx, root, target, ex);
+        }
+    }
+    wr_unprotect(ctx, package);
+    return result;
+}
+
+// Package traversal must start from an absolute path: dirname(".") is ".".
+pub fun esm_scope(ctx: ptr<u8>, path: str, ex: ptr<ptr<u8>>) -> bool {
+    if (ends(path, ".mjs")) {
+        return true;
+    }
+    if (ends(path, ".cjs") || ends(path, ".json")) {
+        return false;
+    }
+    if (path[0] != 47) {
+        var resolved: ptr<u8> = canonical(path);
+        if (resolved == null) {
+            missing(ctx, path, ex);
+            return false;
+        }
+        var result: bool = esm_scope(ctx, resolved as str, ex);
+        mem_free(resolved, PATH_CAP);
+        return result;
+    }
+    var directory: array<u8, 8192>;
+    var scratch: array<u8, 8192>;
+    if (path_dirname_copy(&directory[0], 8192, path) < 0) {
+        return false;
+    }
+    while (true) {
+        if (ends(&directory[0] as str, "/node_modules")) {
+            return false;
+        }
+        var info: Metadata;
+        if (path_join2(&scratch[0], 8192, &directory[0] as str, "package.json") < 0) {
+            error(ctx, ex, 2, "package scope path is too long", "ERR_MODULE_LIMIT");
+            return false;
+        }
+        if (metadata(&scratch[0] as str, &info) == 0 && info.is_file) {
+            var package: ptr<u8> = parsed_file(ctx, &scratch[0] as str, ex);
+            if (deref ex != null) {
+                return false;
+            }
+            wr_protect(ctx, package);
+            var esm: bool = false;
+            if (wr_type(ctx, package) != 5) {
+                error(ctx, ex, 1, "package.json must contain an object", "ERR_INVALID_PACKAGE_CONFIG");
+            } else {
+                var mode: ptr<u8> = own_get(ctx, package, "type", ex);
+                if (deref ex == null && wr_type(ctx, mode) == 4) {
+                    var actual: ptr<u8> = wr_to_string(ctx, mode, ex);
+                    var expected: ptr<u8> = wr_string_utf8("module");
+                    esm = wr_string_equal(actual, expected);
+                    wr_string_release(actual);
+                    wr_string_release(expected);
+                }
+            }
+            wr_unprotect(ctx, package);
+            return esm && deref ex == null;
+        }
+        if (mem_eq_cstr(&directory[0] as str, "/")) {
+            return false;
+        }
+        if (path_dirname_copy(&scratch[0], 8192, &directory[0] as str) < 0) {
+            return false;
+        }
+        mem_copy(&directory[0], &scratch[0], mem_len_cstr(&scratch[0] as str) + 1);
+    }
+    return false;
+}
+
+pub fun commonjs_scope(ctx: ptr<u8>, path: str, ex: ptr<ptr<u8>>) -> bool {
+    if (esm_scope(ctx, path, ex)) {
+        error(ctx, ex, 0, "package declares ES modules; require cannot load ESM", "ERR_REQUIRE_ESM");
+    }
+    return deref ex == null;
+}
+
+pub fun self_export(ctx: ptr<u8>, directory_path: str, name: str, subpath: str, found: ptr<bool>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var directory: array<u8, 8192>;
+    var scratch: array<u8, 8192>;
+    var info: Metadata;
+    mem_copy(&directory[0], directory_path as ptr<u8>, mem_len_cstr(directory_path) + 1);
+    while (!ends(&directory[0] as str, "/node_modules")) {
+        if (path_join2(&scratch[0], PATH_CAP as i32, &directory[0] as str, "package.json") >= 0 && metadata(&scratch[0] as str,
+            &info) == 0 && info.is_file) {
+            var package: ptr<u8> = parsed_file(ctx, &scratch[0] as str, ex);
+            if (deref ex != null) {
+                return null;
+            }
+            wr_protect(ctx, package);
+            var matches: bool = false;
+            if (wr_type(ctx, package) == 5 && !wr_is_array(ctx, package)) {
+                var declared: ptr<u8> = own_get(ctx, package, "name", ex);
+                var exported: ptr<u8> = own_get(ctx, package, "exports", ex);
+                if (wr_type(ctx, declared) == 4 && wr_type(ctx, exported) != 0) {
+                    var actual: array<u8, 8192>;
+                    if (copy_host_path(ctx, declared, &actual[0], PATH_CAP, ex) >= 0) {
+                        matches = mem_eq_cstr(&actual[0] as str, name);
+                    }
+                }
+            }
+            wr_unprotect(ctx, package);
+            if (matches) {
+                return package_export(ctx, &directory[0] as str, subpath, found, ex);
+            }
+            return null;
+        }
+        if (mem_eq_cstr(&directory[0] as str, "/") || path_dirname_copy(&scratch[0], PATH_CAP as i32,
+            &directory[0] as str) < 0) {
+            break;
+        }
+        mem_copy(&directory[0], &scratch[0], mem_len_cstr(&scratch[0] as str) + 1);
+    }
+    return null;
+}

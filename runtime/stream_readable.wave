@@ -1,0 +1,378 @@
+// Readable queues, flow control, piping and read callbacks.
+import("./stream_operations")::{schedule, release_pass_write, push_chunk, unpipe, destroy_stream, finish_text, auto_destroy};
+import("./stream_state")::{finish_stream_signal};
+import("./stream_text")::{configure_text, read_text};
+import("./stream_writable")::{stream_write, stream_end};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::ops")::{mem_copy};
+import("./values")::{get, put, text, fail};
+import("./collections")::{length, at, set_at, remove_at, integer, flag, set_integer, set_flag, bind_one};
+import("./events")::{add_listener, emit_named};
+import("./stream_state")::{stream_state, stream_chunk, stream_state_storage, StreamHostState, stream_chunk_size};
+import("./buffer")::{buffer_integer};
+import("./buffer_core")::{byte_view_length, copy_byte_view, buffer_from_bytes, buffer_subview};
+import("./config")::{STREAM_BYTE_LIMIT};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, left: ptr<u8>, right: ptr<u8>) -> bool;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+
+pub fun stream_push(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<u8> = stream_state(ctx, receiver, 1, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    if (count == 0) {
+        fail(ctx, ex, 1, "push requires a chunk or null");
+        return undefined(ctx);
+    }
+    if (flag(ctx, state, "destroyed", ex)) {
+        return boolean(ctx, false);
+    }
+    if (flag(ctx, state, "ended", ex)) {
+        fail(ctx, ex, 0, "push after EOF");
+        return undefined(ctx);
+    }
+    set_flag(ctx, state, "pulling", false, ex);
+    if (kind(ctx, args[0]) == 1) {
+        set_flag(ctx, state, "ended", true, ex);
+        schedule(ctx, receiver, state, false, ex);
+        return boolean(ctx, false);
+    }
+    var enc: ptr<u8> = undefined(ctx);
+    if (count > 1) {
+        enc = args[1];
+    }
+    var chunk: ptr<u8> = args[0];
+    if (!flag(ctx, state, "readableObjectMode", ex)) {
+        chunk = stream_chunk(ctx, args[0], enc, ex);
+    }
+    if (chunk == null || deref ex != null) {
+        return undefined(ctx);
+    }
+    protect(ctx, chunk);
+    set_flag(ctx, state, "readableNotified", false, ex);
+    var accepted: bool = push_chunk(ctx, receiver, state, chunk, ex);
+    unprotect(ctx, chunk);
+    return boolean(ctx, accepted);
+}
+
+pub fun take_chunk(ctx: ptr<u8>, receiver: ptr<u8>, state: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    set_flag(ctx, state, "disturbed", true, ex);
+    var reads: ptr<u8> = get(ctx, state, "reads", ex);
+    var chunk: ptr<u8> = at(ctx, reads, 0, ex);
+    protect(ctx, chunk);
+    var size: i64 = stream_chunk_size(ctx, state, chunk, true, ex);
+    remove_at(ctx, reads, 0, ex);
+    set_integer(ctx, state, "rbytes", integer(ctx, state, "rbytes", ex) - size, ex);
+    release_pass_write(ctx, receiver, state, ex);
+    unprotect(ctx, chunk);
+    return chunk;
+}
+
+pub fun stream_read(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<u8> = stream_state(ctx, receiver, 1, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    if (flag(ctx, state, "destroyed", ex)) {
+        return js_null(ctx);
+    }
+    set_flag(ctx, state, "reading", true, ex);
+    set_flag(ctx, state, "readableNotified", false, ex);
+    finish_text(ctx, state, ex);
+    var total: i64 = integer(ctx, state, "rbytes", ex);
+    var size: i64 = -1;
+    if (count > 0 && kind(ctx, args[0]) != 0) {
+        size = buffer_integer(ctx, args[0], 0, STREAM_BYTE_LIMIT, ex);
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (flag(ctx, state, "readableObjectMode", ex) && size != 0) {
+        size = -1;
+    }
+    if (total == 0 || size == 0 || (size > total && !flag(ctx, state, "ended", ex))) {
+        set_flag(ctx, state, "requested", true, ex);
+        schedule(ctx, receiver, state, false, ex);
+        return js_null(ctx);
+    }
+    var result: ptr<u8> = js_null(ctx);
+    if (size < 0) {
+        result = take_chunk(ctx, receiver, state, ex);
+        protect(ctx, result);
+    } else if (flag(ctx, state, "utf8", ex)) {
+        if (size > total) {
+            size = total;
+        }
+        result = read_text(ctx, state, size, ex);
+        protect(ctx, result);
+        release_pass_write(ctx, receiver, state, ex);
+    } else {
+        if (size > total) {
+            size = total;
+        }
+        var bytes: ptr<u8> = mem_alloc(STREAM_BYTE_LIMIT + 1);
+        var output: ptr<u8> = mem_alloc(size + 1);
+        if (bytes == null || output == null) {
+            fail(ctx, ex, 2, "cannot allocate stream read");
+        } else {
+            var used: i64 = 0;
+            var reads: ptr<u8> = get(ctx, state, "reads", ex);
+            while (used < size && deref ex == null) {
+                var chunk: ptr<u8> = at(ctx, reads, 0, ex);
+                protect(ctx, chunk);
+                var n: i64 = copy_byte_view(ctx, chunk, bytes, STREAM_BYTE_LIMIT, ex);
+                var selected: i64 = size - used;
+                if (selected > n) {
+                    selected = n;
+                }
+                if (n >= 0 && deref ex == null) {
+                    mem_copy(output + used, bytes, selected);
+                    used += selected;
+                    if (selected == n) {
+                        remove_at(ctx, reads, 0, ex);
+                    } else {
+                        var remainder: ptr<u8> = buffer_subview(ctx, chunk, selected, n - selected, ex);
+                        // Replace only the private queue's first element.
+                        set_at(ctx, reads, 0, remainder, ex);
+                    }
+                }
+                unprotect(ctx, chunk);
+            }
+            if (deref ex == null) {
+                set_flag(ctx, state, "disturbed", true, ex);
+                set_integer(ctx, state, "rbytes", total - size, ex);
+                result = buffer_from_bytes(ctx, output, size, ex);
+            }
+        }
+        protect(ctx, result);
+        if (bytes != null) {
+            mem_free(bytes, STREAM_BYTE_LIMIT + 1);
+        }
+        if (output != null) {
+            mem_free(output, size + 1);
+        }
+        release_pass_write(ctx, receiver, state, ex);
+    }
+    schedule(ctx, receiver, state, false, ex);
+    unprotect(ctx, result);
+    return result;
+}
+
+export(c) fun jsrt_stream_set_encoding(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<u8> = stream_state(ctx, receiver, 1, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    var value: ptr<u8> = undefined(ctx);
+    if (count > 0) {
+        value = args[0];
+    }
+    configure_text(ctx, state, value, ex);
+    finish_text(ctx, state, ex);
+    release_pass_write(ctx, receiver, state, ex);
+    schedule(ctx, receiver, state, false, ex);
+    return receiver;
+}
+
+pub fun stream_flow(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var state: ptr<u8> = stream_state(ctx, receiver, 1, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    var flowing: bool = equal(ctx, fn, (deref stream_state_roots.stream_methods)[3]);
+    if (!flag(ctx, state, "destroyed", ex)) {
+        set_flag(ctx, state, "flow", flowing, ex);
+        if (flowing) {
+            set_flag(ctx, state, "reading", true, ex);
+            schedule(ctx, receiver, state, false, ex);
+        }
+    }
+    return receiver;
+}
+
+pub fun stream_after_add(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<u8> = stream_state(ctx, receiver, 0, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    if ((integer(ctx, state, "type", ex) & 1) != 0 && count > 0 && equal(ctx, args[0], text(ctx, "data")) && !flag(ctx,
+        state, "destroyed", ex)) {
+        set_flag(ctx, state, "flow", true, ex);
+        set_flag(ctx, state, "reading", true, ex);
+        schedule(ctx, receiver, state, false, ex);
+    }
+    if ((integer(ctx, state, "type", ex) & 1) != 0 && count > 0 && equal(ctx, args[0], text(ctx, "readable")) &&
+        !flag(ctx, state, "destroyed", ex)) {
+        set_flag(ctx, state, "readableListener", true, ex);
+        set_flag(ctx, state, "requested", true, ex);
+        set_flag(ctx, state, "reading", true, ex);
+        schedule(ctx, receiver, state, false, ex);
+    }
+    return undefined(ctx);
+}
+
+pub fun stream_pipe(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var state: ptr<u8> = stream_state(ctx, receiver, 1, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    if (equal(ctx, fn, (deref stream_state_roots.stream_methods)[8])) {
+        if (count == 0 || equal(ctx, args[0], get(ctx, state, "pipe", ex))) {
+            unpipe(ctx, receiver, state, ex);
+            set_flag(ctx, state, "flow", false, ex);
+        }
+        return receiver;
+    }
+    if (count == 0) {
+        fail(ctx, ex, 1, "pipe requires a Writable destination");
+        return undefined(ctx);
+    }
+    var dest_state: ptr<u8> = stream_state(ctx, args[0], 2, ex);
+    if (dest_state == null) {
+        return undefined(ctx);
+    }
+    if (flag(ctx, state, "destroyed", ex) || flag(ctx, state, "endEmitted", ex) || flag(ctx, dest_state,
+        "destroyed", ex) || flag(ctx, dest_state, "ending", ex)) {
+        fail(ctx, ex, 0, "cannot pipe a closed stream");
+        return undefined(ctx);
+    }
+    if (equal(ctx, receiver, args[0]) || kind(ctx, get(ctx, state, "pipe", ex)) == 5) {
+        fail(ctx, ex, 1, "only one non-self pipe destination is supported");
+        return undefined(ctx);
+    }
+    var end_dest: bool = true;
+    if (count > 1 && kind(ctx, args[1]) != 0) {
+        if (kind(ctx, args[1]) != 5) {
+            fail(ctx, ex, 1, "pipe options must be an object");
+            return undefined(ctx);
+        }
+        var option: ptr<u8> = get(ctx, args[1], "end", ex);
+        if (equal(ctx, option, boolean(ctx, false))) {
+            end_dest = false;
+        }
+    }
+    var listener: ptr<u8> = bind_one(ctx, (deref stream_state_roots.stream_methods)[14], receiver, args[0],
+        ex);
+    protect(ctx, listener);
+    add_listener(ctx, args[0], text(ctx, "drain"), listener, false, false, ex);
+    put(ctx, state, "pipe", args[0], ex);
+    put(ctx, state, "drainListener", listener, ex);
+    set_flag(ctx, state, "endDest", end_dest, ex);
+    set_flag(ctx, state, "flow", true, ex);
+    set_flag(ctx, state, "reading", true, ex);
+    schedule(ctx, receiver, state, false, ex);
+    unprotect(ctx, listener);
+    return args[0];
+}
+
+pub fun stream_drain(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<u8> = stream_state(ctx, receiver, 1, ex);
+    if (state == null || count == 0) {
+        return undefined(ctx);
+    }
+    if (equal(ctx, args[0], get(ctx, state, "pipe", ex)) && flag(ctx, state, "pipePaused", ex) && !flag(ctx,
+        state, "destroyed", ex)) {
+        set_flag(ctx, state, "pipePaused", false, ex);
+        set_flag(ctx, state, "flow", true, ex);
+        schedule(ctx, receiver, state, false, ex);
+    }
+    return undefined(ctx);
+}
+
+pub fun stream_pump_read(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var state: ptr<u8> = stream_state(ctx, receiver, 1, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    set_flag(ctx, state, "readScheduled", false, ex);
+    if (flag(ctx, state, "destroyed", ex) || flag(ctx, state, "pumping", ex)) {
+        return undefined(ctx);
+    }
+    set_flag(ctx, state, "pumping", true, ex);
+    finish_text(ctx, state, ex);
+    var reads: ptr<u8> = get(ctx, state, "reads", ex);
+    if (flag(ctx, state, "readableListener", ex) && !flag(ctx, state, "readableNotified", ex) &&
+        (length(ctx, reads, ex) > 0 || flag(ctx, state, "ended", ex))) {
+        set_flag(ctx, state, "readableNotified", true, ex);
+        emit_named(ctx, receiver, "readable", 0, null, ex);
+        reads = get(ctx, state, "reads", ex);
+    }
+    while (flag(ctx, state, "flow", ex) && length(ctx, reads, ex) > 0 && !flag(ctx, state, "destroyed",
+        ex) && deref ex == null) {
+        var chunk: ptr<u8> = take_chunk(ctx, receiver, state, ex);
+        protect(ctx, chunk);
+        var call_args: array<ptr<u8>, 1> = [chunk];
+        emit_named(ctx, receiver, "data", 1, &call_args[0], ex);
+        var dest: ptr<u8> = get(ctx, state, "pipe", ex);
+        if (kind(ctx, dest) == 5 && !flag(ctx, state, "destroyed", ex) && deref ex == null) {
+            var ready: ptr<u8> = stream_write(ctx, (deref stream_state_roots.stream_methods)[4], dest,
+                1, &call_args[0], ex);
+            if (equal(ctx, ready, boolean(ctx, false))) {
+                set_flag(ctx, state, "flow", false, ex);
+                set_flag(ctx, state, "pipePaused", true, ex);
+            }
+        }
+        unprotect(ctx, chunk);
+        // A data listener may call setEncoding and replace the private queue.
+        reads = get(ctx, state, "reads", ex);
+    }
+    finish_text(ctx, state, ex);
+    if (deref ex == null && flag(ctx, state, "flow", ex) && length(ctx, reads, ex) > 0) {
+        schedule(ctx, receiver, state, false, ex);
+    }
+    if (deref ex == null && !flag(ctx, state, "destroyed", ex) && length(ctx, reads, ex) == 0 && flag(ctx,
+        state, "ended", ex) && flag(ctx, state, "reading", ex) && !flag(ctx, state, "endEmitted", ex)) {
+        set_flag(ctx, state, "endEmitted", true, ex);
+        finish_stream_signal(ctx, state, ex);
+        set_flag(ctx, state, "flow", false, ex);
+        set_flag(ctx, state, "disturbed", true, ex);
+        var dest: ptr<u8> = get(ctx, state, "pipe", ex);
+        protect(ctx, dest);
+        var end_dest: bool = flag(ctx, state, "endDest", ex);
+        unpipe(ctx, receiver, state, ex);
+        emit_named(ctx, receiver, "end", 0, null, ex);
+        if (deref ex == null && (integer(ctx, state, "type", ex) & 2) != 0 &&
+            !flag(ctx, state, "allowHalfOpen", ex) && !flag(ctx, state, "ending", ex)) {
+            stream_end(ctx, (deref stream_state_roots.stream_methods)[5], receiver, 0, null, ex);
+        }
+        if (deref ex == null && kind(ctx, dest) == 5 && end_dest) {
+            stream_end(ctx, (deref stream_state_roots.stream_methods)[5], dest, 0, null, ex);
+        }
+        unprotect(ctx, dest);
+        auto_destroy(ctx, receiver, state, ex);
+    } else if (deref ex == null && !flag(ctx, state, "destroyed", ex) && !flag(ctx, state, "ended", ex) && !flag(ctx,
+        state, "pulling", ex) && (flag(ctx, state, "flow", ex) || flag(ctx, state, "requested", ex))) {
+        set_flag(ctx, state, "requested", false, ex);
+        var reader: ptr<u8> = get(ctx, receiver, "_read", ex);
+        protect(ctx, reader);
+        if (kind(ctx, reader) == 5 && callable(ctx, reader)) {
+            set_flag(ctx, state, "pulling", true, ex);
+            var call_args: array<ptr<u8>, 1> = [get(ctx, state, "readHigh", ex)];
+            call(ctx, reader, receiver, 1, &call_args[0], ex);
+        }
+        unprotect(ctx, reader);
+        if (deref ex != null) {
+            var reason: ptr<u8> = deref ex;
+            protect(ctx, reason);
+            deref ex = null;
+            destroy_stream(ctx, receiver, state, reason, ex);
+            unprotect(ctx, reason);
+        }
+    }
+    set_flag(ctx, state, "pumping", false, ex);
+    return undefined(ctx);
+}

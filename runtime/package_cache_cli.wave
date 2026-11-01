@@ -1,0 +1,79 @@
+// Explicit maintenance takes the same project lock as installation and recovery.
+import("./package_transaction")::{open_transaction, close_transaction, transaction_error};
+import("./package_cache")::{prune_archive_cache};
+import("./package_io")::{install_error};
+import("./config")::{PACKAGE_CACHE_BYTE_LIMIT, PACKAGE_CACHE_ENTRY_LIMIT};
+import("./output")::{write_text};
+import("std::mem::cstr")::{mem_eq_cstr};
+extern(c, "jsrt_argc") fun argc() -> i32;
+extern(c, "jsrt_argv") fun arg(index: i32) -> str;
+
+fun bounded_number(value: str, maximum: i64) -> i64 {
+    var result: i64 = 0;
+    var i: i64 = 0;
+    while (value[i] != 0) {
+        if (value[i] < 48 || value[i] > 57 || result > maximum / 10) {
+            return -1;
+        }
+        result = result * 10 + (value[i] - 48) as i64;
+        if (result > maximum) {
+            return -1;
+        }
+        i += 1;
+    }
+    if (i == 0) {
+        return -1;
+    }
+    return result;
+}
+
+pub fun run_cache_cli() -> i32 {
+    var project: str = ".";
+    var bytes: i64 = PACKAGE_CACHE_BYTE_LIMIT;
+    var entries: i64 = PACKAGE_CACHE_ENTRY_LIMIT;
+    if (argc() < 3 || !mem_eq_cstr(arg(2), "prune")) {
+        write_text(2, "expected cache prune [--project <directory>] [--max-mb <0..256>] [--max-entries <0..1024>]\n");
+        return 2;
+    }
+    for (var i: i32 = 3; i < argc(); i++) {
+        var option: str = arg(i);
+        if (i + 1 >= argc()) {
+            return 2;
+        }
+        i += 1;
+        if (mem_eq_cstr(option, "--project")) {
+            project = arg(i);
+        } else if (mem_eq_cstr(option, "--max-mb")) {
+            bytes = bounded_number(arg(i), PACKAGE_CACHE_BYTE_LIMIT / 1048576);
+            if (bytes >= 0) {
+                bytes *= 1048576;
+            }
+        } else if (mem_eq_cstr(option, "--max-entries")) {
+            entries = bounded_number(arg(i), PACKAGE_CACHE_ENTRY_LIMIT);
+        } else {
+            return 2;
+        }
+        if (bytes < 0 || entries < 0) {
+            write_text(2, "invalid cache limit\n");
+            return 2;
+        }
+    }
+    if (!open_transaction(project)) {
+        write_text(2, transaction_error());
+        write_text(2, "\n");
+        return 1;
+    }
+    var ok: bool = prune_archive_cache(bytes, entries);
+    if (!close_transaction()) {
+        write_text(2, transaction_error());
+        write_text(2, "\n");
+        return 1;
+    }
+    if (!ok) {
+        write_text(2, install_error());
+        write_text(2, "\n");
+        return 1;
+    }
+    write_text(1, "Archive cache pruned\n");
+    return 0;
+}

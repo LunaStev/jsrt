@@ -1,0 +1,590 @@
+import("./context_state")::{owned_context_slot, active_context};
+import("std::mem::layout")::{size_of};
+struct StreamUtilsState {
+    methods: array<ptr<u8>, 16>;
+    promises: ptr<u8>;
+}
+
+fun stream_utils_storage(ctx: ptr<u8>) -> ptr<StreamUtilsState> {
+    return owned_context_slot(ctx, 22, size_of<StreamUtilsState>() as i64) as ptr<StreamUtilsState>;
+}
+
+// Stream completion and coordinated failure, entirely engine-owned records.
+import("./values")::{get, put, text, plain, define, fail};
+import("./collections")::{list, length, at, append, integer, flag, set_integer, set_flag, bind_one, enqueue};
+import("./abort")::{abort_error, signal_aborted, signal_reason, subscribe_abort, unsubscribe_abort};
+import("./events")::{add_listener, remove_listener};
+import("./stream_state")::{stream_state, is_stream, stream_state_storage, StreamHostState};
+import("./streams")::{stream_invoke};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_is_array") fun is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_promise") fun promise(ctx: ptr<u8>, resolve: ptr<ptr<u8>>, reject: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "jsrt_stream_util_callback") fun callback(code: i32) -> ptr<u8>;
+
+fun link_abort_signal(ctx: ptr<u8>, signal: ptr<u8>, stream: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<StreamUtilsState> = stream_utils_storage(ctx);
+    signal_aborted(ctx, signal, ex);
+    var s: ptr<u8> = stream_state(ctx, stream, 0, ex);
+    if (deref ex != null || s == null) {
+        return undefined(ctx);
+    }
+    if (flag(ctx, s, "closed", ex)) {
+        return stream;
+    }
+    var record: ptr<u8> = plain(ctx);
+    protect(ctx, record);
+    put(ctx, record, "stream", stream, ex);
+    put(ctx, record, "signal", signal, ex);
+    var hook: ptr<u8> = bind_one(ctx, (deref host_state.methods)[13], null, record, ex);
+    protect(ctx, hook);
+    put(ctx, record, "hook", hook, ex);
+    var done: ptr<u8> = bind_one(ctx, (deref host_state.methods)[14], null, record, ex);
+    protect(ctx, done);
+    var cleanup_fn: ptr<u8> = monitor_stream(ctx, stream, undefined(ctx), done, ex);
+    put(ctx, record, "cleanup", cleanup_fn, ex);
+    if (deref ex == null) {
+        subscribe_abort(ctx, signal, hook, ex);
+    }
+    if (deref ex != null) {
+        var ignored: ptr<u8> = null;
+        if (kind(ctx, cleanup_fn) == 5) {
+            call(ctx, cleanup_fn, null, 0, null, &ignored);
+        }
+    }
+    unprotect(ctx, done);
+    unprotect(ctx, hook);
+    unprotect(ctx, record);
+    return done;
+}
+
+pub fun add_abort_signal(ctx: ptr<u8>, signal: ptr<u8>, stream: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    link_abort_signal(ctx, signal, stream, ex);
+    return stream;
+}
+
+export(c) fun jsrt_stream_abort(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<StreamUtilsState> = stream_utils_storage(ctx);
+    if (equal(ctx, fn, (deref host_state.methods)[12])) {
+        if (count < 2) {
+            fail(ctx, ex, 1, "addAbortSignal requires a signal and stream");
+            return undefined(ctx);
+        }
+        return add_abort_signal(ctx, args[0], args[1], ex);
+    }
+    if (count == 0) {
+        return undefined(ctx);
+    }
+    var record: ptr<u8> = args[0];
+    if (equal(ctx, fn, (deref host_state.methods)[14])) {
+        unsubscribe_abort(ctx, get(ctx, record, "signal", ex), get(ctx, record, "hook", ex), ex);
+        var cleanup_fn: ptr<u8> = get(ctx, record, "cleanup", ex);
+        if (kind(ctx, cleanup_fn) == 5) {
+            call(ctx, cleanup_fn, null, 0, null, ex);
+        }
+        return undefined(ctx);
+    }
+    var error: ptr<u8> = abort_error(ctx, false);
+    protect(ctx, error);
+    define(ctx, error, "cause", signal_reason(ctx, get(ctx, record, "signal", ex), ex), ex, false);
+    var problem: array<ptr<u8>, 1> = [error];
+    stream_invoke(ctx, get(ctx, record, "stream", ex), 6, 1, &problem[0], ex);
+    unprotect(ctx, error);
+    return undefined(ctx);
+}
+
+pub fun premature_error(ctx: ptr<u8>) -> ptr<u8> {
+    var problem: ptr<u8> = null;
+    fail(ctx, &problem, 0, "stream closed before completion");
+    protect(ctx, problem);
+    var nested: ptr<u8> = null;
+    define(ctx, problem, "code", text(ctx, "ERR_STREAM_PREMATURE_CLOSE"), &nested, true);
+    unprotect(ctx, problem);
+    return problem;
+}
+
+fun cleanup(ctx: ptr<u8>, record: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (flag(ctx, record, "cleaned", ex)) {
+        return;
+    }
+    set_flag(ctx, record, "cleaned", true, ex);
+    var signal: ptr<u8> = get(ctx, record, "signal", ex);
+    if (kind(ctx, signal) == 5) {
+        unsubscribe_abort(ctx, signal, get(ctx, record, "abortHook", ex), ex);
+    }
+    var stream: ptr<u8> = get(ctx, record, "stream", ex);
+    var hooks: ptr<u8> = get(ctx, record, "hooks", ex);
+    var names: array<str, 4> = ["end", "finish", "error", "close"];
+    for (var i: i64 = 0; i < length(ctx, hooks, ex); i++) {
+        remove_listener(ctx, stream, text(ctx, names[i]), at(ctx, hooks, i, ex), null, ex);
+    }
+}
+
+fun settle(ctx: ptr<u8>, record: ptr<u8>, error: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (flag(ctx, record, "done", ex) || flag(ctx, record, "cleaned", ex)) {
+        return;
+    }
+    var signal: ptr<u8> = get(ctx, record, "signal", ex);
+    if (kind(ctx, signal) == 5) {
+        unsubscribe_abort(ctx, signal, get(ctx, record, "abortHook", ex), ex);
+    }
+    set_flag(ctx, record, "done", true, ex);
+    var cb: ptr<u8> = get(ctx, record, "callback", ex);
+    protect(ctx, cb);
+    put(ctx, record, "callback", undefined(ctx), ex);
+    var args: array<ptr<u8>, 1> = [error];
+    call(ctx, cb, null, 1, &args[0], ex);
+    unprotect(ctx, cb);
+}
+
+pub fun monitor_stream(ctx: ptr<u8>, stream: ptr<u8>, options: ptr<u8>, cb: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<StreamUtilsState> = stream_utils_storage(ctx);
+    var state: ptr<u8> = stream_state(ctx, stream, 0, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    var category: i64 = integer(ctx, state, "type", ex);
+    var reading: bool = (category & 1) != 0;
+    var writing: bool = (category & 2) != 0;
+    if (options != null && kind(ctx, options) != 0) {
+        if (kind(ctx, options) != 5) {
+            fail(ctx, ex, 1, "finished options must be an object");
+            return undefined(ctx);
+        }
+        var setting: ptr<u8> = get(ctx, options, "readable", ex);
+        if (kind(ctx, setting) != 0 && !truth(ctx, setting)) {
+            reading = false;
+        }
+        setting = get(ctx, options, "writable", ex);
+        if (kind(ctx, setting) != 0 && !truth(ctx, setting)) {
+            writing = false;
+        }
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (kind(ctx, cb) != 5 || !callable(ctx, cb)) {
+        fail(ctx, ex, 1, "finished requires a callback");
+        return undefined(ctx);
+    }
+    var watched_signal: ptr<u8> = undefined(ctx);
+    if (options != null && kind(ctx, options) == 5) {
+        watched_signal = get(ctx, options, "signal", ex);
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    protect(ctx, watched_signal);
+    if (kind(ctx, watched_signal) != 0 && kind(ctx, watched_signal) != 1) {
+        signal_aborted(ctx, watched_signal, ex);
+    }
+    if (deref ex != null) {
+        unprotect(ctx, watched_signal);
+        return undefined(ctx);
+    }
+    var record: ptr<u8> = plain(ctx);
+    protect(ctx, record);
+    put(ctx, record, "stream", stream, ex);
+    put(ctx, record, "callback", cb, ex);
+    if (kind(ctx, watched_signal) == 5) {
+        put(ctx, record, "signal", watched_signal, ex);
+    }
+    unprotect(ctx, watched_signal);
+    set_flag(ctx, record, "read", reading, ex);
+    set_flag(ctx, record, "write", writing, ex);
+    var hooks: ptr<u8> = list(ctx, ex);
+    protect(ctx, hooks);
+    put(ctx, record, "hooks", hooks, ex);
+    var names: array<str, 4> = ["end", "finish", "error", "close"];
+    for (var i: i64 = 0; i < 4 && deref ex == null; i++) {
+        var hook: ptr<u8> = bind_one(ctx, (deref host_state.methods)[i], stream, record, ex);
+        protect(ctx, hook);
+        append(ctx, hooks, hook, ex);
+        add_listener(ctx, stream, text(ctx, names[i]), hook, false, false, ex);
+        unprotect(ctx, hook);
+    }
+    var signal: ptr<u8> = get(ctx, record, "signal", ex);
+    if (kind(ctx, signal) == 5 && deref ex == null) {
+        var hook: ptr<u8> = bind_one(ctx, (deref host_state.methods)[15], stream, record, ex);
+        protect(ctx, hook);
+        put(ctx, record, "abortHook", hook, ex);
+        subscribe_abort(ctx, signal, hook, ex);
+        unprotect(ctx, hook);
+    }
+    if (deref ex != null) {
+        var original: ptr<u8> = deref ex;
+        protect(ctx, original);
+        var ignored: ptr<u8> = null;
+        cleanup(ctx, record, &ignored);
+        unprotect(ctx, hooks);
+        unprotect(ctx, record);
+        deref ex = original;
+        unprotect(ctx, original);
+        return undefined(ctx);
+    }
+    var disposer: ptr<u8> = bind_one(ctx, (deref host_state.methods)[4], stream, record, ex);
+    protect(ctx, disposer);
+    enqueue(ctx, (deref host_state.methods)[5], stream, record, ex);
+    unprotect(ctx, hooks);
+    unprotect(ctx, record);
+    unprotect(ctx, disposer);
+    return disposer;
+}
+
+export(c) fun jsrt_stream_watch(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<StreamUtilsState> = stream_utils_storage(ctx);
+    if (count == 0) {
+        return undefined(ctx);
+    }
+    var record: ptr<u8> = args[0];
+    if (equal(ctx, fn, (deref host_state.methods)[15])) {
+        enqueue(ctx, (deref host_state.methods)[5], receiver, record, ex);
+        return undefined(ctx);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[4])) {
+        cleanup(ctx, record, ex);
+        return undefined(ctx);
+    }
+    if (flag(ctx, record, "cleaned", ex)) {
+        return undefined(ctx);
+    }
+    var signal: ptr<u8> = get(ctx, record, "signal", ex);
+    if (equal(ctx, fn, (deref host_state.methods)[5]) && kind(ctx, signal) == 5 && signal_aborted(ctx,
+        signal, ex)) {
+        var error: ptr<u8> = abort_error(ctx, false);
+        protect(ctx, error);
+        define(ctx, error, "cause", signal_reason(ctx, signal, ex), ex, false);
+        settle(ctx, record, error, ex);
+        cleanup(ctx, record, ex);
+        unprotect(ctx, error);
+        return undefined(ctx);
+    }
+    if (equal(ctx, fn, (deref host_state.methods)[2]) && count > 1) {
+        settle(ctx, record, args[1], ex);
+        return undefined(ctx);
+    }
+    var state: ptr<u8> = stream_state(ctx, receiver, 0, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    var ready: bool = (!flag(ctx, record, "read", ex) || flag(ctx, state, "endEmitted", ex)) && (!flag(ctx,
+        record, "write", ex) || flag(ctx, state, "finished", ex));
+    if (ready) {
+        settle(ctx, record, undefined(ctx), ex);
+    } else if (flag(ctx, state, "closed", ex)) {
+        var reason: ptr<u8> = get(ctx, state, "failure", ex);
+        if (kind(ctx, reason) == 0) {
+            reason = premature_error(ctx);
+        }
+        protect(ctx, reason);
+        settle(ctx, record, reason, ex);
+        unprotect(ctx, reason);
+    }
+    if (flag(ctx, state, "closed", ex)) {
+        cleanup(ctx, record, ex);
+    }
+    return undefined(ctx);
+}
+
+export(c) fun jsrt_pipeline_member(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var group: ptr<u8> = args[0];
+    var streams: ptr<u8> = get(ctx, group, "streams", ex);
+    var n: i64 = length(ctx, streams, ex);
+    set_integer(ctx, group, "pending", integer(ctx, group, "pending", ex) - 1, ex);
+    if (count > 1 && kind(ctx, args[1]) != 0 && !flag(ctx, group, "failed", ex)) {
+        set_flag(ctx, group, "failed", true, ex);
+        put(ctx, group, "error", args[1], ex);
+        for (var i: i64 = 0; i < n && deref ex == null; i++) {
+            var stream: ptr<u8> = at(ctx, streams, i, ex);
+            var problem: array<ptr<u8>, 1> = [args[1]];
+            stream_invoke(ctx, stream, 6, 1, &problem[0], ex);
+        }
+    }
+    if (integer(ctx, group, "pending", ex) == 0 && !flag(ctx, group, "done", ex)) {
+        set_flag(ctx, group, "done", true, ex);
+        if (!flag(ctx, group, "failed", ex)) {
+            var cleanups: ptr<u8> = get(ctx, group, "cleanups", ex);
+            for (var i: i64 = 0; i < length(ctx, cleanups, ex); i++) {
+                call(ctx, at(ctx, cleanups, i, ex), null, 0, null, ex);
+            }
+        }
+        var cb: ptr<u8> = get(ctx, group, "callback", ex);
+        protect(ctx, cb);
+        put(ctx, group, "callback", undefined(ctx), ex);
+        var result: array<ptr<u8>, 1> = [get(ctx, group, "error", ex)];
+        call(ctx, cb, null, 1, &result[0], ex);
+        unprotect(ctx, cb);
+    }
+    return undefined(ctx);
+}
+
+pub fun pipeline(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, cb: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<StreamUtilsState> = stream_utils_storage(ctx);
+    var signal: ptr<u8> = undefined(ctx);
+    if (count > 1 && kind(ctx, args[count - 1]) == 5 && !is_stream(ctx, args[count - 1], ex) && !is_array(ctx,
+        args[count - 1])) {
+        signal = get(ctx, args[count - 1], "signal", ex);
+        if (kind(ctx, signal) != 0) {
+            signal_aborted(ctx, signal, ex);
+        }
+        count -= 1;
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    protect(ctx, signal);
+    var entries: i64 = count;
+    if (count == 1 && is_array(ctx, args[0])) {
+        entries = length(ctx, args[0], ex);
+    }
+    if (entries < 2 || entries > 32) {
+        fail(ctx, ex, 1, "pipeline requires 2..32 streams");
+        unprotect(ctx, signal);
+        return undefined(ctx);
+    }
+    var streams: ptr<u8> = list(ctx, ex);
+    protect(ctx, streams);
+    if (count == 1 && is_array(ctx, args[0])) {
+        for (var i: i64 = 0; i < length(ctx, args[0], ex); i++) {
+            append(ctx, streams, at(ctx, args[0], i, ex), ex);
+        }
+    } else {
+        for (var i: i64 = 0; i < count; i++) {
+            append(ctx, streams, args[i], ex);
+        }
+    }
+    var n: i64 = length(ctx, streams, ex);
+    if (n < 2 || n > 32 || kind(ctx, cb) != 5 || !callable(ctx, cb)) {
+        fail(ctx, ex, 1, "pipeline requires 2..32 streams and a callback");
+        unprotect(ctx, streams);
+        unprotect(ctx, signal);
+        return undefined(ctx);
+    }
+    for (var i: i64 = 0; i < n && deref ex == null; i++) {
+        var need: i64 = 3;
+        if (i == 0) {
+            need = 1;
+        } else if (i == n - 1) {
+            need = 2;
+        }
+        var stream: ptr<u8> = at(ctx, streams, i, ex);
+        var state: ptr<u8> = stream_state(ctx, stream, need, ex);
+        if (state == null) {
+            break;
+        }
+        if (flag(ctx, state, "destroyed", ex) || (i < n - 1 && kind(ctx, get(ctx, state, "pipe", ex)) == 5)) {
+            fail(ctx, ex, 0, "pipeline stream is closed or already piped");
+        }
+        for (var j: i64 = 0; j < i; j++) {
+            if (equal(ctx, stream, at(ctx, streams, j, ex))) {
+                fail(ctx, ex, 1, "pipeline streams must be distinct");
+            }
+        }
+    }
+    if (deref ex != null) {
+        unprotect(ctx, streams);
+        unprotect(ctx, signal);
+        return undefined(ctx);
+    }
+    var group: ptr<u8> = plain(ctx);
+    protect(ctx, group);
+    put(ctx, group, "streams", streams, ex);
+    put(ctx, group, "callback", cb, ex);
+    set_integer(ctx, group, "pending", n, ex);
+    var cleanups: ptr<u8> = list(ctx, ex);
+    protect(ctx, cleanups);
+    put(ctx, group, "cleanups", cleanups, ex);
+    for (var i: i64 = 0; i < n && deref ex == null; i++) {
+        var member: ptr<u8> = bind_one(ctx, (deref host_state.methods)[6], null, group, ex);
+        protect(ctx, member);
+        var options: ptr<u8> = plain(ctx);
+        protect(ctx, options);
+        if (i == n - 1) {
+            set_flag(ctx, options, "readable", false, ex);
+        }
+        if (i == 0) {
+            set_flag(ctx, options, "writable", false, ex);
+        }
+        var disposer: ptr<u8> = monitor_stream(ctx, at(ctx, streams, i, ex), options, member, ex);
+        append(ctx, cleanups, disposer, ex);
+        unprotect(ctx, options);
+        unprotect(ctx, member);
+    }
+    if (kind(ctx, signal) != 0) {
+        for (var i: i64 = 0; i < n && deref ex == null; i++) {
+            var unlink: ptr<u8> = link_abort_signal(ctx, signal, at(ctx, streams, i, ex), ex);
+            if (deref ex == null) {
+                append(ctx, cleanups, unlink, ex);
+            }
+        }
+    }
+    var already_aborted: bool = false;
+    if (kind(ctx, signal) != 0 && deref ex == null) {
+        already_aborted = signal_aborted(ctx, signal, ex);
+    }
+    for (var i: i64 = 0; i + 1 < n && deref ex == null && !already_aborted; i++) {
+        var target: array<ptr<u8>, 1> = [at(ctx, streams, i + 1, ex)];
+        stream_invoke(ctx, at(ctx, streams, i, ex), 7, 1, &target[0], ex);
+    }
+    if (deref ex != null) {
+        var original: ptr<u8> = deref ex;
+        protect(ctx, original);
+        var ignored: ptr<u8> = null;
+        for (var i: i64 = 0; i < length(ctx, cleanups, &ignored); i++) {
+            call(ctx, at(ctx, cleanups, i, &ignored), null, 0, null, &ignored);
+        }
+        for (var i: i64 = 0; i + 1 < n; i++) {
+            stream_invoke(ctx, at(ctx, streams, i, &ignored), 8, 0, null, &ignored);
+        }
+        deref ex = original;
+        unprotect(ctx, original);
+    }
+    var result: ptr<u8> = undefined(ctx);
+    if (deref ex == null) {
+        result = at(ctx, streams, n - 1, ex);
+    }
+    unprotect(ctx, cleanups);
+    unprotect(ctx, group);
+    unprotect(ctx, streams);
+    unprotect(ctx, signal);
+    return result;
+}
+
+export(c) fun jsrt_stream_util_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<StreamUtilsState> = stream_utils_storage(ctx);
+    var watching: bool = equal(ctx, fn, (deref host_state.methods)[8]) || equal(ctx, fn, (deref host_state.methods)[10]);
+    var promised: bool = equal(ctx, fn, (deref host_state.methods)[10]) || equal(ctx, fn, (deref host_state.methods)[11]);
+    var cb: ptr<u8> = undefined(ctx);
+    var result: ptr<u8> = undefined(ctx);
+    var amount: i64 = count;
+    if (promised) {
+        var resolve: ptr<u8> = null;
+        var reject: ptr<u8> = null;
+        result = promise(ctx, &resolve, &reject, ex);
+        protect(ctx, result);
+        protect(ctx, resolve);
+        protect(ctx, reject);
+        var record: ptr<u8> = plain(ctx);
+        protect(ctx, record);
+        put(ctx, record, "resolve", resolve, ex);
+        put(ctx, record, "reject", reject, ex);
+        cb = bind_one(ctx, (deref host_state.methods)[7], null, record, ex);
+        protect(ctx, cb);
+        unprotect(ctx, record);
+        unprotect(ctx, resolve);
+        unprotect(ctx, reject);
+    } else {
+        if (amount == 0) {
+            fail(ctx, ex, 1, "completion callback required");
+            return undefined(ctx);
+        }
+        amount -= 1;
+        cb = args[amount];
+        protect(ctx, cb);
+    }
+    var nested: ptr<u8> = null;
+    var value: ptr<u8> = undefined(ctx);
+    if (watching) {
+        if (amount < 1 || amount > 2) {
+            fail(ctx, &nested, 1, "finished requires a stream and optional options");
+        } else {
+            var options: ptr<u8> = undefined(ctx);
+            if (amount == 2) {
+                options = args[1];
+            }
+            value = monitor_stream(ctx, args[0], options, cb, &nested);
+        }
+    } else {
+        value = pipeline(ctx, amount, args, cb, &nested);
+    }
+    if (promised) {
+        if (nested != null) {
+            var problem: array<ptr<u8>, 1> = [nested];
+            call(ctx, cb, null, 1, &problem[0], ex);
+        }
+        unprotect(ctx, result);
+    } else {
+        result = value;
+        if (nested != null) {
+            deref ex = nested;
+        }
+    }
+    unprotect(ctx, cb);
+    return result;
+}
+
+export(c) fun jsrt_stream_promise_result(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var record: ptr<u8> = args[0];
+    var error: ptr<u8> = undefined(ctx);
+    if (count > 1) {
+        error = args[1];
+    }
+    var cb: ptr<u8> = get(ctx, record, "resolve", ex);
+    if (kind(ctx, error) != 0) {
+        cb = get(ctx, record, "reject", ex);
+    }
+    var result: array<ptr<u8>, 1> = [error];
+    call(ctx, cb, null, 1, &result[0], ex);
+    return undefined(ctx);
+}
+
+pub fun install_stream_utils(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var host_state: ptr<StreamUtilsState> = stream_utils_storage(ctx);
+    var stream_state_roots: ptr<StreamHostState> = stream_state_storage(ctx);
+    var names: array<str, 16> = ["watchEnd", "watchFinish", "watchError", "watchClose", "cleanup", "inspect",
+        "pipelineMember", "promiseResult", "finished", "pipeline", "finished", "pipeline", "addAbortSignal",
+        "abortStream", "removeAbortSignal", "abortWatch"];
+    for (var i: i64 = 0; i < 16; i++) {
+        var name: ptr<u8> = utf8(names[i]);
+        (deref host_state.methods)[i] = function(ctx, name, callback(i as i32));
+        release(name);
+        protect(ctx, (deref host_state.methods)[i]);
+    }
+    (deref host_state.promises) = plain(ctx);
+    protect(ctx, (deref host_state.promises));
+    define(ctx, (deref host_state.promises), "finished", (deref host_state.methods)[10], ex, false);
+    define(ctx, (deref host_state.promises), "pipeline", (deref host_state.methods)[11], ex, false);
+    define(ctx, (deref stream_state_roots.stream_exports), "finished", (deref host_state.methods)[8],
+        ex, false);
+    define(ctx, (deref stream_state_roots.stream_exports), "pipeline", (deref host_state.methods)[9],
+        ex, false);
+    define(ctx, (deref stream_state_roots.stream_exports), "promises", (deref host_state.promises), ex,
+        false);
+    define(ctx, (deref stream_state_roots.stream_exports), "addAbortSignal", (deref host_state.methods)[12],
+        ex, false);
+    return deref ex == null;
+}
+
+pub fun stream_promises_module() -> ptr<u8> {
+    var host_state: ptr<StreamUtilsState> = stream_utils_storage(active_context());
+    return(deref host_state.promises);
+}
+
+pub fun shutdown_stream_utils(ctx: ptr<u8>) {
+    var host_state: ptr<StreamUtilsState> = stream_utils_storage(ctx);
+    if ((deref host_state.promises) != null) {
+        unprotect(ctx, (deref host_state.promises));
+        (deref host_state.promises) = null;
+    }
+    for (var i: i64 = 0; i < 16; i++) {
+        if ((deref host_state.methods)[i] != null) {
+            unprotect(ctx, (deref host_state.methods)[i]);
+            (deref host_state.methods)[i] = null;
+        }
+    }
+}

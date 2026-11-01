@@ -1,0 +1,186 @@
+// UTF-8 carry bytes live in the engine graph, independently of native resources.
+import("./values")::{get, put, plain, fail};
+import("./collections")::{list, length, at, append, set_at, remove_at, integer, set_integer, flag, set_flag};
+import("./buffer_core")::{byte_view_length, copy_byte_view, buffer_from_bytes};
+import("./byte_codec")::{decode_bytes, encoding};
+import("./config")::{STREAM_BYTE_LIMIT};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::ops")::{mem_copy};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_to_string") fun to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_length") fun string_length(value: ptr<u8>) -> i64;
+extern(c, "wr_string_characters") fun characters(value: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_utf16") fun utf16(units: ptr<u16>, count: i64) -> ptr<u8>;
+extern(c, "wr_string_value") fun string_value(ctx: ptr<u8>, value: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+
+pub fun text_length(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64 {
+    if (kind(ctx, value) != 4 || deref ex != null) {
+        fail(ctx, ex, 1, "expected a decoded stream string");
+        return -1;
+    }
+    var string: ptr<u8> = to_string(ctx, value, ex);
+    if (string == null || deref ex != null) {
+        return -1;
+    }
+    var size: i64 = string_length(string);
+    release(string);
+    return size;
+}
+
+fun complete_prefix(bytes: ptr<u8>, n: i64) -> i64 {
+    if (n == 0) {
+        return 0;
+    }
+    var lead: i64 = n - 1;
+    while (lead > 0 && n - lead < 4 && bytes[lead] >= 128 && bytes[lead] <= 191) {
+        lead -= 1;
+    }
+    var first: u8 = bytes[lead];
+    var width: i64 = 1;
+    if (first >= 194 && first <= 223) {
+        width = 2;
+    } else if (first >= 224 && first <= 239) {
+        width = 3;
+    } else if (first >= 240 && first <= 244) {
+        width = 4;
+    }
+    if (n - lead >= width) {
+        return n;
+    }
+    if (n - lead > 1) {
+        var second: u8 = bytes[lead + 1];
+        if ((first == 224 && second < 160) || (first == 237 && second >= 160) ||
+            (first == 240 && second < 144) || (first == 244 && second >= 144)) {
+            return n;
+        }
+    }
+    return lead;
+}
+
+pub fun decode_stream_chunk(ctx: ptr<u8>, decoder: ptr<u8>, chunk: ptr<u8>, finish: bool,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var pending: ptr<u8> = get(ctx, decoder, "utf8Pending", ex);
+    var before: i64 = 0;
+    if (kind(ctx, pending) != 0) {
+        before = byte_view_length(ctx, pending, ex);
+    }
+    var size: i64 = 0;
+    if (!finish) {
+        size = byte_view_length(ctx, chunk, ex);
+    }
+    if (deref ex != null || before < 0 || before > 3 || size < 0 || size > STREAM_BYTE_LIMIT) {
+        fail(ctx, ex, 2, "invalid stream decoder input size");
+        return undefined(ctx);
+    }
+    var bytes: ptr<u8> = mem_alloc(before + size + 1);
+    if (bytes == null) {
+        fail(ctx, ex, 2, "cannot allocate stream decoder bytes");
+        return undefined(ctx);
+    }
+    if (before > 0) {
+        copy_byte_view(ctx, pending, bytes, before, ex);
+    }
+    if (!finish && deref ex == null) {
+        copy_byte_view(ctx, chunk, bytes + before, size, ex);
+    }
+    var used: i64 = before + size;
+    if (!finish && deref ex == null) {
+        used = complete_prefix(bytes, used);
+    }
+    var result: ptr<u8> = undefined(ctx);
+    if (deref ex == null) {
+        result = decode_bytes(ctx, bytes, used, 0, ex);
+        protect(ctx, result);
+        var remainder: ptr<u8> = buffer_from_bytes(ctx, bytes + used, before + size - used, ex);
+        put(ctx, decoder, "utf8Pending", remainder, ex);
+        unprotect(ctx, result);
+    }
+    mem_free(bytes, before + size + 1);
+    return result;
+}
+
+pub fun configure_text(ctx: ptr<u8>, state: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var code: i32 = encoding(ctx, value, ex, false);
+    if (deref ex != null) {
+        return;
+    }
+    if (code != 0 || flag(ctx, state, "readableObjectMode", ex)) {
+        fail(ctx, ex, 1, "setEncoding currently supports UTF-8 byte streams only");
+        return;
+    }
+    if (flag(ctx, state, "utf8", ex)) {
+        return;
+    }
+    var decoder: ptr<u8> = plain(ctx);
+    protect(ctx, decoder);
+    var selected: ptr<u8> = list(ctx, ex);
+    protect(ctx, selected);
+    var reads: ptr<u8> = get(ctx, state, "reads", ex);
+    var total: i64 = 0;
+    for (var i: i64 = 0; i < length(ctx, reads, ex) && deref ex == null; i++) {
+        var decoded: ptr<u8> = decode_stream_chunk(ctx, decoder, at(ctx, reads, i, ex), false, ex);
+        protect(ctx, decoded);
+        var n: i64 = text_length(ctx, decoded, ex);
+        if (n > 0 && deref ex == null) {
+            append(ctx, selected, decoded, ex);
+            total += n;
+        }
+        unprotect(ctx, decoded);
+    }
+    if (deref ex == null) {
+        put(ctx, state, "reads", selected, ex);
+        put(ctx, state, "utf8Pending", get(ctx, decoder, "utf8Pending", ex), ex);
+        set_integer(ctx, state, "rbytes", total, ex);
+        set_flag(ctx, state, "utf8", true, ex);
+    }
+    unprotect(ctx, selected);
+    unprotect(ctx, decoder);
+}
+
+pub fun read_text(ctx: ptr<u8>, state: ptr<u8>, size: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var units: ptr<u16> = mem_alloc((size + 1) * 2) as ptr<u16>;
+    if (units == null) {
+        fail(ctx, ex, 2, "cannot allocate decoded stream read");
+        return undefined(ctx);
+    }
+    var reads: ptr<u8> = get(ctx, state, "reads", ex);
+    var used: i64 = 0;
+    while (used < size && deref ex == null) {
+        var chunk: ptr<u8> = at(ctx, reads, 0, ex);
+        var string: ptr<u8> = to_string(ctx, chunk, ex);
+        if (string == null || deref ex != null) {
+            break;
+        }
+        var n: i64 = string_length(string);
+        var selected: i64 = size - used;
+        if (selected > n) {
+            selected = n;
+        }
+        var data: ptr<u16> = characters(string);
+        mem_copy((units + used) as ptr<u8>, data as ptr<u8>, selected * 2);
+        used += selected;
+        if (selected == n) {
+            remove_at(ctx, reads, 0, ex);
+        } else {
+            var remaining: ptr<u8> = utf16(data + selected, n - selected);
+            var value: ptr<u8> = string_value(ctx, remaining);
+            release(remaining);
+            set_at(ctx, reads, 0, value, ex);
+        }
+        release(string);
+    }
+    var result: ptr<u8> = undefined(ctx);
+    if (deref ex == null) {
+        var string: ptr<u8> = utf16(units, used);
+        result = string_value(ctx, string);
+        release(string);
+        set_integer(ctx, state, "rbytes", integer(ctx, state, "rbytes", ex) - used, ex);
+        set_flag(ctx, state, "disturbed", true, ex);
+    }
+    mem_free(units as ptr<u8>, (size + 1) * 2);
+    return result;
+}

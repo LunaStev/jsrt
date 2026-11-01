@@ -1,0 +1,121 @@
+--- a/Source/JavaScriptCore/runtime/SyntheticModuleRecord.h
++++ b/Source/JavaScriptCore/runtime/SyntheticModuleRecord.h
+@@ -64,9 +64,19 @@
+     SyntheticModuleRecord(VM&, Structure*, const Identifier& moduleKey);
+ 
+     static SyntheticModuleRecord* tryCreateDefaultExportSyntheticModule(JSGlobalObject*, const Identifier& moduleKey, JSValue);
++public:
+     static SyntheticModuleRecord* tryCreateWithExportNamesAndValues(JSGlobalObject*, const Identifier& moduleKey, const Vector<Identifier, 4>& exportNames, const MarkedArgumentBuffer& exportValues);
++    void setRuntimeValueEvaluator(VM& vm, JSObject* function)
++    {
++        m_runtimeValueEvaluator.set(vm, this, function);
++    }
++private:
+ 
+     void finishCreation(JSGlobalObject*, VM&);
++
++    WriteBarrier<JSObject> m_runtimeValueEvaluator;
++    WriteBarrier<Unknown> m_runtimeEvaluationError;
++    bool m_runtimeEvaluated { false };
+ };
+ 
+ } // namespace JSC
+--- a/Source/JavaScriptCore/runtime/SyntheticModuleRecord.cpp
++++ b/Source/JavaScriptCore/runtime/SyntheticModuleRecord.cpp
+@@ -73,6 +73,8 @@
+     SyntheticModuleRecord* thisObject = uncheckedDowncast<SyntheticModuleRecord>(cell);
+     ASSERT_GC_OBJECT_INHERITS(thisObject, info());
+     Base::visitChildren(thisObject, visitor);
++    visitor.append(thisObject->m_runtimeValueEvaluator);
++    visitor.append(thisObject->m_runtimeEvaluationError);
+ }
+ 
+ DEFINE_VISIT_CHILDREN(SyntheticModuleRecord);
+@@ -82,8 +84,35 @@
+     return Synchronousness::Sync;
+ }
+ 
+-JSValue SyntheticModuleRecord::evaluate(JSGlobalObject*)
++JSValue SyntheticModuleRecord::evaluate(JSGlobalObject* globalObject)
+ {
++    VM& vm = globalObject->vm();
++    auto scope = DECLARE_THROW_SCOPE(vm);
++    if (JSValue failure = m_runtimeEvaluationError.get()) {
++        throwException(globalObject, scope, failure);
++        return { };
++    }
++    if (m_runtimeValueEvaluator && !m_runtimeEvaluated) {
++        m_runtimeEvaluated = true;
++        MarkedArgumentBuffer arguments;
++        JSObject* function = m_runtimeValueEvaluator.get();
++        JSValue value = call(globalObject, function, JSC::getCallDataInline(function), jsUndefined(), arguments);
++        if (scope.exception()) {
++            m_runtimeEvaluationError.set(vm, this, scope.exception()->value());
++            return { };
++        }
++        for (auto& entry : exportEntries()) {
++            bool written = false;
++            symbolTablePutTouchWatchpointSet(moduleEnvironment(), globalObject, entry.value.localName,
++                value, false, true, written);
++            if (scope.exception()) {
++                m_runtimeEvaluationError.set(vm, this, scope.exception()->value());
++                return { };
++            }
++            ASSERT(written);
++        }
++        m_runtimeValueEvaluator.clear();
++    }
+     return jsUndefined();
+ }
+ 
+--- a/Source/JavaScriptCore/runtime/JSMicrotask.cpp
++++ b/Source/JavaScriptCore/runtime/JSMicrotask.cpp
+@@ -61,6 +61,7 @@
+ #include "ModuleLoaderPayload.h"
+ #include "ModuleLoadingContext.h"
+ #include "ModuleRegistryEntry.h"
++#include "SyntheticModuleRecord.h"
+ #include "ObjectConstructor.h"
+ #include "ScriptFetcher.h"
+ #include "ThrowScope.h"
+@@ -979,6 +980,11 @@
+     auto* modulePromise = uncheckedDowncast<JSPromise>(arguments[0]);
+     auto status = static_cast<JSPromise::Status>(payload);
+     if (status == JSPromise::Status::Fulfilled) {
++        if (auto* synthetic = dynamicDowncast<SyntheticModuleRecord>(arguments[1])) {
++            entry->fetchComplete(globalObject, synthetic);
++            modulePromise->fulfill(vm, synthetic);
++            return;
++        }
+         auto* jsSourceCode = downcast<JSSourceCode>(arguments[1]);
+         JSPromise* makeModulePromise = JSModuleLoader::makeModule(globalObject, entry->key(), jsSourceCode);
+         if (scope.exception()) {
+@@ -1119,13 +1125,25 @@
+     auto* intermediatePromise = uncheckedDowncast<JSPromise>(arguments[0]);
+     auto status = static_cast<JSPromise::Status>(payload);
+     if (status == JSPromise::Status::Fulfilled) {
+-        auto* jsSourceCode = downcast<JSSourceCode>(arguments[1]);
+-
+         const Identifier& specifier = context->moduleRequest().m_specifier;
+         auto type = context->moduleRequest().type();
+         ScriptFetcher* scriptFetcher = context->scriptFetcher();
+ 
+-        globalObject->moduleLoader()->provideFetch(globalObject, specifier, type, jsSourceCode);
++        if (auto* synthetic = dynamicDowncast<SyntheticModuleRecord>(arguments[1])) {
++            auto* entry = globalObject->moduleLoader()->ensureRegistered(globalObject, specifier, type);
++            if (entry->status() == ModuleRegistryEntry::Status::New) {
++                entry->ensureModulePromise(globalObject);
++                if (scope.exception()) {
++                    intermediatePromise->rejectWithCaughtException(vm, scope);
++                    return;
++                }
++                entry->setStatus(ModuleRegistryEntry::Status::Fetching);
++                entry->ensureFetchPromise(globalObject)->fulfill(vm, synthetic);
++            }
++        } else {
++            auto* jsSourceCode = downcast<JSSourceCode>(arguments[1]);
++            globalObject->moduleLoader()->provideFetch(globalObject, specifier, type, jsSourceCode);
++        }
+         if (scope.exception()) {
+             intermediatePromise->rejectWithCaughtException(vm, scope);
+             return;

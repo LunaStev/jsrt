@@ -1,0 +1,42 @@
+// Bounded script loading from a single verified regular-file descriptor.
+import("std::sys::fs")::{open, fstat, Stat, FS_O_RDONLY, FS_O_NONBLOCK};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::io::fd")::{io_read_at_most, io_close};
+import("./config")::{SOURCE_LIMIT};
+import("./output")::{write_text};
+
+pub fun read_source(path: str) -> ptr<u8> {
+    var fd: i64 = open(path, FS_O_RDONLY | FS_O_NONBLOCK, 0);
+    var info: Stat;
+    if (fd < 0) {
+        write_text(2, "cannot read script: expected a regular file up to 4 MiB\n");
+        return null;
+    }
+    if (fstat(fd, &info) < 0 || ((info.mode as i32) & 61440) != 32768 || info.size > SOURCE_LIMIT) {
+        io_close(fd);
+        write_text(2, "cannot read script: expected a regular file up to 4 MiB\n");
+        return null;
+    }
+    var buffer: ptr<u8> = mem_alloc(SOURCE_LIMIT + 1);
+    if (buffer == null) {
+        io_close(fd);
+        write_text(2, "cannot allocate script buffer\n");
+        return null;
+    }
+    var count: i64 = io_read_at_most(fd, buffer, SOURCE_LIMIT + 1);
+    var closed: i64 = io_close(fd);
+    if (count < 0 || count > SOURCE_LIMIT || closed < 0) {
+        write_text(2, "cannot read complete script within 4 MiB\n");
+        mem_free(buffer, SOURCE_LIMIT + 1);
+        return null;
+    }
+    for (var i: i64 = 0; i < count; i++) {
+        if (buffer[i] == 0) {
+            write_text(2, "script contains a NUL byte\n");
+            mem_free(buffer, SOURCE_LIMIT + 1);
+            return null;
+        }
+    }
+    deref buffer[count] = 0;
+    return buffer;
+}

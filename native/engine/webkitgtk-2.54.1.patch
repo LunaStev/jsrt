@@ -1,0 +1,41 @@
+--- a/Source/JavaScriptCore/runtime/JSGlobalObject.h
++++ b/Source/JavaScriptCore/runtime/JSGlobalObject.h
+@@ -702,10 +702,18 @@
+ #endif
+ 
+     const GlobalObjectMethodTable* m_globalObjectMethodTable;
++    void* m_runtimeModuleHooks { nullptr };
+ 
+     inline void createRareDataIfNeeded();
+         
+ public:
++    void* runtimeModuleHooks() const { return m_runtimeModuleHooks; }
++    void setRuntimeModuleHooks(void* hooks, const GlobalObjectMethodTable* table)
++    {
++        m_runtimeModuleHooks = hooks;
++        m_globalObjectMethodTable = table;
++    }
++
+     using Base = JSSegmentedVariableObject;
+     static constexpr unsigned StructureFlags = Base::StructureFlags | HasStaticPropertyTable | OverridesGetOwnPropertySlot | OverridesPut | IsImmutablePrototypeExoticObject;
+ 
+--- a/Source/JavaScriptCore/bytecode/InlineCacheCompiler.h
++++ b/Source/JavaScriptCore/bytecode/InlineCacheCompiler.h
+@@ -28,6 +28,7 @@
+ #if ENABLE(JIT)
+ 
+ #include "AccessCase.h"
++#include "CCallHelpers.h"
+ #include "InlineCacheHandler.h"
+ #include "JITStubRoutine.h"
+ #include "JSFunctionInlines.h"
+--- a/Source/JavaScriptCore/CMakeLists.txt
++++ b/Source/JavaScriptCore/CMakeLists.txt
+@@ -1857,6 +1857,7 @@
+     PREFIX_LANGUAGES CXX
+     DIRS jit dfg ftl bytecode bytecompiler llint lol tools)
+ 
++list(APPEND JavaScriptCore_SOURCES "${CMAKE_SOURCE_DIR}/../../../native/cpp/jsc_module_api.cpp")
+ WEBKIT_FRAMEWORK(JavaScriptCore)
+ 
+ if (USE_APPLE_INTERNAL_SDK)

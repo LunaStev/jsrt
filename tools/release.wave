@@ -1,0 +1,352 @@
+// Relocatable artifacts and deployment regressions are orchestrated in Wave.
+import("./support")::{join, concat, absolute, private_directory, ensure_directory, run};
+import("./private_files")::{copy_regular, clean_private_directory};
+import("./release_files")::{PAYLOAD, PAYLOAD_COUNT, payload_directories, write_checksums, verify_payload,
+    digest, capture, copy_payload};
+import("./compiler")::{compile_wave, compile_c, link_with_rpath};
+import("./soak")::{soak_binary};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("std::mem::ops")::{mem_eq};
+import("std::fs::file")::{write, fs_read_all, remove};
+import("std::sys::fs")::{open, mkdir, fsync, chdir};
+import("std::env::cwd")::{env_getcwd};
+import("std::io::fd")::{io_read, io_close};
+extern(c, "renameat2") fun rename_new(a: i32, source: str, b: i32, destination: str, flags: u32) -> i32;
+extern(c, "readlink") fun read_link(path: str, bytes: ptr<u8>, capacity: i64) -> i64;
+extern(c, "symlink") fun symbolic_link(target: str, path: str) -> i32;
+const CURRENT_DIRECTORY: i32 = -100;
+const REGULAR_FILE_FLAGS: i32 = 657408;
+
+fun sync_file(path: str) -> bool {
+    var fd: i64 = open(path, REGULAR_FILE_FLAGS, 0);
+    if (fd < 0) {
+        return false;
+    }
+    var ok: bool = fsync(fd) == 0;
+    io_close(fd);
+    return ok;
+}
+
+fun check(name: str, args: ptr<str>, count: i64, expected: i32) -> bool {
+    var status: i32 = run(args, count);
+    if (status != expected) {
+        println("RELEASE FAIL {}: expected {}, got {}", name, expected, status);
+        return false;
+    }
+    println("RELEASE PASS {}", name);
+    return true;
+}
+
+fun contains(bytes: ptr<u8>, n: i64, needle: str) -> bool {
+    var width: i64 = mem_len_cstr(needle);
+    for (var i: i64 = 0; i + width <= n; i++) {
+        if (mem_eq(bytes + i, needle as ptr<u8>, width)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fun x86_64_elf(path: str) -> bool {
+    var fd: i64 = open(path, 526336, 0);
+    if (fd < 0) {
+        return false;
+    }
+    var bytes: array<u8, 64>;
+    var n: i64 = io_read(fd, &bytes[0], 64);
+    io_close(fd);
+    return n == 64 && bytes[0] == 127 && bytes[1] == 69 && bytes[2] == 76 && bytes[3] == 70 &&
+        bytes[4] == 2 && bytes[5] == 1 && bytes[18] == 62 && bytes[19] == 0;
+}
+
+fun compile_deployer(compiler: str, cc: str, standard: str, directory: str) -> ptr<u8> {
+    var object: str = join(directory, "deploy.o") as str;
+    var binary: ptr<u8> = join(directory, "jsrt-deploy");
+    if (compile_wave(compiler, standard, "tools/deploy.wave", object) != 0) {
+        return null;
+    }
+    var native: str = join(directory, "deploy-abi.o") as str;
+    if (compile_c(cc, "native/c/tool_abi.c", native, false) != 0) {
+        return null;
+    }
+    var command: array<str, 13> = [cc, "-pie", object, join(directory, "args.o") as str,
+        join(directory, "filesystem-abi.o") as str, "-Wl,--wrap=main", "-Wl,-z,relro,-z,now",
+        "-Wl,-z,noexecstack", "-ldl", "-lm", "-o", binary as str, native];
+    if (run(&command[0], 13) != 0) {
+        return null;
+    }
+    return binary;
+}
+
+fun same_target(prefix: str, target: str) -> bool {
+    var bytes: array<u8, 128>;
+    var n: i64 = read_link(join(prefix, "current") as str, &bytes[0], 128);
+    return n == mem_len_cstr(target) && mem_eq(&bytes[0], target as ptr<u8>, n);
+}
+
+fun deployment_tests(bundle: str, root: str) -> bool {
+    var moved: str = join(root, "relocated") as str;
+    var alternate: str = join(root, "alternate") as str;
+    if (mkdir(moved, 448) != 0 || mkdir(alternate, 448) != 0 ||
+        !copy_payload(bundle, moved) || !copy_payload(bundle, alternate)) {
+        return false;
+    }
+    var deploy: str = join(moved, "bin/jsrt-deploy") as str;
+    var verify: array<str, 4> = [deploy, "verify", "--bundle", moved];
+    if (!check("verify moved artifact", &verify[0], 4, 0)) {
+        return false;
+    }
+    var readelf: array<str, 3> = ["/usr/bin/readelf", "-d", join(moved, "bin/jsrt") as str];
+    var dynamic: str = join(root, "dynamic") as str;
+    if (!capture(&readelf[0], 3, dynamic)) {
+        return false;
+    }
+    var bytes: array<u8, 65536>;
+    var n: i64 = fs_read_all(dynamic, &bytes[0], 65536);
+    if (!contains(&bytes[0], n, "[$ORIGIN/../lib]") || contains(&bytes[0], n, "candidate-")) {
+        println("RELEASE FAIL relocatable RUNPATH");
+        return false;
+    }
+    println("RELEASE PASS RUNPATH has no engine checkout dependency");
+    var cwd: array<u8, 8192>;
+    if (env_getcwd(&cwd[0], 8192) < 0 || chdir("/") < 0) {
+        return false;
+    }
+    var clean: array<str, 5> = ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", join(moved, "bin/jsrt") as str,
+        join(moved, "checks/probe.js") as str];
+    var ok: bool = check("CJS ESM Worker files crypto and UTF8 outside checkout with clean environment", &clean[0], 5, 0);
+    ok = chdir(&cwd[0] as str) == 0 && ok;
+    if (!ok) {
+        return false;
+    }
+    var prefix: str = join(root, "user-install") as str;
+    var install: array<str, 6> = [deploy, "install", "--bundle", bundle, "--prefix", prefix];
+    if (!check("fresh user-local install", &install[0], 6, 0) ||
+        !check("idempotent install", &install[0], 6, 0)) {
+        return false;
+    }
+    var first: ptr<u8> = digest(join(bundle, "SHA256SUMS") as str, root);
+    if (first == null || !same_target(prefix, concat("releases/", first as str) as str)) {
+        return false;
+    }
+    var variant_text: str = "Owned release regression variant_text\n";
+    if (write(join(alternate, "README.md") as str, variant_text as ptr<u8>, mem_len_cstr(variant_text)) < 0 ||
+        !write_checksums(alternate, root)) {
+        return false;
+    }
+    var second: ptr<u8> = digest(join(alternate, "SHA256SUMS") as str, root);
+    if (second == null || mem_eq_cstr(first as str, second as str)) {
+        return false;
+    }
+    install[3] = alternate;
+    if (!check("update activates a distinct complete generation", &install[0], 6, 0) ||
+        !same_target(prefix, concat("releases/", second as str) as str)) {
+        return false;
+    }
+    var rollback: array<str, 4> = [deploy, "rollback", "--prefix", prefix];
+    if (!check("rollback restores the previous generation", &rollback[0], 4, 0) ||
+        !same_target(prefix, concat("releases/", first as str) as str)) {
+        return false;
+    }
+    var probe: array<str, 2> = [join(prefix, "bin/jsrt") as str, join(prefix, "current/checks/probe.js") as str];
+    if (!check("installed entry point executes after rollback", &probe[0], 2, 0)) {
+        return false;
+    }
+    var phases: array<str, 6> = ["copy-reserved", "copy-completed", "generation-published",
+        "switch-staged", "previous-switched", "current-switched"];
+    var recover: array<str, 4> = [deploy, "recover", "--prefix", prefix];
+    for (var i: i64 = 0; i < 6; i++) {
+        install[3] = alternate;
+        if (!same_target(prefix, concat("releases/", first as str) as str)) {
+            install[3] = bundle;
+        }
+        var interrupted: array<str, 8> = ["/usr/bin/env", concat("JSRT_DEPLOY_DIAGNOSTIC_INTERRUPT=", phases[i]) as str,
+            deploy, "install", "--bundle", install[3], "--prefix", prefix];
+        if (!check(concat("SIGKILL deployment at ", phases[i]) as str, &interrupted[0], 8, 137) ||
+            !check("recover validates active generation and removes journal-owned staging", &recover[0], 4, 0) ||
+            !check("retry interrupted deployment", &install[0], 6, 0) ||
+            !check("recovered installed runtime executes", &probe[0], 2, 0)) {
+            return false;
+        }
+    }
+    install[3] = alternate;
+    var faults: array<str, 3> = ["copy-write", "generation-fsync", "current-rename"];
+    for (var i: i64 = 0; i < 3; i++) {
+        var interrupted: array<str, 8> = ["/usr/bin/env", concat("JSRT_DEPLOY_DIAGNOSTIC_IO=", faults[i]) as str,
+            deploy, "install", "--bundle", alternate, "--prefix", prefix];
+        if (!check(concat("deployment I/O decision failure at ", faults[i]) as str, &interrupted[0], 8, 1) ||
+            !same_target(prefix, concat("releases/", first as str) as str) ||
+            !check("recover after injected I/O failure", &recover[0], 4, 0) ||
+            !check("previous runtime executes after injected I/O failure", &probe[0], 2, 0)) {
+            return false;
+        }
+    }
+    var bad_journal: str = join(prefix, ".pending-copy") as str;
+    write(bad_journal, "../foreign" as ptr<u8>, 10);
+    if (!check("invalid recovery journal is preserved without changing the active release", &recover[0], 4, 1) ||
+        fs_read_all(bad_journal, &bytes[0], 65536) != 10 ||
+        !same_target(prefix, concat("releases/", first as str) as str)) {
+        return false;
+    }
+    remove(bad_journal);
+    var limited: array<str, 8> = ["/usr/bin/env", "JSRT_DEPLOY_DIAGNOSTIC_FSIZE=1", deploy,
+        "install", "--bundle", alternate, "--prefix", prefix];
+    if (!check("kernel file-size write failure preserves the previous release", &limited[0], 8, 1) ||
+        !same_target(prefix, concat("releases/", first as str) as str) ||
+        !check("recover after real kernel write failure", &recover[0], 4, 0)) {
+        return false;
+    }
+    var cached: str = join(prefix, concat("releases/", second as str) as str) as str;
+    write(join(cached, "README.md") as str, "different" as ptr<u8>, 9);
+    if (!write_checksums(cached, root) ||
+        !check("cached generation identity must match the requested manifest", &install[0], 6, 1) ||
+        !same_target(prefix, concat("releases/", first as str) as str)) {
+        return false;
+    }
+    if (write(join(cached, "README.md") as str, variant_text as ptr<u8>, mem_len_cstr(variant_text)) < 0 ||
+        !write_checksums(cached, root)) {
+        return false;
+    }
+    write(join(alternate, "README.md") as str, "corrupt" as ptr<u8>, 7);
+    if (!check("corrupt update is rejected before activation", &install[0], 6, 1) ||
+        !same_target(prefix, concat("releases/", first as str) as str)) {
+        return false;
+    }
+    var library: str = join(moved, "lib/libJavaScriptCore.so.1") as str;
+    remove(library);
+    if (symbolic_link(join(bundle, "lib/libJavaScriptCore.so.1") as str, library) != 0 ||
+        !check("linked payload cannot substitute for a regular engine file", &verify[0], 4, 1)) {
+        return false;
+    }
+    var foreign: str = join(root, "foreign") as str;
+    mkdir(foreign, 448);
+    var sentinel: str = join(foreign, "keep") as str;
+    write(sentinel, "keep" as ptr<u8>, 4);
+    install[3] = bundle;
+    install[5] = foreign;
+    if (!check("unmanaged prefix remains untouched", &install[0], 6, 1) ||
+        fs_read_all(sentinel, &bytes[0], 65536) != 4 || !mem_eq(&bytes[0], "keep" as ptr<u8>, 4)) {
+        return false;
+    }
+    var uninstall: array<str, 4> = [deploy, "uninstall", "--prefix", prefix];
+    var external: str = join(prefix, "keep") as str;
+    write(external, "keep" as ptr<u8>, 4);
+    if (!check("uninstall preserves unrecognized user files", &uninstall[0], 4, 1) ||
+        fs_read_all(external, &bytes[0], 65536) != 4) {
+        return false;
+    }
+    remove(external);
+    return check("uninstall removes only the validated owned installation", &uninstall[0], 4, 0);
+}
+
+fun assemble(compiler: str, cc: str, standard: str, library: str, directory: str, tests: str,
+    root: str) -> ptr<u8> {
+    var bundle: str = join(root, "jsrt-linux-x86_64") as str;
+    if (mkdir(bundle, 493) < 0 || !payload_directories(bundle) || !x86_64_elf(library)) {
+        println("Release currently requires a Linux x86_64 module-enabled libJavaScriptCore.so.1");
+        return null;
+    }
+    var deploy: ptr<u8> = compile_deployer(compiler, cc, standard, directory);
+    if (deploy == null) {
+        return null;
+    }
+    var sources: array<str, 18> = ["", deploy as str, library, "LICENSE", "docs/distribution.md", "",
+        "target/engine-source/webkitgtk-2.54.1/Source/JavaScriptCore/COPYING.LIB",
+        "vendor/libuv/LICENSE", "vendor/llhttp/LICENSE-MIT", "vendor/wjson/LICENSE", "vendor/libuv/LICENSE-extra",
+        "native/engine/webkitgtk-2.54.1.patch", "native/engine/module-output.patch",
+        "native/engine/synthetic-modules.patch", "native/engine/webkitgtk-2.54.1.sha256",
+        "tests/release_probe.js", "tests/release_probe.mjs", "docs/engine-source.md"];
+    for (var i: i64 = 1; i < PAYLOAD_COUNT; i++) {
+        if (i == 5) {
+            continue;
+        }
+        var mode: i32 = 420;
+        if (i == 1) {
+            mode = 493;
+        }
+        if (!copy_regular(sources[i], join(bundle, PAYLOAD[i]) as str, mode)) {
+            println("Cannot copy release input {}", sources[i]);
+            return null;
+        }
+    }
+    var binary: str = join(bundle, "bin/jsrt") as str;
+    if (link_with_rpath(cc, join(directory, "runtime.o") as str, join(directory, "args.o") as str,
+        join(directory, "engine.o") as str, join(directory, "bridge.o") as str, library, binary,
+        directory, false, "$ORIGIN/../lib") != 0 || !x86_64_elf(binary)) {
+        return null;
+    }
+    var info: array<str, 2> = [binary, "--info"];
+    if (!capture(&info[0], 2, join(bundle, "runtime-info.json") as str) || !write_checksums(bundle, root) ||
+        !verify_payload(bundle, root)) {
+        return null;
+    }
+    var command: array<str, 3> = [tests, binary, "--require-tcp"];
+    if (!check("full regression suite using relocated engine RUNPATH", &command[0], 3, 0)) {
+        return null;
+    }
+    command[2] = "--npm-only";
+    if (!check("real npm graph on release binary", &command[0], 3, 0) || !deployment_tests(bundle, root) ||
+        soak_binary(binary, 60) != 0) {
+        return null;
+    }
+    return bundle as ptr<u8>;
+}
+
+fun publish(bundle: str, root: str) -> bool {
+    var hash: ptr<u8> = digest(join(bundle, "SHA256SUMS") as str, root);
+    if (hash == null || !ensure_directory("target/dist")) {
+        return false;
+    }
+    var distribution: i64 = open("target/dist", 720896, 0);
+    if (distribution < 0) {
+        return false;
+    }
+    var name: str = concat(concat("jsrt-linux-x86_64-", hash as str) as str, ".tar.gz") as str;
+    var archive: str = join(root, name) as str;
+    var tar: array<str, 11> = ["/usr/bin/tar", "--sort=name", "--mtime=@0", "--owner=0",
+        "--group=0", "--numeric-owner", "-czf", archive, "-C", root, "jsrt-linux-x86_64"];
+    var ok: bool = run(&tar[0], 11) == 0 && sync_file(archive);
+    var archive_hash: ptr<u8> = null;
+    if (ok) {
+        archive_hash = digest(archive, root);
+        ok = archive_hash != null;
+    }
+    if (ok) {
+        var checksum: str = concat(concat(archive_hash as str, "  ") as str, concat(name, "\n") as str) as str;
+        var sidecar: str = join(root, "archive.sha256") as str;
+        ok = write(sidecar, checksum as ptr<u8>, mem_len_cstr(checksum)) == mem_len_cstr(checksum) && sync_file(sidecar);
+        var destination: str = join("target/dist", name) as str;
+        if (ok && rename_new(CURRENT_DIRECTORY, archive, CURRENT_DIRECTORY, destination, 1) != 0) {
+            var existing: ptr<u8> = digest(destination, root);
+            ok = existing != null && mem_eq(existing, archive_hash, 64);
+        }
+        if (ok && rename_new(CURRENT_DIRECTORY, sidecar, CURRENT_DIRECTORY,
+            concat(destination, ".sha256") as str, 1) != 0) {
+            var bytes: array<u8, 8192>;
+            var n: i64 = fs_read_all(concat(destination, ".sha256") as str, &bytes[0], 8192);
+            ok = n == mem_len_cstr(checksum) && mem_eq(&bytes[0], checksum as ptr<u8>, n);
+        }
+        ok = fsync(distribution) == 0 && ok;
+        if (ok) {
+            println("Release artifact: {}", destination);
+            println("Release SHA-256: {}", archive_hash as str);
+        }
+    }
+    io_close(distribution);
+    return ok;
+}
+
+pub fun build_release(compiler: str, cc: str, standard: str, library: str, directory: str, tests: str) -> bool {
+    var reserved: ptr<u8> = private_directory("target", "release-");
+    if (reserved == null) {
+        return false;
+    }
+    var root: str = absolute(reserved as str) as str;
+    var bundle: ptr<u8> = assemble(compiler, cc, standard, library, absolute(directory) as str, absolute(tests) as str, root);
+    var ok: bool = bundle != null;
+    if (ok) {
+        ok = publish(bundle as str, root);
+    }
+    ok = clean_private_directory(root) && ok;
+    return ok;
+}

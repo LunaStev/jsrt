@@ -1,0 +1,117 @@
+import("./context_state")::{owned_context_slot, active_context};
+import("std::mem::layout")::{size_of};
+struct NetworkState {
+    loop: ptr<u8>;
+}
+
+fun network_storage(ctx: ptr<u8>) -> ptr<NetworkState> {
+    return owned_context_slot(ctx, 18, size_of<NetworkState>() as i64) as ptr<NetworkState>;
+}
+
+// libuv owns I/O readiness; Wave owns its lifetime and JS scheduling.
+import("std::mem::alloc")::{mem_alloc_zeroed, mem_free};
+import("std::net::poll")::{PollFd, NET_POLLIN, net_poll};
+import("./async_fs")::{file_completions_ready, file_completion_fd, async_pending};
+
+extern(c, "uv_loop_size") fun uv_loop_size() -> i64;
+extern(c, "uv_loop_init") fun uv_loop_init(loop: ptr<u8>) -> i32;
+extern(c, "uv_loop_close") fun uv_loop_close(loop: ptr<u8>) -> i32;
+extern(c, "uv_loop_alive") fun uv_loop_alive(loop: ptr<u8>) -> i32;
+extern(c, "uv_run") fun uv_run(loop: ptr<u8>, mode: i32) -> i32;
+extern(c, "uv_backend_fd") fun uv_backend_fd(loop: ptr<u8>) -> i32;
+extern(c, "uv_backend_timeout") fun uv_backend_timeout(loop: ptr<u8>) -> i32;
+
+pub fun network_loop() -> ptr<u8> {
+    var host_state: ptr<NetworkState> = network_storage(active_context());
+    return(deref host_state.loop);
+}
+
+pub fun network_fd() -> i32 {
+    var host_state: ptr<NetworkState> = network_storage(active_context());
+    if ((deref host_state.loop) == null) {
+        return -1;
+    }
+    return uv_backend_fd((deref host_state.loop));
+}
+
+pub fun network_timeout() -> i32 {
+    var host_state: ptr<NetworkState> = network_storage(active_context());
+    if ((deref host_state.loop) == null) {
+        return -1;
+    }
+    return uv_backend_timeout((deref host_state.loop));
+}
+
+pub fun initialize_network() -> i32 {
+    var host_state: ptr<NetworkState> = network_storage(active_context());
+    if ((deref host_state.loop) != null) {
+        return 0;
+    }
+    var created: ptr<u8> = mem_alloc_zeroed(uv_loop_size());
+    if (created == null) {
+        return -12;
+    }
+    var status: i32 = uv_loop_init(created);
+    if (status < 0) {
+        mem_free(created, uv_loop_size());
+        return status;
+    }
+    (deref host_state.loop) = created;
+    return 0;
+}
+
+pub fun network_active() -> bool {
+    var host_state: ptr<NetworkState> = network_storage(active_context());
+    return(deref host_state.loop) != null && uv_loop_alive((deref host_state.loop)) != 0;
+}
+
+pub fun poll_network() {
+    var host_state: ptr<NetworkState> = network_storage(active_context());
+    if ((deref host_state.loop) != null) {
+        uv_run((deref host_state.loop), 2);
+    }
+}
+
+pub fun wait_network(ctx: ptr<u8>, timeout: i32) -> bool {
+    var host_state: ptr<NetworkState> = network_storage(ctx);
+    if ((deref host_state.loop) == null) {
+        return false;
+    }
+    if (async_pending(ctx) > 0 && file_completions_ready(ctx)) {
+        return true;
+    }
+    var millis: i32 = timeout;
+    var next: i32 = uv_backend_timeout((deref host_state.loop));
+    if (next >= 0 && (millis < 0 || next < millis)) {
+        millis = next;
+    }
+    var descriptors: array<PollFd, 2>;
+    descriptors[0] = PollFd {
+        fd: uv_backend_fd((deref host_state.loop)), events: NET_POLLIN, revents: 0
+    }
+    ;
+    descriptors[1] = PollFd {
+        fd: file_completion_fd(ctx) as i32, events: NET_POLLIN, revents: 0
+    }
+    ;
+    var count: i64 = 1;
+    if (async_pending(ctx) > 0) {
+        count = 2;
+    }
+    var status: i64 = net_poll(&descriptors[0], count, millis);
+    return status >= 0 || status == -4;
+}
+
+pub fun shutdown_network() -> bool {
+    var host_state: ptr<NetworkState> = network_storage(active_context());
+    if ((deref host_state.loop) == null) {
+        return true;
+    }
+    var status: i32 = uv_loop_close((deref host_state.loop));
+    if (status != 0) {
+        return false;
+    }
+    mem_free((deref host_state.loop), uv_loop_size());
+    (deref host_state.loop) = null;
+    return true;
+}

@@ -1,0 +1,177 @@
+// Rootless distribution checks share the host kernel, never its library tree.
+import("./support")::{argc, arg, absolute, join, concat, private_directory, ensure_directory, run};
+import("./private_files")::{clean_private_directory, copy_regular};
+import("./release_files")::{digest};
+import("std::mem::cstr")::{mem_eq_cstr};
+import("std::sys::fs")::{mkdir};
+extern(c, "opendir") fun directory_open(path: str) -> ptr<u8>;
+extern(c, "closedir") fun directory_close(directory: ptr<u8>) -> i32;
+extern(c, "jsrt_directory_next") fun directory_next(directory: ptr<u8>, name: ptr<u8>, capacity: i64) -> i32;
+import("std::mem::cstr")::{mem_len_cstr};
+import("std::mem::ops")::{mem_eq};
+
+fun only_archive(directory: str) -> ptr<u8> {
+    var d: ptr<u8> = directory_open(directory);
+    if (d == null) {
+        return null;
+    }
+    var result: ptr<u8> = null;
+    var count: i64 = 0;
+    var bytes: array<u8, 256>;
+    while (true) {
+        var status: i32 = directory_next(d, &bytes[0], 256);
+        if (status <= 0) {
+            if (status < 0) {
+                count = 2;
+            }
+            break;
+        }
+        var n: i64 = mem_len_cstr(&bytes[0] as str);
+        if (n > 7 && mem_eq(&bytes[n - 7], ".tar.gz" as ptr<u8>, 7)) {
+            result = absolute(join(directory, &bytes[0] as str) as str);
+            count += 1;
+        }
+    }
+    directory_close(d);
+    if (count != 1) {
+        return null;
+    }
+    return result;
+}
+
+fun download(url: str, path: str, sha: str, scratch: str) -> bool {
+    var command: array<str, 9> = ["/usr/bin/curl", "--fail", "--location", "--proto", "=https",
+        "--max-time", "180", "--output", path];
+    var args: array<str, 10>;
+    for (var i: i64 = 0; i < 9; i++) {
+        args[i] = command[i];
+    }
+    args[9] = url;
+    if (run(&args[0], 10) != 0) {
+        return false;
+    }
+    var actual: ptr<u8> = digest(path, scratch);
+    return actual != null && mem_eq_cstr(actual as str, sha);
+}
+
+fun guest(proot: str, rootfs: str, bundle: str, command: ptr<str>, count: i64) -> bool {
+    var args: array<str, 64>;
+    args[0] = "/usr/bin/env";
+    args[1] = "-i";
+    args[2] = "PROOT_NO_SECCOMP=1";
+    args[3] = "PATH=/usr/sbin:/usr/bin:/sbin:/bin";
+    args[4] = "HOME=/tmp";
+    args[5] = "DEBIAN_FRONTEND=noninteractive";
+    args[6] = proot;
+    args[7] = "-0";
+    args[8] = "-r";
+    args[9] = rootfs;
+    args[10] = "-b";
+    args[11] = "/proc";
+    args[12] = "-b";
+    args[13] = "/dev";
+    args[14] = "-b";
+    args[15] = concat(bundle, ":/bundle") as str;
+    args[16] = "-w";
+    args[17] = "/tmp";
+    for (var i: i64 = 0; i < count; i++) {
+        args[18 + i] = command[i];
+    }
+    return run(&args[0], 18 + count) == 0;
+}
+
+pub fun linux_check() -> i32 {
+    var archive: str = "";
+    var image: str = "26.04";
+    var archive_directory: str = "target/dist";
+    for (var i: i32 = 2; i < argc(); i++) {
+        if (mem_eq_cstr(arg(i), "--archive") && i + 1 < argc()) {
+            i += 1;
+            archive = absolute(arg(i)) as str;
+        } else if (mem_eq_cstr(arg(i), "--image") && i + 1 < argc()) {
+            i += 1;
+            image = arg(i);
+        } else if (mem_eq_cstr(arg(i), "--archive-directory") && i + 1 < argc()) {
+            i += 1;
+            archive_directory = arg(i);
+        } else {
+            return 2;
+        }
+    }
+    var sha: str = "046fcabb7f16f45a80ae11824664f2a07e01386c6fb1ed9dc1e225a66a6553a2";
+    if (mem_eq_cstr(image, "26.10")) {
+        sha = "ff50c868fa972e956b6406d7efc6e3e47746247f5b301a7c29465e609788c3fc";
+    } else if (!mem_eq_cstr(image, "26.04")) {
+        return 2;
+    }
+    if (archive[0] == 0) {
+        var selected: ptr<u8> = only_archive(archive_directory);
+        if (selected != null) {
+            archive = selected as str;
+        }
+    }
+    if (archive[0] == 0 || !ensure_directory("target")) {
+        println("linux-check --archive <release.tar.gz> --image <26.04|26.10>");
+        return 2;
+    }
+    var reserved: ptr<u8> = private_directory("target", "linux-check-");
+    if (reserved == null) {
+        return 1;
+    }
+    var root: str = absolute(reserved as str) as str;
+    var rootfs: str = join(root, "rootfs") as str;
+    var tool: str = join(root, "tool") as str;
+    var unpacked: str = join(root, "release") as str;
+    var ok: bool = mkdir(rootfs, 448) == 0 && mkdir(tool, 448) == 0 && mkdir(unpacked, 448) == 0;
+    var url: str = concat(concat("https://cdimage.ubuntu.com/ubuntu-base/releases/", image) as str,
+        concat(concat("/release/ubuntu-base-", image) as str, "-base-amd64.tar.gz") as str) as str;
+    var root_archive: str = join(root, "rootfs.tar.gz") as str;
+    var deb: str = join(root, "proot.deb") as str;
+    ok = ok && download(url, root_archive, sha, root) &&
+        download("https://archive.ubuntu.com/ubuntu/pool/universe/p/proot/proot_5.4.0-3_amd64.deb", deb,
+            "8520a33632dc721ec9404eb8bb0079834dcced02f6e861510238bf636cc629e7", root);
+    var extract_tool: array<str, 4> = ["/usr/bin/dpkg-deb", "-x", deb, tool];
+    var extract_root: array<str, 6> = ["/usr/bin/tar", "--no-same-owner", "-xzf", root_archive, "-C", rootfs];
+    var extract_release: array<str, 6> = ["/usr/bin/tar", "--no-same-owner", "-xzf", archive, "-C", unpacked];
+    ok = ok && run(&extract_tool[0], 4) == 0 && run(&extract_root[0], 6) == 0 && run(&extract_release[0], 6) == 0;
+    var proot: str = join(tool, "usr/bin/proot") as str;
+    var bundle: str = join(unpacked, "jsrt-linux-x86_64") as str;
+    if (ok) {
+        // The DNS configuration is data; no host libraries or executable paths are bound.
+        var remove_dns: array<str, 3> = ["/usr/bin/rm", "-f", join(rootfs, "etc/resolv.conf") as str];
+        ok = run(&remove_dns[0], 3) == 0 && copy_regular("/etc/resolv.conf", join(rootfs, "etc/resolv.conf") as str, 420);
+    }
+    var update: array<str, 2> = ["/usr/bin/apt-get", "update"];
+    // PRoot's temporary executable naming conflicts with uutils' multicall dispatch.
+    // Switch only this disposable guest using Ubuntu's documented provider command.
+    var install: array<str, 14> = ["/usr/bin/apt-get", "install", "-y", "--no-install-recommends",
+        "libcurl4t64", "libarchive13t64", "libicu78", "libstdc++6", "ca-certificates", "openssl", "coreutils-from-gnu", "libssl3t64",
+        "coreutils-from-uutils-", "--allow-remove-essential"];
+    var info: array<str, 2> = ["/bundle/bin/jsrt", "--info"];
+    var verify: array<str, 4> = ["/bundle/bin/jsrt-deploy", "verify", "--bundle", "/bundle"];
+    var deploy: array<str, 6> = ["/bundle/bin/jsrt-deploy", "install", "--bundle", "/bundle", "--prefix", "/tmp/jsrt-installed"];
+    var probe: array<str, 2> = ["/tmp/jsrt-installed/bin/jsrt", "/tmp/jsrt-installed/current/checks/probe.js"];
+    var uninstall: array<str, 4> = ["/bundle/bin/jsrt-deploy", "uninstall", "--prefix", "/tmp/jsrt-installed"];
+    var package_root: str = join(rootfs, "tmp/compat") as str;
+    var package_install: array<str, 5> = ["/bundle/bin/jsrt", "install", "--project", "/tmp/compat", "--frozen-lockfile"];
+    var package_run: array<str, 4> = ["/bundle/bin/jsrt", "/tmp/compat-case.js", "/tmp/compat", "polka"];
+    if (ok) {
+        ok = mkdir(package_root, 448) == 0 &&
+            copy_regular("tests/npm_compat.package.json", join(package_root, "package.json") as str, 384) &&
+            copy_regular("tests/npm_compat.lock.wjson", join(package_root, "jsrt.lock.wjson") as str, 384) &&
+            copy_regular("tests/npm_compat.js", join(rootfs, "tmp/compat-case.js") as str, 384);
+    }
+    if (ok) {
+        ok = guest(proot, rootfs, bundle, &update[0], 2) && guest(proot, rootfs, bundle, &install[0], 14) &&
+            guest(proot, rootfs, bundle, &info[0], 2) && guest(proot, rootfs, bundle, &verify[0], 4) &&
+            guest(proot, rootfs, bundle, &deploy[0], 6) && guest(proot, rootfs, bundle, &probe[0], 2) &&
+            guest(proot, rootfs, bundle, &package_install[0], 5) && guest(proot, rootfs, bundle, &package_run[0], 4) &&
+            guest(proot, rootfs, bundle, &uninstall[0], 4);
+    }
+    println("Linux Ubuntu {} rootless userspace validation: {} (shared host kernel)", image, ok);
+    ok = clean_private_directory(root) && ok;
+    if (!ok) {
+        return 1;
+    }
+    return 0;
+}

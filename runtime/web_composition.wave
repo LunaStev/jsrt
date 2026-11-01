@@ -1,0 +1,334 @@
+// pipeTo/tee/async iteration coordinate existing default-stream capabilities.
+import("./web_stream_core")::{storage, WebStreamState, record, capability, settle, resolved, handled, type_error, job, follow, read_result, error_readable, READABLE, WRITABLE, READER, WRITER, OPEN, JOB_PIPE_READ, JOB_PIPE_WRITE, JOB_PIPE_CLOSE, JOB_PIPE_CLEANUP, JOB_TEE_READ, JOB_TEE_CANCEL, JOB_ITERATOR_READ, JOB_ITERATOR_RETURN, JOB_PIPE_WATCH_READ, JOB_PIPE_WATCH_WRITE};
+import("./web_readable")::{create_readable, reader, read, cancel, release_reader, enqueue_readable, request_close};
+import("./web_writable")::{writer, write, close, abort, release_writer};
+import("./abort")::{signal_aborted, signal_reason, subscribe_abort, unsubscribe_abort};
+import("./values")::{get, put, plain, fail};
+import("./collections")::{weak_set, integer, set_integer, flag, set_flag, bind_one};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, owner: ptr<u8>, parent: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+pub const PIPE_ABORT: i64 = 49;
+pub const TEE_PULL: i64 = 50;
+pub const TEE_CANCEL: i64 = 51;
+const ITERATOR: i64 = 8;
+fun detach(ctx: ptr<u8>, p: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var signal: ptr<u8> = get(ctx, p, "signal", ex);
+    if (kind(ctx, signal) == 5) {
+        unsubscribe_abort(ctx, signal, get(ctx, p, "abortHook", ex), ex);
+        put(ctx, p, "signal", undefined(ctx), ex);
+        put(ctx, p, "abortHook", undefined(ctx), ex);
+    }
+}
+fun finish_pipe(ctx: ptr<u8>, p: ptr<u8>, reason: ptr<u8>, failed: bool, ex: ptr<ptr<u8>>) {
+    if (flag(ctx, p, "done", ex)) {
+        return;
+    }
+    set_flag(ctx, p, "done", true, ex);
+    detach(ctx, p, ex);
+    release_reader(ctx, record(ctx, get(ctx, p, "reader", ex), READER, ex), ex);
+    release_writer(ctx, record(ctx, get(ctx, p, "writer", ex), WRITER, ex), ex);
+    settle(ctx, get(ctx, p, "deferred", ex), reason, failed, ex);
+}
+pub fun shutdown_pipe(ctx: ptr<u8>, p: ptr<u8>, reason: ptr<u8>, source_failed: bool, both: bool, ex: ptr<ptr<u8>>) {
+    if (flag(ctx, p, "done", ex) || flag(ctx, p, "shutting", ex)) {
+        return;
+    }
+    set_flag(ctx, p, "shutting", true, ex);
+    put(ctx, p, "failure", reason, ex);
+    detach(ctx, p, ex);
+    var abort_sink: bool = (source_failed || both) && !flag(ctx, p, "preventAbort", ex);
+    var cancel_source: bool = (!source_failed || both) && !flag(ctx, p, "preventCancel", ex);
+    var waits: i64 = 0;
+    if (abort_sink) {
+        waits += 1;
+    }
+    if (cancel_source) {
+        waits += 1;
+    }
+    set_integer(ctx, p, "waits", waits, ex);
+    if (abort_sink) {
+        var result: ptr<u8> = abort(ctx, get(ctx, p, "writeState", ex), reason, ex);
+        follow(ctx, result, job(ctx, JOB_PIPE_CLEANUP, p, undefined(ctx), ex), ex);
+    }
+    if (cancel_source) {
+        var result: ptr<u8> = cancel(ctx, get(ctx, p, "readState", ex), reason, ex);
+        follow(ctx, result, job(ctx, JOB_PIPE_CLEANUP, p, undefined(ctx), ex), ex);
+    }
+    if (waits == 0) {
+        finish_pipe(ctx, p, reason, true, ex);
+    }
+}
+fun next_pipe(ctx: ptr<u8>, p: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (flag(ctx, p, "done", ex) || flag(ctx, p, "shutting", ex)) {
+        return;
+    }
+    follow(ctx, read(ctx, get(ctx, p, "reader", ex), ex), job(ctx, JOB_PIPE_READ, p, undefined(ctx), ex), ex);
+}
+pub fun pipe_to(ctx: ptr<u8>, source: ptr<u8>, destination: ptr<u8>, options: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var rs: ptr<u8> = record(ctx, source, READABLE, ex);
+    var ws: ptr<u8> = record(ctx, destination, WRITABLE, ex);
+    var p: ptr<u8> = plain(ctx);
+    protect(ctx, p);
+    if (kind(ctx, options) == 5) {
+        var names: array<str, 3> = ["preventClose", "preventAbort", "preventCancel"];
+        for (var i: i64 = 0; i < 3 && deref ex == null; i++) {
+            set_flag(ctx, p, names[i], flag(ctx, options, names[i], ex), ex);
+        }
+        var signal: ptr<u8> = get(ctx, options, "signal", ex);
+        if (kind(ctx, signal) != 0) {
+            signal_aborted(ctx, signal, ex);
+            put(ctx, p, "signal", signal, ex);
+        }
+    } else if (kind(ctx, options) != 0 && kind(ctx, options) != 1) {
+        fail(ctx, ex, 1, "pipe options must be an object");
+    }
+    if (deref ex != null || kind(ctx, get(ctx, rs, "reader", ex)) == 5 || kind(ctx, get(ctx, ws, "writer", ex)) == 5) {
+        fail(ctx, ex, 1, "pipe source or destination is locked");
+        unprotect(ctx, p);
+        return undefined(ctx);
+    }
+    put(ctx, p, "readState", rs, ex);
+    put(ctx, p, "writeState", ws, ex);
+    put(ctx, p, "reader", reader(ctx, source, undefined(ctx), ex), ex);
+    put(ctx, p, "writer", writer(ctx, destination, ex), ex);
+    var deferred: ptr<u8> = capability(ctx, ex);
+    put(ctx, p, "deferred", deferred, ex);
+    var r: ptr<u8> = record(ctx, get(ctx, p, "reader", ex), READER, ex);
+    follow(ctx, get(ctx, get(ctx, r, "closed", ex), "promise", ex), job(ctx, JOB_PIPE_WATCH_READ, p, undefined(ctx), ex), ex);
+    r = record(ctx, get(ctx, p, "writer", ex), WRITER, ex);
+    follow(ctx, get(ctx, get(ctx, r, "closed", ex), "promise", ex), job(ctx, JOB_PIPE_WATCH_WRITE, p, undefined(ctx), ex), ex);
+    var signal: ptr<u8> = get(ctx, p, "signal", ex);
+    if (kind(ctx, signal) == 5) {
+        var s: ptr<WebStreamState> = storage(ctx);
+        var bound: ptr<u8> = bind_one(ctx, (deref s.methods)[PIPE_ABORT], undefined(ctx), p, ex);
+        put(ctx, p, "abortHook", bound, ex);
+        subscribe_abort(ctx, signal, bound, ex);
+    }
+    next_pipe(ctx, p, ex);
+    var result: ptr<u8> = get(ctx, deferred, "promise", ex);
+    unprotect(ctx, p);
+    return result;
+}
+pub fun pipe_job(ctx: ptr<u8>, p: ptr<u8>, operation: i64, value: ptr<u8>, failed: bool, ex: ptr<ptr<u8>>) {
+    if (flag(ctx, p, "done", ex)) {
+        return;
+    }
+    if (operation == JOB_PIPE_CLEANUP) {
+        if (failed && !flag(ctx, p, "cleanupFailed", ex)) {
+            put(ctx, p, "failure", value, ex);
+            set_flag(ctx, p, "cleanupFailed", true, ex);
+        }
+        var waits: i64 = integer(ctx, p, "waits", ex) - 1;
+        set_integer(ctx, p, "waits", waits, ex);
+        if (waits == 0) {
+            finish_pipe(ctx, p, get(ctx, p, "failure", ex), true, ex);
+        }
+        return;
+    }
+    if (flag(ctx, p, "shutting", ex)) {
+        return;
+    }
+    if (operation == JOB_PIPE_WATCH_READ || operation == JOB_PIPE_WATCH_WRITE) {
+        if (failed) {
+            shutdown_pipe(ctx, p, value, operation == JOB_PIPE_WATCH_READ, false, ex);
+        } else if (operation == JOB_PIPE_WATCH_WRITE && !flag(ctx, p, "closing", ex)) {
+            shutdown_pipe(ctx, p, type_error(ctx, "pipe destination closed prematurely"), false, false, ex);
+        }
+        return;
+    }
+    if (failed) {
+        shutdown_pipe(ctx, p, value, operation == JOB_PIPE_READ, false, ex);
+        return;
+    }
+    if (operation == JOB_PIPE_WRITE) {
+        next_pipe(ctx, p, ex);
+    } else if (operation == JOB_PIPE_CLOSE) {
+        finish_pipe(ctx, p, undefined(ctx), false, ex);
+    } else if (flag(ctx, value, "done", ex)) {
+        if (flag(ctx, p, "preventClose", ex)) {
+            finish_pipe(ctx, p, undefined(ctx), false, ex);
+        } else {
+            set_flag(ctx, p, "closing", true, ex);
+            follow(ctx, close(ctx, get(ctx, p, "writeState", ex), ex), job(ctx, JOB_PIPE_CLOSE, p, undefined(ctx), ex), ex);
+        }
+    } else {
+        var cursor: ptr<u8> = record(ctx, get(ctx, p, "writer", ex), WRITER, ex);
+        follow(ctx, write(ctx, cursor, get(ctx, value, "value", ex), ex), job(ctx, JOB_PIPE_WRITE, p, undefined(ctx), ex), ex);
+    }
+}
+pub fun abort_pipe(ctx: ptr<u8>, p: ptr<u8>, ex: ptr<ptr<u8>>) {
+    shutdown_pipe(ctx, p, signal_reason(ctx, get(ctx, p, "signal", ex), ex), true, true, ex);
+}
+fun next_tee(ctx: ptr<u8>, p: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (flag(ctx, p, "finished", ex)) {
+        return;
+    }
+    if (flag(ctx, p, "reading", ex)) {
+        set_flag(ctx, p, "readAgain", true, ex);
+        return;
+    }
+    set_flag(ctx, p, "reading", true, ex);
+    follow(ctx, read(ctx, get(ctx, p, "reader", ex), ex), job(ctx, JOB_TEE_READ, p, undefined(ctx), ex), ex);
+}
+pub fun tee(ctx: ptr<u8>, source: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var p: ptr<u8> = plain(ctx);
+    protect(ctx, p);
+    put(ctx, p, "reader", reader(ctx, source, undefined(ctx), ex), ex);
+    put(ctx, p, "cancelRequest", capability(ctx, ex), ex);
+    var branches: array<ptr<u8>, 2> = [undefined(ctx), undefined(ctx)];
+    var s: ptr<WebStreamState> = storage(ctx);
+    for (var i: i64 = 0; i < 2 && deref ex == null; i++) {
+        var branch: ptr<u8> = plain(ctx);
+        protect(ctx, branch);
+        put(ctx, branch, "tee", p, ex);
+        set_integer(ctx, branch, "index", i, ex);
+        var source: ptr<u8> = plain(ctx);
+        protect(ctx, source);
+        put(ctx, source, "pull", bind_one(ctx, (deref s.methods)[TEE_PULL], undefined(ctx), branch, ex), ex);
+        put(ctx, source, "cancel", bind_one(ctx, (deref s.methods)[TEE_CANCEL], undefined(ctx), branch, ex), ex);
+        branches[i] = create_readable(ctx, source, undefined(ctx), 1.0, ex);
+        if (i == 0) {
+            put(ctx, p, "first", record(ctx, branches[i], READABLE, ex), ex);
+        } else {
+            put(ctx, p, "second", record(ctx, branches[i], READABLE, ex), ex);
+        }
+        unprotect(ctx, source);
+        unprotect(ctx, branch);
+    }
+    var result: ptr<u8> = array(ctx, 2, &branches[0], ex);
+    unprotect(ctx, p);
+    return result;
+}
+pub fun tee_hook(ctx: ptr<u8>, branch: ptr<u8>, reason: ptr<u8>, cancelling: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var p: ptr<u8> = get(ctx, branch, "tee", ex);
+    if (!cancelling) {
+        next_tee(ctx, p, ex);
+        return undefined(ctx);
+    }
+    var index: i64 = integer(ctx, branch, "index", ex);
+    if (index == 0) {
+        set_flag(ctx, p, "cancelFirst", true, ex);
+        put(ctx, p, "reasonFirst", reason, ex);
+    } else {
+        set_flag(ctx, p, "cancelSecond", true, ex);
+        put(ctx, p, "reasonSecond", reason, ex);
+    }
+    if (flag(ctx, p, "cancelFirst", ex) && flag(ctx, p, "cancelSecond", ex) && !flag(ctx, p, "finished", ex)) {
+        set_flag(ctx, p, "finished", true, ex);
+        var reasons: array<ptr<u8>, 2> = [get(ctx, p, "reasonFirst", ex), get(ctx, p, "reasonSecond", ex)];
+        var cursor: ptr<u8> = record(ctx, get(ctx, p, "reader", ex), READER, ex);
+        var result: ptr<u8> = cancel(ctx, get(ctx, cursor, "stream", ex), array(ctx, 2, &reasons[0], ex), ex);
+        follow(ctx, result, job(ctx, JOB_TEE_CANCEL, p, undefined(ctx), ex), ex);
+    }
+    return get(ctx, get(ctx, p, "cancelRequest", ex), "promise", ex);
+}
+pub fun tee_job(ctx: ptr<u8>, p: ptr<u8>, operation: i64, value: ptr<u8>, failed: bool, ex: ptr<ptr<u8>>) {
+    if (operation == JOB_TEE_CANCEL) {
+        settle(ctx, get(ctx, p, "cancelRequest", ex), value, failed, ex);
+        release_reader(ctx, record(ctx, get(ctx, p, "reader", ex), READER, ex), ex);
+        return;
+    }
+    if (flag(ctx, p, "finished", ex)) {
+        return;
+    }
+    if (failed || flag(ctx, value, "done", ex)) {
+        set_flag(ctx, p, "finished", true, ex);
+        var names: array<str, 2> = ["first", "second"];
+        for (var i: i64 = 0; i < 2; i++) {
+            var r: ptr<u8> = get(ctx, p, names[i], ex);
+            if (failed) {
+                error_readable(ctx, r, value, ex);
+            } else if (integer(ctx, r, "state", ex) == OPEN && !flag(ctx, r, "closeRequested", ex)) {
+                request_close(ctx, r, ex);
+            }
+        }
+        settle(ctx, get(ctx, p, "cancelRequest", ex), undefined(ctx), false, ex);
+        release_reader(ctx, record(ctx, get(ctx, p, "reader", ex), READER, ex), ex);
+        return;
+    }
+    var chunk: ptr<u8> = get(ctx, value, "value", ex);
+    var problem: ptr<u8> = null;
+    if (!flag(ctx, p, "cancelFirst", ex)) {
+        enqueue_readable(ctx, get(ctx, p, "first", ex), chunk, &problem);
+    }
+    if (problem == null && !flag(ctx, p, "cancelSecond", ex)) {
+        enqueue_readable(ctx, get(ctx, p, "second", ex), chunk, &problem);
+    }
+    set_flag(ctx, p, "reading", false, ex);
+    if (problem != null) {
+        protect(ctx, problem);
+        set_flag(ctx, p, "finished", true, ex);
+        error_readable(ctx, get(ctx, p, "first", ex), problem, ex);
+        error_readable(ctx, get(ctx, p, "second", ex), problem, ex);
+        settle(ctx, get(ctx, p, "cancelRequest", ex), undefined(ctx), false, ex);
+        var cursor: ptr<u8> = record(ctx, get(ctx, p, "reader", ex), READER, ex);
+        handled(ctx, cancel(ctx, get(ctx, cursor, "stream", ex), problem, ex), ex);
+        release_reader(ctx, cursor, ex);
+        unprotect(ctx, problem);
+        return;
+    }
+    if (flag(ctx, p, "readAgain", ex)) {
+        set_flag(ctx, p, "readAgain", false, ex);
+        next_tee(ctx, p, ex);
+    }
+}
+pub fun iterator(ctx: ptr<u8>, source: ptr<u8>, options: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var r: ptr<u8> = plain(ctx);
+    protect(ctx, r);
+    set_integer(ctx, r, "kind", ITERATOR, ex);
+    if (kind(ctx, options) == 5) {
+        set_flag(ctx, r, "preventCancel", flag(ctx, options, "preventCancel", ex), ex);
+    } else if (kind(ctx, options) != 0 && kind(ctx, options) != 1) {
+        fail(ctx, ex, 1, "iterator options must be an object");
+    }
+    put(ctx, r, "reader", reader(ctx, source, undefined(ctx), ex), ex);
+    var s: ptr<WebStreamState> = storage(ctx);
+    var owner: ptr<u8> = object(ctx, null, null);
+    protect(ctx, owner);
+    prototype(ctx, owner, deref s.iterator_parent);
+    weak_set(ctx, deref s.records, owner, r, ex);
+    unprotect(ctx, owner);
+    unprotect(ctx, r);
+    return owner;
+}
+pub fun iterator_method(ctx: ptr<u8>, owner: ptr<u8>, value: ptr<u8>, returning: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var r: ptr<u8> = record(ctx, owner, ITERATOR, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (flag(ctx, r, "done", ex)) {
+        return resolved(ctx, read_result(ctx, value, true, ex), false, ex);
+    }
+    var cursor: ptr<u8> = record(ctx, get(ctx, r, "reader", ex), READER, ex);
+    var deferred: ptr<u8> = capability(ctx, ex);
+    protect(ctx, deferred);
+    if (returning) {
+        set_flag(ctx, r, "done", true, ex);
+        put(ctx, deferred, "value", value, ex);
+        var result: ptr<u8> = undefined(ctx);
+        if (!flag(ctx, r, "preventCancel", ex)) {
+            result = cancel(ctx, get(ctx, cursor, "stream", ex), value, ex);
+        }
+        follow(ctx, result, job(ctx, JOB_ITERATOR_RETURN, r, deferred, ex), ex);
+    } else {
+        follow(ctx, read(ctx, get(ctx, r, "reader", ex), ex), job(ctx, JOB_ITERATOR_READ, r, deferred, ex), ex);
+    }
+    var result: ptr<u8> = get(ctx, deferred, "promise", ex);
+    unprotect(ctx, deferred);
+    return result;
+}
+pub fun iterator_job(ctx: ptr<u8>, r: ptr<u8>, operation: i64, deferred: ptr<u8>, value: ptr<u8>, failed: bool, ex: ptr<ptr<u8>>) {
+    if (failed || operation == JOB_ITERATOR_RETURN || flag(ctx, value, "done", ex)) {
+        set_flag(ctx, r, "done", true, ex);
+        release_reader(ctx, record(ctx, get(ctx, r, "reader", ex), READER, ex), ex);
+    }
+    if (operation == JOB_ITERATOR_RETURN && !failed) {
+        value = read_result(ctx, get(ctx, deferred, "value", ex), true, ex);
+    }
+    settle(ctx, deferred, value, failed, ex);
+}

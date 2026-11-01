@@ -1,0 +1,195 @@
+// Path-based file jobs share the Wave file queue. Only preparation/completion use JSC.
+import("./system")::{FileWork, copy_host_path, complete_file, free_file};
+import("./fs_sync")::{DirectoryOptions, directory_options, file_stats};
+import("./fs_directory")::{readdir_options};
+import("./fs_directory_jobs")::{perform_readdir, complete_readdir};
+import("./values")::{text, define, fail};
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed};
+import("std::mem::layout")::{size_of};
+import("std::mem::cstr")::{mem_len_cstr};
+import("std::sys::fs")::{stat, access, mkdir, rmdir, unlink, rename_path, Stat};
+extern(c, "lstat") fun link_stat(path: str, info: ptr<Stat>) -> i32;
+extern(c, "__errno_location") fun errno_location() -> ptr<i32>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_to_number") fun numeric(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+pub const STAT: i32 = 6;
+pub const LSTAT: i32 = 7;
+pub const ACCESS: i32 = 8;
+pub const MKDIR: i32 = 9;
+pub const UNLINK: i32 = 10;
+pub const RMDIR: i32 = 11;
+pub const RENAME: i32 = 12;
+pub const READDIR: i32 = 13;
+pub const METHOD_COUNT: i64 = 8;
+const PATH_CAP: i64 = 16385;
+const DIRECTORY_MASK: i32 = 61440;
+const DIRECTORY_KIND: i32 = 16384;
+const PATH_EXISTS: i64 = -17;
+const NOT_DIRECTORY: i64 = -20;
+
+pub fun prepare_path_task(ctx: ptr<u8>, operation: i32, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<FileWork> {
+    if (count == 0 || (operation == RENAME && count < 2)) {
+        fail(ctx, ex, 1, "filesystem path arguments are required");
+        return null;
+    }
+    var work: ptr<FileWork> = mem_alloc_zeroed(size_of<FileWork>() as i64) as ptr<FileWork>;
+    if (work == null) {
+        fail(ctx, ex, 2, "cannot allocate filesystem job");
+        return null;
+    }
+    deref work.mode = operation;
+    deref work.fd = -1;
+    deref work.offset = -1;
+    deref work.path = mem_alloc(PATH_CAP);
+    if (deref work.path == null) {
+        fail(ctx, ex, 2, "cannot allocate filesystem path");
+    } else {
+        copy_host_path(ctx, args[0], deref work.path, PATH_CAP, ex);
+    }
+    if (deref ex == null && operation == RENAME) {
+        deref work.other_path = mem_alloc(PATH_CAP);
+        if (deref work.other_path == null) {
+            fail(ctx, ex, 2, "cannot allocate destination path");
+        } else {
+            copy_host_path(ctx, args[1], deref work.other_path, PATH_CAP, ex);
+        }
+    } else if (deref ex == null && operation == READDIR) {
+        if (count > 1) {
+            deref work.with_types = readdir_options(ctx, args[1], ex);
+        }
+    } else if (deref ex == null && operation == MKDIR) {
+        var value: ptr<u8> = undefined(ctx);
+        if (count > 1) {
+            value = args[1];
+        }
+        var options: DirectoryOptions = directory_options(ctx, value, ex);
+        deref work.permissions = options.mode as i32;
+        deref work.recursive = options.recursive;
+    } else if (deref ex == null && operation == ACCESS && count > 1 && kind(ctx, args[1]) != 0) {
+        if (kind(ctx, args[1]) != 3) {
+            fail(ctx, ex, 1, "access mode must be a number");
+        } else {
+            var mode: f64 = numeric(ctx, args[1], ex);
+            if (!(mode >= 0.0 && mode <= 7.0) || mode != (mode as i32) as f64) {
+                fail(ctx, ex, 2, "access mode must be an integer from 0 to 7");
+            } else {
+                deref work.permissions = mode as i32;
+            }
+        }
+    } else if (deref ex == null && count > 1 && kind(ctx, args[1]) != 0) {
+        fail(ctx, ex, 1, "options for this filesystem operation are not implemented");
+    }
+    if (deref ex != null) {
+        free_file(work);
+        return null;
+    }
+    return work;
+}
+
+fun directory_job(work: ptr<FileWork>) -> i64 {
+    if (!deref work.recursive) {
+        return mkdir(deref work.path as str, deref work.permissions);
+    }
+    var bytes: ptr<u8> = deref work.path;
+    var size: i64 = mem_len_cstr(bytes as str);
+    if (size == 0) {
+        return mkdir(bytes as str, deref work.permissions);
+    }
+    for (var i: i64 = 1; i <= size; i++) {
+        if ((i != size && bytes[i] != 47) || bytes[i - 1] == 47) {
+            continue;
+        }
+        var saved: u8 = bytes[i];
+        bytes[i] = 0;
+        var status: i64 = mkdir(bytes as str, deref work.permissions);
+        if (status == PATH_EXISTS) {
+            var info: Stat;
+            status = stat(bytes as str, &info);
+            if (status == 0 && (info.mode & DIRECTORY_MASK) != DIRECTORY_KIND) {
+                status = NOT_DIRECTORY;
+            }
+        } else if (status == 0 && deref work.offset < 0) {
+            deref work.offset = i;
+        }
+        bytes[i] = saved;
+        if (status < 0) {
+            return status;
+        }
+    }
+    var info: Stat;
+    var result: i64 = stat(bytes as str, &info);
+    if (result == 0 && (info.mode & DIRECTORY_MASK) != DIRECTORY_KIND) {
+        return NOT_DIRECTORY;
+    }
+    return result;
+}
+
+// Worker thread: native path snapshots and Stat storage only, never engine handles.
+pub fun perform_path_task(work: ptr<FileWork>) {
+    var code: i32 = deref work.mode;
+    if (code == READDIR) {
+        perform_readdir(work);
+        return;
+    }
+    var result: i64 = 0;
+    if (code == STAT) {
+        deref work.operation = "stat";
+        result = stat(deref work.path as str, &(deref work.info));
+    } else if (code == LSTAT) {
+        deref work.operation = "lstat";
+        if (link_stat(deref work.path as str, &(deref work.info)) < 0) {
+            result = -(deref errno_location() as i64);
+        }
+    } else if (code == ACCESS) {
+        deref work.operation = "access";
+        result = access(deref work.path as str, deref work.permissions);
+    } else if (code == MKDIR) {
+        deref work.operation = "mkdir";
+        result = directory_job(work);
+    } else if (code == UNLINK) {
+        deref work.operation = "unlink";
+        result = unlink(deref work.path as str);
+    } else if (code == RMDIR) {
+        deref work.operation = "rmdir";
+        result = rmdir(deref work.path as str);
+    } else if (code == RENAME) {
+        deref work.operation = "rename";
+        result = rename_path(deref work.path as str, deref work.other_path as str);
+    }
+    if (result < 0) {
+        deref work.status = 1;
+        deref work.errno = result;
+    }
+}
+
+pub fun complete_path_task(ctx: ptr<u8>, work: ptr<FileWork>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (deref work.mode == READDIR) {
+        return complete_readdir(ctx, work, ex);
+    }
+    if (deref work.status != 0) {
+        complete_file(ctx, work, ex);
+        if (deref work.mode == RENAME && deref ex != null) {
+            protect(ctx, deref ex);
+            var nested: ptr<u8> = null;
+            define(ctx, deref ex, "dest", text(ctx, deref work.other_path as str), &nested, true);
+            unprotect(ctx, deref ex);
+        }
+        return undefined(ctx);
+    }
+    if (deref work.mode == STAT || deref work.mode == LSTAT) {
+        return file_stats(ctx, &(deref work.info), ex);
+    }
+    if (deref work.mode == MKDIR && deref work.recursive && deref work.offset >= 0) {
+        var bytes: ptr<u8> = deref work.path;
+        var saved: u8 = bytes[deref work.offset];
+        bytes[deref work.offset] = 0;
+        var result: ptr<u8> = text(ctx, bytes as str);
+        bytes[deref work.offset] = saved;
+        return result;
+    }
+    return undefined(ctx);
+}

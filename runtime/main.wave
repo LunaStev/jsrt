@@ -1,0 +1,6 @@
+// Executable entry point. Application orchestration lives in app.wave.
+import("./app")::{run};
+
+fun main() -> i32 {
+    return run();
+}

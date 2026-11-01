@@ -1,0 +1,100 @@
+// Indent serialized wjson output without changing its values.
+import("./json_support")::{error};
+import("./wjson_text")::{JSON_TEXT_LIMIT};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+extern(c, "wr_string_value") fun wr_string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf16") fun wr_string_utf16(text: ptr<u16>, length: i64) -> ptr<u8>;
+extern(c, "wr_string_characters") fun wr_string_characters(text: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_length") fun wr_string_length(text: ptr<u8>) -> i64;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+
+pub struct Format {
+    data: ptr<u16>;
+    len: i64;
+    ok: bool;
+}
+
+pub fun put(f: ptr<Format>, unit: u16) {
+    if (deref f.len >= JSON_TEXT_LIMIT) {
+        deref f.ok = false;
+        return;
+    }
+    var data: ptr<u16> = deref f.data;
+    deref data[deref f.len] = unit;
+    deref f.len = deref f.len + 1;
+}
+
+pub fun newline(f: ptr<Format>, gap: ptr<u16>, count: i64, depth: i64) {
+    put(f, 10);
+    for (var i: i64 = 0; i < depth && deref f.ok; i++) {
+        for (var j: i64 = 0; j < count; j++) {
+            put(f, gap[j]);
+        }
+    }
+}
+
+pub fun format_json(ctx: ptr<u8>, text: ptr<u8>, gap: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var size: i64 = wr_string_length(gap);
+    if (size == 0) {
+        return wr_string_value(ctx, text);
+    }
+    var data: ptr<u16> = wr_string_characters(text);
+    var length: i64 = wr_string_length(text);
+    var spaces: ptr<u16> = wr_string_characters(gap);
+    var f: Format = Format {
+        data: mem_alloc(JSON_TEXT_LIMIT * 2) as ptr<u16>,
+        len: 0,
+        ok: true
+    };
+    if (f.data == null) {
+        error(ctx, ex, 2, "cannot allocate wjson output");
+        return null;
+    }
+    var inside: bool = false;
+    var depth: i64 = 0;
+    for (var i: i64 = 0; i < length && f.ok; i++) {
+        var unit: u16 = data[i];
+        if (inside) {
+            put(&f, unit);
+            if (unit == 92 && i + 1 < length) {
+                i += 1;
+                put(&f, data[i]);
+            } else if (unit == 34) {
+                inside = false;
+            }
+        } else if (unit == 34) {
+            inside = true;
+            put(&f, unit);
+        } else if (unit == 123 || unit == 91) {
+            put(&f, unit);
+            depth += 1;
+            if (i + 1 < length && data[i + 1] != 125 && data[i + 1] != 93) {
+                newline(&f, spaces, size, depth);
+            }
+        } else if (unit == 125 || unit == 93) {
+            depth -= 1;
+            if (i > 0 && data[i - 1] != 123 && data[i - 1] != 91) {
+                newline(&f, spaces, size, depth);
+            }
+            put(&f, unit);
+        } else if (unit == 44) {
+            put(&f, unit);
+            newline(&f, spaces, size, depth);
+        } else if (unit == 58) {
+            put(&f, unit);
+            put(&f, 32);
+        } else {
+            put(&f, unit);
+        }
+    }
+    var result: ptr<u8> = null;
+    if (f.ok) {
+        var output: ptr<u8> = wr_string_utf16(f.data, f.len);
+        result = wr_string_value(ctx, output);
+        wr_string_release(output);
+    } else {
+        error(ctx, ex, 2, "wjson pretty output limit exceeded (4 Mi UTF-16 units)");
+    }
+    mem_free(f.data as ptr<u8>, JSON_TEXT_LIMIT * 2);
+    return result;
+}

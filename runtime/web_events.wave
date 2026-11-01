@@ -1,0 +1,469 @@
+// EventTarget has no DOM tree. Private listener entries survive dispatch snapshots.
+import("./context_state")::{owned_context_slot, context_slot, release_context_slot};
+import("./values")::{get, put, text, plain, define, define_key, getter, fail};
+import("./collections")::{weak_map, weak_get, weak_set, list, length, at, append, integer, set_integer, flag, set_flag, bind_one, enqueue};
+import("./web_support")::{dom_text, apply, readonly, public_constructor};
+// Both APIs use the shared cancellation layer without importing each other.
+import("./abort_state")::{is_aborted, subscribe, unsubscribe};
+import("./config")::{EVENT_LISTENER_LIMIT};
+import("std::mem::layout")::{size_of};
+import("std::time::clock")::{time_now_monotonic_ns};
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, value: ptr<u8>, parent: ptr<u8>);
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "jsrt_dom_callback") fun callback(constructing: bool) -> ptr<u8>;
+const SLOT: i64 = 44;
+const EVENT: i64 = 0;
+const TARGET: i64 = 1;
+const EXCEPTION: i64 = 2;
+const ADD: i64 = 0;
+const REMOVE: i64 = 1;
+const DISPATCH: i64 = 2;
+const PREVENT: i64 = 3;
+const STOP: i64 = 4;
+const STOP_IMMEDIATE: i64 = 5;
+const PATH: i64 = 6;
+const FIRST_GETTER: i64 = 7;
+const ABORT_LISTENER: i64 = 17;
+const REPORT_ERROR: i64 = 18;
+const METHOD_COUNT: i64 = 19;
+struct State {
+    records: ptr<u8>;
+    ctors: array<ptr<u8>, 3>;
+    parents: array<ptr<u8>, 3>;
+    methods: array<ptr<u8>, 19>;
+    origin: i64;
+}
+fun state(ctx: ptr<u8>) -> ptr<State> {
+    return context_slot(ctx, SLOT) as ptr<State>;
+}
+fun record(ctx: ptr<u8>, owner: ptr<u8>, category: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<State> = state(ctx);
+    var result: ptr<u8> = undefined(ctx);
+    if (kind(ctx, owner) == 5) {
+        result = weak_get(ctx, deref s.records, owner, ex);
+    }
+    if (kind(ctx, result) != 5 || integer(ctx, result, "kind", ex) != category) {
+        fail(ctx, ex, 1, "invalid Web event receiver");
+        return undefined(ctx);
+    }
+    return result;
+}
+pub fun event_target_parent(ctx: ptr<u8>) -> ptr<u8> {
+    var s: ptr<State> = state(ctx);
+    return (deref s.parents)[TARGET];
+}
+pub fun initialize_event_target(ctx: ptr<u8>, owner: ptr<u8>, synchronous_errors: bool, ex: ptr<ptr<u8>>) {
+    var s: ptr<State> = state(ctx);
+    var r: ptr<u8> = plain(ctx);
+    protect(ctx, r);
+    set_integer(ctx, r, "kind", TARGET, ex);
+    set_flag(ctx, r, "synchronousErrors", synchronous_errors, ex);
+    put(ctx, r, "listeners", list(ctx, ex), ex);
+    weak_set(ctx, deref s.records, owner, r, ex);
+    unprotect(ctx, r);
+}
+fun event_record(ctx: ptr<u8>, value: ptr<u8>, options: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var r: ptr<u8> = plain(ctx);
+    protect(ctx, r);
+    set_integer(ctx, r, "kind", EVENT, ex);
+    put(ctx, r, "type", dom_text(ctx, value, ex), ex);
+    var names: array<str, 3> = ["bubbles", "cancelable", "composed"];
+    if (kind(ctx, options) == 5) {
+        for (var i: i64 = 0; i < 3 && deref ex == null; i++) {
+            set_flag(ctx, r, names[i], truth(ctx, get(ctx, options, names[i], ex)), ex);
+        }
+    } else if (kind(ctx, options) != 0 && kind(ctx, options) != 1) {
+        fail(ctx, ex, 1, "Event options must be an object");
+    }
+    var s: ptr<State> = state(ctx);
+    put(ctx, r, "timeStamp", number(ctx, (time_now_monotonic_ns() - deref s.origin) as f64 / 1000000.0), ex);
+    put(ctx, r, "target", js_null(ctx), ex);
+    put(ctx, r, "currentTarget", js_null(ctx), ex);
+    set_integer(ctx, r, "eventPhase", 0, ex);
+    unprotect(ctx, r);
+    return r;
+}
+pub fun make_event(ctx: ptr<u8>, name: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<State> = state(ctx);
+    var r: ptr<u8> = event_record(ctx, text(ctx, name), undefined(ctx), ex);
+    protect(ctx, r);
+    var owner: ptr<u8> = object(ctx, null, null);
+    protect(ctx, owner);
+    prototype(ctx, owner, (deref s.parents)[EVENT]);
+    weak_set(ctx, deref s.records, owner, r, ex);
+    unprotect(ctx, owner);
+    unprotect(ctx, r);
+    return owner;
+}
+fun exception_code(ctx: ptr<u8>, name: ptr<u8>) -> i64 {
+    var names: array<str, 25> = ["IndexSizeError", "DOMStringSizeError", "HierarchyRequestError", "WrongDocumentError",
+        "InvalidCharacterError", "NoDataAllowedError", "NoModificationAllowedError", "NotFoundError",
+        "NotSupportedError", "InUseAttributeError", "InvalidStateError", "SyntaxError", "InvalidModificationError",
+        "NamespaceError", "InvalidAccessError", "ValidationError", "TypeMismatchError", "SecurityError",
+        "NetworkError", "AbortError", "URLMismatchError", "QuotaExceededError", "TimeoutError",
+        "InvalidNodeTypeError", "DataCloneError"];
+    for (var i: i64 = 0; i < 25; i++) {
+        if (equal(ctx, name, text(ctx, names[i]))) {
+            return i + 1;
+        }
+    }
+    return 0;
+}
+export(c) fun jsrt_dom_construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<State> = state(ctx);
+    var category: i64 = EVENT;
+    if (equal(ctx, ctor, (deref s.ctors)[TARGET])) {
+        category = TARGET;
+    } else if (equal(ctx, ctor, (deref s.ctors)[EXCEPTION])) {
+        category = EXCEPTION;
+    }
+    var owner: ptr<u8> = object(ctx, null, null);
+    protect(ctx, owner);
+    prototype(ctx, owner, get(ctx, ctor, "prototype", ex));
+    if (category == TARGET) {
+        initialize_event_target(ctx, owner, false, ex);
+    } else if (category == EVENT) {
+        if (count == 0) {
+            fail(ctx, ex, 1, "Event requires a type");
+        } else {
+            var options: ptr<u8> = undefined(ctx);
+            if (count > 1) {
+                options = args[1];
+            }
+            var r: ptr<u8> = event_record(ctx, args[0], options, ex);
+            protect(ctx, r);
+            weak_set(ctx, deref s.records, owner, r, ex);
+            unprotect(ctx, r);
+        }
+    } else {
+        var message: ptr<u8> = text(ctx, "");
+        if (count > 0 && kind(ctx, args[0]) != 0) {
+            message = dom_text(ctx, args[0], ex);
+        }
+        protect(ctx, message);
+        var name: ptr<u8> = text(ctx, "Error");
+        if (count > 1 && kind(ctx, args[1]) != 0) {
+            name = dom_text(ctx, args[1], ex);
+        }
+        protect(ctx, name);
+        readonly(ctx, owner, "message", message, ex);
+        readonly(ctx, owner, "name", name, ex);
+        readonly(ctx, owner, "code", number(ctx, exception_code(ctx, name) as f64), ex);
+        unprotect(ctx, name);
+        unprotect(ctx, message);
+    }
+    unprotect(ctx, owner);
+    return owner;
+}
+fun remove_entry(ctx: ptr<u8>, entry: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (flag(ctx, entry, "removed", ex)) {
+        return;
+    }
+    set_flag(ctx, entry, "removed", true, ex);
+    var signal: ptr<u8> = get(ctx, entry, "signal", ex);
+    if (kind(ctx, signal) == 5) {
+        unsubscribe(ctx, signal, get(ctx, entry, "abort", ex), ex);
+        put(ctx, entry, "signal", undefined(ctx), ex);
+        put(ctx, entry, "abort", undefined(ctx), ex);
+    }
+}
+fun prune(ctx: ptr<u8>, r: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var entries: ptr<u8> = get(ctx, r, "listeners", ex);
+    var retained: ptr<u8> = list(ctx, ex);
+    protect(ctx, retained);
+    for (var i: i64 = 0; i < length(ctx, entries, ex) && deref ex == null; i++) {
+        var entry: ptr<u8> = at(ctx, entries, i, ex);
+        if (!flag(ctx, entry, "removed", ex)) {
+            append(ctx, retained, entry, ex);
+        }
+    }
+    put(ctx, r, "listeners", retained, ex);
+    unprotect(ctx, retained);
+}
+pub fun event_listener(ctx: ptr<u8>, owner: ptr<u8>, count: i64, args: ptr<ptr<u8>>, removing: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var r: ptr<u8> = record(ctx, owner, TARGET, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (count < 2) {
+        fail(ctx, ex, 1, "event listener requires a type and callback");
+        return undefined(ctx);
+    }
+    var name: ptr<u8> = dom_text(ctx, args[0], ex);
+    protect(ctx, name);
+    if (kind(ctx, args[1]) == 0 || kind(ctx, args[1]) == 1) {
+        unprotect(ctx, name);
+        return undefined(ctx);
+    }
+    if (kind(ctx, args[1]) != 5) {
+        fail(ctx, ex, 1, "event listener must be a function or object");
+    }
+    var capture_mode: bool = false;
+    var once: bool = false;
+    var passive: bool = false;
+    var signal: ptr<u8> = undefined(ctx);
+    if (count > 2 && kind(ctx, args[2]) == 5) {
+        capture_mode = flag(ctx, args[2], "capture", ex);
+        if (!removing) {
+            once = flag(ctx, args[2], "once", ex);
+            passive = flag(ctx, args[2], "passive", ex);
+            signal = get(ctx, args[2], "signal", ex);
+        }
+    } else if (count > 2) {
+        capture_mode = truth(ctx, args[2]);
+    }
+    protect(ctx, signal);
+    var aborted: bool = false;
+    if (kind(ctx, signal) != 0 && deref ex == null) {
+        aborted = is_aborted(ctx, signal, ex);
+    }
+    var entries: ptr<u8> = get(ctx, r, "listeners", ex);
+    var found: bool = false;
+    for (var i: i64 = 0; i < length(ctx, entries, ex) && deref ex == null; i++) {
+        var entry: ptr<u8> = at(ctx, entries, i, ex);
+        var mode: bool = flag(ctx, entry, "capture", ex);
+        if (!flag(ctx, entry, "removed", ex) && equal(ctx, get(ctx, entry, "name", ex), name) &&
+            equal(ctx, get(ctx, entry, "fn", ex), args[1]) && ((mode && capture_mode) || (!mode && !capture_mode))) {
+            found = true;
+            if (removing) {
+                remove_entry(ctx, entry, ex);
+            }
+        }
+    }
+    if (!found && !removing && !aborted && deref ex == null) {
+        if (length(ctx, entries, ex) >= EVENT_LISTENER_LIMIT) {
+            fail(ctx, ex, 2, "EventTarget listener limit exceeded");
+        } else {
+            var entry: ptr<u8> = plain(ctx);
+            protect(ctx, entry);
+            put(ctx, entry, "name", name, ex);
+            put(ctx, entry, "fn", args[1], ex);
+            set_flag(ctx, entry, "capture", capture_mode, ex);
+            set_flag(ctx, entry, "once", once, ex);
+            set_flag(ctx, entry, "passive", passive, ex);
+            append(ctx, entries, entry, ex);
+            if (kind(ctx, signal) == 5) {
+                var s: ptr<State> = state(ctx);
+                var bound: ptr<u8> = bind_one(ctx, (deref s.methods)[ABORT_LISTENER], owner, entry, ex);
+                protect(ctx, bound);
+                put(ctx, entry, "signal", signal, ex);
+                put(ctx, entry, "abort", bound, ex);
+                subscribe(ctx, signal, bound, ex);
+                unprotect(ctx, bound);
+            }
+            unprotect(ctx, entry);
+        }
+    }
+    prune(ctx, r, ex);
+    unprotect(ctx, signal);
+    unprotect(ctx, name);
+    return undefined(ctx);
+}
+pub fun dispatch_event(ctx: ptr<u8>, owner: ptr<u8>, event: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var target: ptr<u8> = record(ctx, owner, TARGET, ex);
+    var r: ptr<u8> = record(ctx, event, EVENT, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (flag(ctx, r, "dispatching", ex)) {
+        fail(ctx, ex, 0, "Event is already being dispatched");
+        return undefined(ctx);
+    }
+    set_flag(ctx, r, "dispatching", true, ex);
+    set_flag(ctx, r, "stopped", false, ex);
+    set_flag(ctx, r, "immediate", false, ex);
+    put(ctx, r, "target", owner, ex);
+    put(ctx, r, "currentTarget", owner, ex);
+    set_integer(ctx, r, "eventPhase", 2, ex);
+    var entries: ptr<u8> = get(ctx, target, "listeners", ex);
+    protect(ctx, entries);
+    var count: i64 = length(ctx, entries, ex);
+    var first: ptr<u8> = null;
+    for (var pass: i64 = 0; pass < 2; pass++) {
+        for (var i: i64 = 0; i < count && !flag(ctx, r, "immediate", ex) && deref ex == null; i++) {
+            var entry: ptr<u8> = at(ctx, entries, i, ex);
+            var capture_mode: bool = flag(ctx, entry, "capture", ex);
+            if (flag(ctx, entry, "removed", ex) || (pass == 0 && !capture_mode) || (pass == 1 && capture_mode) ||
+                !equal(ctx, get(ctx, entry, "name", ex), get(ctx, r, "type", ex))) {
+                continue;
+            }
+            if (flag(ctx, entry, "once", ex)) {
+                remove_entry(ctx, entry, ex);
+            }
+            set_flag(ctx, r, "passive", flag(ctx, entry, "passive", ex), ex);
+            var fn: ptr<u8> = get(ctx, entry, "fn", ex);
+            var receiver: ptr<u8> = owner;
+            var nested: ptr<u8> = null;
+            if (!callable(ctx, fn)) {
+                receiver = fn;
+                fn = get(ctx, receiver, "handleEvent", &nested);
+            }
+            if (nested == null) {
+                var call_args: array<ptr<u8>, 1> = [event];
+                apply(ctx, fn, receiver, 1, &call_args[0], &nested);
+            }
+            if (nested != null && first == null) {
+                first = nested;
+                protect(ctx, first);
+            }
+        }
+    }
+    set_flag(ctx, r, "passive", false, ex);
+    set_flag(ctx, r, "dispatching", false, ex);
+    set_integer(ctx, r, "eventPhase", 0, ex);
+    put(ctx, r, "currentTarget", js_null(ctx), ex);
+    prune(ctx, target, ex);
+    unprotect(ctx, entries);
+    if (first != null) {
+        // Listener exceptions are reported after dispatch through the existing
+        // JSC microtask/error path, without skipping later listeners.
+        var s: ptr<State> = state(ctx);
+        if (flag(ctx, target, "synchronousErrors", ex)) {
+            deref ex = first;
+        } else {
+            enqueue(ctx, (deref s.methods)[REPORT_ERROR], undefined(ctx), first, ex);
+        }
+        unprotect(ctx, first);
+    }
+    return boolean(ctx, !flag(ctx, r, "defaultPrevented", ex));
+}
+export(c) fun jsrt_dom_method(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<State> = state(ctx);
+    var mode: i64 = 0;
+    while (mode < METHOD_COUNT && !equal(ctx, fn, (deref s.methods)[mode])) {
+        mode += 1;
+    }
+    if (mode == REPORT_ERROR) {
+        if (count > 0) {
+            deref ex = args[0];
+        }
+        return undefined(ctx);
+    }
+    if (mode == ABORT_LISTENER) {
+        if (count > 0) {
+            remove_entry(ctx, args[0], ex);
+            prune(ctx, record(ctx, owner, TARGET, ex), ex);
+        }
+        return undefined(ctx);
+    }
+    if (mode == ADD || mode == REMOVE) {
+        return event_listener(ctx, owner, count, args, mode == REMOVE, ex);
+    }
+    if (mode == DISPATCH) {
+        if (count == 0) {
+            fail(ctx, ex, 1, "dispatchEvent requires an Event");
+            return undefined(ctx);
+        }
+        return dispatch_event(ctx, owner, args[0], ex);
+    }
+    var r: ptr<u8> = record(ctx, owner, EVENT, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (mode == PREVENT) {
+        if (flag(ctx, r, "cancelable", ex) && !flag(ctx, r, "passive", ex)) {
+            set_flag(ctx, r, "defaultPrevented", true, ex);
+        }
+    } else if (mode == STOP || mode == STOP_IMMEDIATE) {
+        set_flag(ctx, r, "stopped", true, ex);
+        if (mode == STOP_IMMEDIATE) {
+            set_flag(ctx, r, "immediate", true, ex);
+        }
+    } else if (mode == PATH) {
+        var result: ptr<u8> = array(ctx, 0, null, ex);
+        if (flag(ctx, r, "dispatching", ex)) {
+            append(ctx, result, get(ctx, r, "target", ex), ex);
+        }
+        return result;
+    } else if (mode >= FIRST_GETTER && mode < ABORT_LISTENER) {
+        var names: array<str, 10> = ["type", "bubbles", "cancelable", "composed", "defaultPrevented",
+            "target", "currentTarget", "eventPhase", "isTrusted", "timeStamp"];
+        if ((mode >= 8 && mode <= 11) || mode == 15) {
+            return boolean(ctx, flag(ctx, r, names[mode - FIRST_GETTER], ex));
+        }
+        return get(ctx, r, names[mode - FIRST_GETTER], ex);
+    }
+    return undefined(ctx);
+}
+pub fun install_web_events(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var s: ptr<State> = owned_context_slot(ctx, SLOT, size_of<State>() as i64) as ptr<State>;
+    deref s.origin = time_now_monotonic_ns();
+    deref s.records = weak_map(ctx, ex);
+    protect(ctx, deref s.records);
+    var names: array<str, 19> = ["addEventListener", "removeEventListener", "dispatchEvent", "preventDefault",
+        "stopPropagation", "stopImmediatePropagation", "composedPath", "type", "bubbles", "cancelable", "composed",
+        "defaultPrevented", "target", "currentTarget", "eventPhase", "isTrusted", "timeStamp", "abortListener", "reportListenerError"];
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        var name: ptr<u8> = utf8(names[i]);
+        (deref s.methods)[i] = function(ctx, name, callback(false));
+        release(name);
+        protect(ctx, (deref s.methods)[i]);
+    }
+    var classes: array<str, 3> = ["Event", "EventTarget", "DOMException"];
+    for (var i: i64 = 0; i < 3; i++) {
+        (deref s.ctors)[i] = public_constructor(ctx, callback(true), classes[i], ex);
+        protect(ctx, (deref s.ctors)[i]);
+        (deref s.parents)[i] = get(ctx, (deref s.ctors)[i], "prototype", ex);
+        protect(ctx, (deref s.parents)[i]);
+        define(ctx, (deref s.parents)[i], "constructor", (deref s.ctors)[i], ex, false);
+        var tag: ptr<u8> = get(ctx, get(ctx, global(ctx), "Symbol", ex), "toStringTag", ex);
+        define_key(ctx, (deref s.parents)[i], tag, text(ctx, classes[i]), ex, false);
+        define(ctx, global(ctx), classes[i], (deref s.ctors)[i], ex, false);
+    }
+    prototype(ctx, (deref s.parents)[EXCEPTION], get(ctx, get(ctx, global(ctx), "Error", ex), "prototype", ex));
+    for (var i: i64 = 0; i < ABORT_LISTENER; i++) {
+        var category: i64 = EVENT;
+        if (i <= DISPATCH) {
+            category = TARGET;
+        }
+        if (i >= FIRST_GETTER) {
+            getter(ctx, (deref s.parents)[category], names[i], (deref s.methods)[i], ex);
+        } else {
+            define(ctx, (deref s.parents)[category], names[i], (deref s.methods)[i], ex, false);
+        }
+    }
+    var phases: array<str, 4> = ["NONE", "CAPTURING_PHASE", "AT_TARGET", "BUBBLING_PHASE"];
+    for (var i: i64 = 0; i < 4; i++) {
+        readonly(ctx, (deref s.ctors)[EVENT], phases[i], number(ctx, i as f64), ex);
+        readonly(ctx, (deref s.parents)[EVENT], phases[i], number(ctx, i as f64), ex);
+    }
+    return deref ex == null;
+}
+pub fun shutdown_web_events(ctx: ptr<u8>) {
+    var s: ptr<State> = state(ctx);
+    if (s == null) {
+        return;
+    }
+    if (deref s.records != null) {
+        unprotect(ctx, deref s.records);
+    }
+    for (var i: i64 = 0; i < 3; i++) {
+        if ((deref s.ctors)[i] != null) {
+            unprotect(ctx, (deref s.ctors)[i]);
+        }
+        if ((deref s.parents)[i] != null) {
+            unprotect(ctx, (deref s.parents)[i]);
+        }
+    }
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        if ((deref s.methods)[i] != null) {
+            unprotect(ctx, (deref s.methods)[i]);
+        }
+    }
+    release_context_slot(ctx, SLOT, size_of<State>() as i64);
+}

@@ -1,0 +1,248 @@
+// Bounded npm-style comparator sets. Values borrow the input text.
+import("./package_version")::{Version, version_span, parse_version, same_core, compare_core, compare_versions};
+import("std::mem::cstr")::{mem_len_cstr};
+import("./config")::{PACKAGE_RANGE_TEXT_LIMIT, PACKAGE_COMPARATOR_LIMIT, PACKAGE_RANGE_GROUP_LIMIT};
+
+const EXACT: i64 = 0;
+const GREATER: i64 = 1;
+const AT_LEAST: i64 = 2;
+const LESS: i64 = 3;
+const AT_MOST: i64 = 4;
+const TILDE: i64 = 5;
+const CARET: i64 = 6;
+const HYPHEN_LOW: i64 = 7;
+const HYPHEN_HIGH: i64 = 8;
+const COMPARATOR_LIMIT: i64 = PACKAGE_COMPARATOR_LIMIT;
+const GROUP_LIMIT: i64 = PACKAGE_RANGE_GROUP_LIMIT;
+pub const RANGE_TEXT_LIMIT: i64 = PACKAGE_RANGE_TEXT_LIMIT;
+
+struct Comparator {
+    version: Version;
+    mode: i64;
+    group: i64;
+}
+
+pub struct Range {
+    valid: bool;
+    count: i64;
+    groups: i64;
+    clauses: array<Comparator, 64>;
+}
+
+fun whitespace(c: u8) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+pub fun parse_range(text: str) -> Range {
+    var result: Range;
+    result.valid = false;
+    result.count = 0;
+    result.groups = 1;
+    if ((text as ptr<u8>) == null) {
+        return result;
+    }
+    var size: i64 = mem_len_cstr(text);
+    if (size > RANGE_TEXT_LIMIT) {
+        return result;
+    }
+    var at: i64 = 0;
+    var group_start: i64 = 0;
+    while (at < size) {
+        while (at < size && whitespace(text[at])) {
+            at += 1;
+        }
+        if (at == size) {
+            break;
+        }
+        if (text[at] == 124) {
+            if (at+1 >= size || text[at+1] != 124 || result.count == group_start || result.groups >= GROUP_LIMIT) {
+                return result;
+            }
+            result.groups += 1;
+            group_start = result.count;
+            at += 2;
+            continue;
+        }
+        if (result.count >= COMPARATOR_LIMIT) {
+            return result;
+        }
+        var mode: i64 = EXACT;
+        if (text[at] == 62) {
+            mode = GREATER;
+        } else if (text[at] == 60) {
+            mode = LESS;
+        } else if (text[at] == 126) {
+            mode = TILDE;
+        } else if (text[at] == 94) {
+            mode = CARET;
+        }
+        if (mode != EXACT || text[at] == 61) {
+            at += 1;
+            if ((mode == GREATER || mode == LESS) && at < size && text[at] == 61) {
+                mode += 1;
+                at += 1;
+            }
+            while (at < size && whitespace(text[at])) {
+                at += 1;
+            }
+        }
+        var first: i64 = at;
+        while (at < size && !whitespace(text[at]) && text[at] != 124) {
+            at += 1;
+        }
+        var version: Version = version_span((text as ptr<u8>+first) as str, at-first, true);
+        if (!version.valid) {
+            return result;
+        }
+        var following: i64 = at;
+        while (following < size && whitespace(text[following])) {
+            following += 1;
+        }
+        var hyphen: bool = mode == EXACT && following+1 < size && text[following] == 45 && whitespace(text[following+1]);
+        if (hyphen) {
+            if (result.count+2 > COMPARATOR_LIMIT) {
+                return result;
+            }
+            mode = HYPHEN_LOW;
+        }
+        var clause: ptr<Comparator> = &(result.clauses)[result.count];
+        deref clause.version = version;
+        deref clause.mode = mode;
+        deref clause.group = result.groups-1;
+        result.count += 1;
+        if (hyphen) {
+            at = following+1;
+            while (at < size && whitespace(text[at])) {
+                at += 1;
+            }
+            first = at;
+            while (at < size && !whitespace(text[at]) && text[at] != 124) {
+                at += 1;
+            }
+            version = version_span((text as ptr<u8>+first) as str, at-first, true);
+            if (!version.valid) {
+                return result;
+            }
+            clause = &(result.clauses)[result.count];
+            deref clause.version = version;
+            deref clause.mode = HYPHEN_HIGH;
+            deref clause.group = result.groups-1;
+            result.count += 1;
+        }
+    }
+    if (result.groups > 1 && result.count == group_start) {
+        return result;
+    }
+    result.valid = true;
+    return result;
+}
+
+fun prefix_compare(candidate: Version, target: Version, parts: i64) -> i64 {
+    if (candidate.major != target.major) {
+        if (candidate.major < target.major) {
+            return -1;
+        }
+        return 1;
+    }
+    if (parts == 1) {
+        return 0;
+    }
+    if (candidate.minor != target.minor) {
+        if (candidate.minor < target.minor) {
+            return -1;
+        }
+        return 1;
+    }
+    if (parts == 2) {
+        return 0;
+    }
+    return compare_core(candidate, target);
+}
+
+fun comparator_matches(candidate: Version, clause: ptr<Comparator>) -> bool {
+    var target: Version = deref clause.version;
+    var mode: i64 = deref clause.mode;
+    if (target.parts == 0) {
+        return mode != GREATER && mode != LESS;
+    }
+    var comparison: i64 = compare_versions(candidate, target);
+    var prefix: i64 = prefix_compare(candidate, target, target.parts);
+    if (mode == EXACT) {
+        if (target.parts < 3) {
+            return prefix == 0;
+        }
+        return comparison == 0;
+    }
+    if (mode == GREATER) {
+        if (target.parts < 3) {
+            return prefix > 0;
+        }
+        return comparison > 0;
+    }
+    if (mode == AT_LEAST || mode == HYPHEN_LOW) {
+        return comparison >= 0;
+    }
+    if (mode == LESS) {
+        if (target.parts < 3) {
+            return prefix < 0;
+        }
+        return comparison < 0;
+    }
+    if (mode == AT_MOST || mode == HYPHEN_HIGH) {
+        if (target.parts < 3) {
+            return prefix <= 0;
+        }
+        return comparison <= 0;
+    }
+    if (comparison < 0) {
+        return false;
+    }
+    var upper_parts: i64 = 1;
+    if (mode == TILDE && target.parts > 1) {
+        upper_parts = 2;
+    }
+    if (mode == CARET && target.major == 0 && target.parts > 1) {
+        upper_parts = 2;
+        if (target.minor == 0 && target.parts == 3) {
+            upper_parts = 3;
+        }
+    }
+    return prefix_compare(candidate, target, upper_parts) == 0;
+}
+
+pub fun matches_range(candidate: Version, range: ptr<Range>) -> bool {
+    if (!candidate.valid || !deref range.valid) {
+        return false;
+    }
+    for (var group: i64 = 0; group < deref range.groups; group++) {
+        var matches: bool = true;
+        var prerelease: bool = candidate.pre_start == candidate.pre_end;
+        for (var i: i64 = 0; i < deref range.count; i++) {
+            var clause: ptr<Comparator> = &(deref range.clauses)[i];
+            if (deref clause.group != group) {
+                continue;
+            }
+            var target: Version = deref clause.version;
+            if (target.pre_start < target.pre_end && same_core(candidate, target)) {
+                prerelease = true;
+            }
+            if (!comparator_matches(candidate, clause)) {
+                matches = false;
+            }
+        }
+        if (matches && prerelease) {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fun satisfies(version: str, requirement: str) -> bool {
+    var range: Range = parse_range(requirement);
+    return matches_range(parse_version(version), &range);
+}
+
+pub fun valid_range(requirement: str) -> bool {
+    var range: Range = parse_range(requirement);
+    return range.valid;
+}

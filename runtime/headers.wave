@@ -1,0 +1,650 @@
+// Fetch header validation, ownership and limits live in Wave.
+import("./context_state")::{context_slot, allocate_context_slot, release_context_slot};
+import("./config")::{HTTP_HEADER_LIMIT, HTTP_HEADER_COUNT};
+import("./values")::{get, put, plain, define, define_key, capture, text, fail};
+import("./collections")::{weak_map, weak_get, weak_set, length, at, integer, set_integer, list,
+    append, set_at};
+import("std::mem::layout")::{size_of};
+import("./http_response")::{header_token};
+import("./web_support")::{iterable_method, iterable_list};
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_is_array") fun is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_to_string") fun stringify(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_length") fun string_length(value: ptr<u8>) -> i64;
+extern(c, "wr_string_characters") fun characters(value: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_utf16") fun utf16(value: ptr<u16>, count: i64) -> ptr<u8>;
+extern(c, "wr_string_value") fun string_value(ctx: ptr<u8>, value: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, value: ptr<u8>, parent: ptr<u8>);
+extern(c, "wr_get_prototype") fun get_prototype(ctx: ptr<u8>, value: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, values: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_constructor") fun constructor(ctx: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_delete") fun remove(ctx: ptr<u8>, owner: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> bool;
+extern(c, "wr_get") fun dynamic_get(ctx: ptr<u8>, owner: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set") fun dynamic_set(ctx: ptr<u8>, owner: ptr<u8>, key: ptr<u8>, value: ptr<u8>,
+    flags: u32, ex: ptr<ptr<u8>>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "jsrt_headers_callback") fun callback(constructing: bool) -> ptr<u8>;
+const SLOT: i64 = 32;
+const ENTRIES: i64 = 6;
+const KEYS: i64 = 7;
+const VALUES: i64 = 8;
+const NEXT: i64 = 9;
+const GET_SET_COOKIE: i64 = 10;
+const METHOD_COUNT: i64 = 11;
+struct State {
+    records: ptr<u8>;
+    keys: ptr<u8>;
+    sort: ptr<u8>;
+    ctor: ptr<u8>;
+    parent: ptr<u8>;
+    iterators: ptr<u8>;
+    iterator_parent: ptr<u8>;
+    iterator_symbol: ptr<u8>;
+    methods: array<ptr<u8>, 11>;
+}
+
+fun state(ctx: ptr<u8>) -> ptr<State> {
+    return context_slot(ctx, SLOT) as ptr<State>;
+}
+
+fun record(ctx: ptr<u8>, owner: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (kind(ctx, owner) != 5) {
+        return undefined(ctx);
+    }
+    var s: ptr<State> = state(ctx);
+    if (s == null) {
+        return undefined(ctx);
+    }
+    return weak_get(ctx, deref s.records, owner, ex);
+}
+
+pub fun headers_record(ctx: ptr<u8>, owner: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var r: ptr<u8> = record(ctx, owner, ex);
+    if (kind(ctx, r) == 5) {
+        return get(ctx, r, "values", ex);
+    }
+    return null;
+}
+
+pub fun default_header(ctx: ptr<u8>, owner: ptr<u8>, name: str, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var values: ptr<u8> = headers_record(ctx, owner, ex);
+    if (values != null && deref ex == null && kind(ctx, get(ctx, values, name, ex)) == 0) {
+        update(ctx, record(ctx, owner, ex), text(ctx, name), value, false, ex);
+    }
+}
+
+// Transport dispatch may populate immutable response Headers before publication.
+pub fun append_response_header(ctx: ptr<u8>, owner: ptr<u8>, name: ptr<u8>, value: ptr<u8>,
+    ex: ptr<ptr<u8>>) {
+    var r: ptr<u8> = record(ctx, owner, ex);
+    if (kind(ctx, r) != 5 || deref ex != null) {
+        fail(ctx, ex, 1, "invalid response Headers");
+        return;
+    }
+    update(ctx, r, name, value, true, ex);
+}
+
+fun normalized(ctx: ptr<u8>, value: ptr<u8>, name: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var source: ptr<u8> = stringify(ctx, value, ex);
+    if (source == null || deref ex != null) {
+        return undefined(ctx);
+    }
+    var n: i64 = string_length(source);
+    if (n > HTTP_HEADER_LIMIT || (name && n == 0)) {
+        release(source);
+        fail(ctx, ex, 1, "invalid or oversized header");
+        return undefined(ctx);
+    }
+    var bytes: ptr<u16> = characters(source);
+    var output: array<u16, 16384>;
+    var begin: i64 = 0;
+    var end: i64 = n;
+    if (!name) {
+        while (begin < end && (bytes[begin] == 32 || bytes[begin] == 9 || bytes[begin] == 10 || bytes[begin] == 13)) {
+            begin += 1;
+        }
+        while (end > begin && (bytes[end - 1] == 32 || bytes[end - 1] == 9 || bytes[end - 1] == 10 || bytes[end - 1] == 13)) {
+            end -= 1;
+        }
+    }
+    for (var i: i64 = 0; i < n; i++) {
+        if (bytes[i] > 255 || (name && !header_token(bytes[i] as u8)) ||
+            (!name && i >= begin && i < end && (bytes[i] == 0 || bytes[i] == 10 || bytes[i] == 13))) {
+            release(source);
+            fail(ctx, ex, 1, "invalid header name or value");
+            return undefined(ctx);
+        }
+        var c: u16 = bytes[i];
+        if (name && c >= 65 && c <= 90) {
+            c += 32;
+        }
+        output[i] = c;
+    }
+    var result: ptr<u8> = utf16(&output[begin], end - begin);
+    release(source);
+    var js: ptr<u8> = string_value(ctx, result);
+    release(result);
+    return js;
+}
+
+fun keys(ctx: ptr<u8>, values: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var args: array<ptr<u8>, 1> = [values];
+    var s: ptr<State> = state(ctx);
+    return call(ctx, deref s.keys, null, 1, &args[0], ex);
+}
+
+fun field(ctx: ptr<u8>, values: ptr<u8>, name: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var key: ptr<u8> = stringify(ctx, name, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var result: ptr<u8> = dynamic_get(ctx, values, key, ex);
+    release(key);
+    return result;
+}
+
+fun assign(ctx: ptr<u8>, values: ptr<u8>, name: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var key: ptr<u8> = stringify(ctx, name, ex);
+    if (deref ex != null) {
+        return;
+    }
+    dynamic_set(ctx, values, key, value, 0, ex);
+    release(key);
+}
+
+pub fun join_header_values(ctx: ptr<u8>, old: ptr<u8>, value: ptr<u8>, separator: u16,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var left: ptr<u8> = stringify(ctx, old, ex);
+    var right: ptr<u8> = null;
+    if (deref ex == null) {
+        right = stringify(ctx, value, ex);
+    }
+    var result: ptr<u8> = undefined(ctx);
+    if (left != null && right != null && deref ex == null) {
+        var a: i64 = string_length(left);
+        var b: i64 = string_length(right);
+        if (a + b + 2 > HTTP_HEADER_LIMIT) {
+            fail(ctx, ex, 2, "header bytes exceeded");
+        } else {
+            var joined: array<u16, 16384>;
+            var left_bytes: ptr<u16> = characters(left);
+            var right_bytes: ptr<u16> = characters(right);
+            for (var i: i64 = 0; i < a; i++) {
+                joined[i] = left_bytes[i];
+            }
+            joined[a] = separator;
+            joined[a + 1] = 32;
+            for (var i: i64 = 0; i < b; i++) {
+                joined[a + 2 + i] = right_bytes[i];
+            }
+            var combined: ptr<u8> = utf16(&joined[0], a + b + 2);
+            result = string_value(ctx, combined);
+            release(combined);
+        }
+    }
+    if (left != null) {
+        release(left);
+    }
+    if (right != null) {
+        release(right);
+    }
+    return result;
+}
+
+fun update(ctx: ptr<u8>, r: ptr<u8>, raw_name: ptr<u8>, raw_value: ptr<u8>, appending: bool,
+    ex: ptr<ptr<u8>>) {
+    var values: ptr<u8> = get(ctx, r, "values", ex);
+    var name: ptr<u8> = normalized(ctx, raw_name, true, ex);
+    if (deref ex != null) {
+        return;
+    }
+    protect(ctx, name);
+    var value: ptr<u8> = normalized(ctx, raw_value, false, ex);
+    protect(ctx, value);
+    var cookie_value: ptr<u8> = value;
+    protect(ctx, cookie_value);
+    var cookie: bool = equal(ctx, name, text(ctx, "set-cookie"));
+    var cookies: ptr<u8> = null;
+    if (deref ex == null && cookie) {
+        cookies = list(ctx, ex);
+        protect(ctx, cookies);
+        if (appending) {
+            var previous: ptr<u8> = get(ctx, r, "cookies", ex);
+            for (var i: i64 = 0; i < length(ctx, previous, ex) && deref ex == null; i++) {
+                append(ctx, cookies, at(ctx, previous, i, ex), ex);
+            }
+        }
+        append(ctx, cookies, cookie_value, ex);
+    }
+    if (deref ex == null && appending) {
+        var old: ptr<u8> = field(ctx, values, name, ex);
+        if (kind(ctx, old) == 4 && deref ex == null) {
+            var joined: ptr<u8> = join_header_values(ctx, old, value, 44, ex);
+            unprotect(ctx, value);
+            value = joined;
+            protect(ctx, value);
+        }
+    }
+    if (deref ex == null) {
+        var names: ptr<u8> = keys(ctx, values, ex);
+        protect(ctx, names);
+        var n: i64 = length(ctx, names, ex);
+        var total: i64 = 0;
+        var replaced: bool = false;
+        for (var i: i64 = 0; i < n && deref ex == null; i++) {
+            var key: ptr<u8> = at(ctx, names, i, ex);
+            var item: ptr<u8> = field(ctx, values, key, ex);
+            if (equal(ctx, key, name)) {
+                item = value;
+                replaced = true;
+            }
+            var k: ptr<u8> = stringify(ctx, key, ex);
+            var v: ptr<u8> = stringify(ctx, item, ex);
+            total += string_length(k) + string_length(v) + 4;
+            release(k);
+            release(v);
+        }
+        if (!replaced) {
+            var k: ptr<u8> = stringify(ctx, name, ex);
+            var v: ptr<u8> = stringify(ctx, value, ex);
+            total += string_length(k) + string_length(v) + 4;
+            release(k);
+            release(v);
+            n += 1;
+        }
+        var cookie_rows: i64 = 0;
+        if (cookies != null) {
+            cookie_rows = length(ctx, cookies, ex);
+        } else {
+            cookie_rows = length(ctx, get(ctx, r, "cookies", ex), ex);
+        }
+        if (cookie_rows > 1) {
+            n += cookie_rows - 1;
+            // A repeated Set-Cookie row repeats its name and CRLF instead of ", ".
+            total += (cookie_rows - 1) * 12;
+        }
+        if (deref ex == null && (n > HTTP_HEADER_COUNT || total > HTTP_HEADER_LIMIT)) {
+            fail(ctx, ex, 2, "header count or bytes exceeded");
+        }
+        if (deref ex == null) {
+            assign(ctx, values, name, value, ex);
+            if (cookies != null) {
+                put(ctx, r, "cookies", cookies, ex);
+            }
+        }
+        unprotect(ctx, names);
+    }
+    if (cookies != null) {
+        unprotect(ctx, cookies);
+    }
+    unprotect(ctx, cookie_value);
+    unprotect(ctx, value);
+    unprotect(ctx, name);
+}
+
+pub fun create_headers(ctx: ptr<u8>, init: ptr<u8>, mutable: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<State> = state(ctx);
+    var owner: ptr<u8> = object(ctx, null, null);
+    protect(ctx, owner);
+    prototype(ctx, owner, deref s.parent);
+    var r: ptr<u8> = plain(ctx);
+    protect(ctx, r);
+    var values: ptr<u8> = plain(ctx);
+    protect(ctx, values);
+    put(ctx, r, "values", values, ex);
+    put(ctx, r, "cookies", list(ctx, ex), ex);
+    put(ctx, r, "mutable", boolean(ctx, mutable), ex);
+    weak_set(ctx, deref s.records, owner, r, ex);
+    if (kind(ctx, init) != 0 && kind(ctx, init) != 1 && deref ex == null) {
+        var source_record: ptr<u8> = record(ctx, init, ex);
+        var source: ptr<u8> = headers_record(ctx, init, ex);
+        if (source != null) {
+            init = source;
+        }
+        if (kind(ctx, init) != 5) {
+            fail(ctx, ex, 1, "Headers init requires a record, pair array or Headers");
+        } else if (kind(ctx, iterable_method(ctx, init, ex)) != 0) {
+            init = iterable_list(ctx, init, HTTP_HEADER_COUNT, ex);
+            protect(ctx, init);
+            var n: i64 = length(ctx, init, ex);
+            if (n > HTTP_HEADER_COUNT) {
+                fail(ctx, ex, 2, "header count exceeded");
+            }
+            for (var i: i64 = 0; i < n && deref ex == null; i++) {
+                var pair: ptr<u8> = at(ctx, init, i, ex);
+                if (deref ex != null) {
+                    break;
+                }
+                protect(ctx, pair);
+                var snapshot: ptr<u8> = iterable_list(ctx, pair, 2, ex);
+                unprotect(ctx, pair);
+                pair = snapshot;
+                protect(ctx, pair);
+                if (deref ex != null || length(ctx, pair, ex) != 2) {
+                    fail(ctx, ex, 1, "header pair must contain two values");
+                    unprotect(ctx, pair);
+                    break;
+                }
+                var name: ptr<u8> = at(ctx, pair, 0, ex);
+                protect(ctx, name);
+                if (deref ex == null) {
+                    var value: ptr<u8> = at(ctx, pair, 1, ex);
+                    protect(ctx, value);
+                    if (deref ex == null) {
+                        update(ctx, r, name, value, true, ex);
+                    }
+                    unprotect(ctx, value);
+                }
+                unprotect(ctx, name);
+                unprotect(ctx, pair);
+            }
+            unprotect(ctx, init);
+        } else {
+            var names: ptr<u8> = keys(ctx, init, ex);
+            protect(ctx, names);
+            var n: i64 = length(ctx, names, ex);
+            if (n > HTTP_HEADER_COUNT) {
+                fail(ctx, ex, 2, "header count exceeded");
+            }
+            for (var i: i64 = 0; i < n && deref ex == null; i++) {
+                var key: ptr<u8> = at(ctx, names, i, ex);
+                var value: ptr<u8> = field(ctx, init, key, ex);
+                protect(ctx, value);
+                if (deref ex == null) {
+                    if (source != null && equal(ctx, key, text(ctx, "set-cookie"))) {
+                        var cookies: ptr<u8> = get(ctx, source_record, "cookies", ex);
+                        for (var j: i64 = 0; j < length(ctx, cookies, ex) && deref ex == null; j++) {
+                            update(ctx, r, key, at(ctx, cookies, j, ex), true, ex);
+                        }
+                    } else {
+                        update(ctx, r, key, value, true, ex);
+                    }
+                }
+                unprotect(ctx, value);
+            }
+            unprotect(ctx, names);
+        }
+    }
+    unprotect(ctx, values);
+    unprotect(ctx, r);
+    unprotect(ctx, owner);
+    return owner;
+}
+
+export(c) fun jsrt_headers_construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var init: ptr<u8> = undefined(ctx);
+    if (count > 0) {
+        init = args[0];
+    }
+    return create_headers(ctx, init, true, ex);
+}
+
+fun header_items(ctx: ptr<u8>, r: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<State> = state(ctx);
+    var values: ptr<u8> = get(ctx, r, "values", ex);
+    var names: ptr<u8> = keys(ctx, values, ex);
+    protect(ctx, names);
+    call(ctx, deref s.sort, names, 0, null, ex);
+    var result: ptr<u8> = list(ctx, ex);
+    protect(ctx, result);
+    for (var i: i64 = 0; i < length(ctx, names, ex) && deref ex == null; i++) {
+        var name: ptr<u8> = at(ctx, names, i, ex);
+        if (equal(ctx, name, text(ctx, "set-cookie"))) {
+            var cookies: ptr<u8> = get(ctx, r, "cookies", ex);
+            for (var j: i64 = 0; j < length(ctx, cookies, ex) && deref ex == null; j++) {
+                var pair: array<ptr<u8>, 2> = [name, at(ctx, cookies, j, ex)];
+                append(ctx, result, array(ctx, 2, &pair[0], ex), ex);
+            }
+        } else {
+            var pair: array<ptr<u8>, 2> = [name, field(ctx, values, name, ex)];
+            append(ctx, result, array(ctx, 2, &pair[0], ex), ex);
+        }
+    }
+    unprotect(ctx, result);
+    unprotect(ctx, names);
+    return result;
+}
+
+fun create_iterator(ctx: ptr<u8>, r: ptr<u8>, mode: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<State> = state(ctx);
+    var owner: ptr<u8> = object(ctx, null, null);
+    protect(ctx, owner);
+    prototype(ctx, owner, deref s.iterator_parent);
+    var cursor: ptr<u8> = plain(ctx);
+    protect(ctx, cursor);
+    put(ctx, cursor, "record", r, ex);
+    set_integer(ctx, cursor, "mode", mode, ex);
+    set_integer(ctx, cursor, "index", 0, ex);
+    weak_set(ctx, deref s.iterators, owner, cursor, ex);
+    unprotect(ctx, cursor);
+    unprotect(ctx, owner);
+    return owner;
+}
+
+fun iterator_next(ctx: ptr<u8>, receiver: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<State> = state(ctx);
+    var cursor: ptr<u8> = undefined(ctx);
+    if (kind(ctx, receiver) == 5) {
+        cursor = weak_get(ctx, deref s.iterators, receiver, ex);
+    }
+    if (kind(ctx, cursor) != 5 || deref ex != null) {
+        fail(ctx, ex, 1, "invalid Headers iterator receiver");
+        return undefined(ctx);
+    }
+    var r: ptr<u8> = get(ctx, cursor, "record", ex);
+    var index: i64 = integer(ctx, cursor, "index", ex);
+    // Web IDL pair iterators use the current sorted list on every next call.
+    var items: ptr<u8> = header_items(ctx, r, ex);
+    protect(ctx, items);
+    var done: bool = index >= length(ctx, items, ex);
+    var value: ptr<u8> = undefined(ctx);
+    if (!done && deref ex == null) {
+        var item: ptr<u8> = at(ctx, items, index, ex);
+        var mode: i64 = integer(ctx, cursor, "mode", ex);
+        if (mode == KEYS) {
+            value = at(ctx, item, 0, ex);
+        } else if (mode == VALUES) {
+            value = at(ctx, item, 1, ex);
+        } else {
+            value = item;
+        }
+        if (deref ex != null) {
+            unprotect(ctx, items);
+            return undefined(ctx);
+        }
+        protect(ctx, value);
+        set_integer(ctx, cursor, "index", index + 1, ex);
+    } else {
+        protect(ctx, value);
+    }
+    var result: ptr<u8> = object(ctx, null, null);
+    protect(ctx, result);
+    define(ctx, result, "value", value, ex, true);
+    define(ctx, result, "done", boolean(ctx, done), ex, true);
+    unprotect(ctx, result);
+    unprotect(ctx, value);
+    unprotect(ctx, items);
+    return result;
+}
+
+export(c) fun jsrt_headers_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<State> = state(ctx);
+    var code: i64 = 0;
+    while (code < METHOD_COUNT && !equal(ctx, fn, (deref s.methods)[code])) {
+        code += 1;
+    }
+    if (code == NEXT) {
+        return iterator_next(ctx, receiver, ex);
+    }
+    var r: ptr<u8> = record(ctx, receiver, ex);
+    if (kind(ctx, r) != 5 || deref ex != null) {
+        fail(ctx, ex, 1, "invalid Headers receiver");
+        return undefined(ctx);
+    }
+    var values: ptr<u8> = get(ctx, r, "values", ex);
+    if (code == GET_SET_COOKIE) {
+        var cookies: ptr<u8> = get(ctx, r, "cookies", ex);
+        var result: ptr<u8> = array(ctx, 0, null, ex);
+        protect(ctx, result);
+        for (var i: i64 = 0; i < length(ctx, cookies, ex) && deref ex == null; i++) {
+            set_at(ctx, result, i, at(ctx, cookies, i, ex), ex);
+        }
+        unprotect(ctx, result);
+        return result;
+    }
+    if (code >= ENTRIES && code <= VALUES) {
+        return create_iterator(ctx, r, code, ex);
+    }
+    if (count == 0 || ((code == 2 || code == 3) && count < 2)) {
+        fail(ctx, ex, 1, "missing Headers method argument");
+        return undefined(ctx);
+    }
+    if (code == 5) {
+        if (!callable(ctx, args[0])) {
+            fail(ctx, ex, 1, "Headers.forEach requires a callback");
+            return undefined(ctx);
+        }
+        var receiver_arg: ptr<u8> = undefined(ctx);
+        if (count > 1) {
+            receiver_arg = args[1];
+        }
+        for (var i: i64 = 0; deref ex == null; i++) {
+            var items: ptr<u8> = header_items(ctx, r, ex);
+            protect(ctx, items);
+            if (i >= length(ctx, items, ex) || deref ex != null) {
+                unprotect(ctx, items);
+                break;
+            }
+            var item: ptr<u8> = at(ctx, items, i, ex);
+            var params: array<ptr<u8>, 3> = [at(ctx, item, 1, ex), at(ctx, item, 0, ex), receiver];
+            if (deref ex == null) {
+                call(ctx, args[0], receiver_arg, 3, &params[0], ex);
+            }
+            unprotect(ctx, items);
+        }
+        return undefined(ctx);
+    }
+    if (code >= 2 && !truth(ctx, get(ctx, r, "mutable", ex))) {
+        fail(ctx, ex, 1, "response Headers are immutable");
+        return undefined(ctx);
+    }
+    if (code == 2 || code == 3) {
+        update(ctx, r, args[0], args[1], code == 2, ex);
+        return undefined(ctx);
+    }
+    var name: ptr<u8> = normalized(ctx, args[0], true, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    protect(ctx, name);
+    var result: ptr<u8> = undefined(ctx);
+    if (code == 4) {
+        var key: ptr<u8> = stringify(ctx, name, ex);
+        remove(ctx, values, key, ex);
+        release(key);
+        if (equal(ctx, name, text(ctx, "set-cookie")) && deref ex == null) {
+            put(ctx, r, "cookies", list(ctx, ex), ex);
+        }
+    } else {
+        result = field(ctx, values, name, ex);
+        if (code == 1) {
+            result = boolean(ctx, kind(ctx, result) != 0);
+        } else if (kind(ctx, result) == 0) {
+            result = js_null(ctx);
+        }
+    }
+    unprotect(ctx, name);
+    return result;
+}
+
+pub fun install_headers(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (!allocate_context_slot(ctx, SLOT, size_of<State>() as i64)) {
+        return false;
+    }
+    var s: ptr<State> = state(ctx);
+    deref s.records = weak_map(ctx, ex);
+    protect(ctx, deref s.records);
+    deref s.keys = capture(ctx, get(ctx, global(ctx), "Object", ex), "keys", ex);
+    deref s.sort = capture(ctx, get(ctx, get(ctx, global(ctx), "Array", ex), "prototype", ex), "sort", ex);
+    deref s.iterators = weak_map(ctx, ex);
+    protect(ctx, deref s.iterators);
+    var symbol: ptr<u8> = get(ctx, global(ctx), "Symbol", ex);
+    deref s.iterator_symbol = capture(ctx, symbol, "iterator", ex);
+    var tag: ptr<u8> = get(ctx, symbol, "toStringTag", ex);
+    protect(ctx, tag);
+    var sample: ptr<u8> = array(ctx, 0, null, ex);
+    protect(ctx, sample);
+    var method: ptr<u8> = get(ctx, sample, "entries", ex);
+    var engine_iterator: ptr<u8> = null;
+    if (deref ex == null) {
+        engine_iterator = call(ctx, method, sample, 0, null, ex);
+    }
+    if (deref ex == null) {
+        protect(ctx, engine_iterator);
+        deref s.iterator_parent = object(ctx, null, null);
+        protect(ctx, deref s.iterator_parent);
+        prototype(ctx, deref s.iterator_parent, get_prototype(ctx, get_prototype(ctx, engine_iterator)));
+        define_key(ctx, deref s.iterator_parent, tag, text(ctx, "Headers Iterator"), ex, false);
+        unprotect(ctx, engine_iterator);
+    }
+    unprotect(ctx, sample);
+    unprotect(ctx, tag);
+    deref s.ctor = constructor(ctx, callback(true));
+    protect(ctx, deref s.ctor);
+    deref s.parent = get(ctx, deref s.ctor, "prototype", ex);
+    protect(ctx, deref s.parent);
+    var names: array<str, 11> = ["get", "has", "append", "set", "delete", "forEach", "entries", "keys", "values", "next", "getSetCookie"];
+    for (var i: i64 = 0; i < METHOD_COUNT && deref ex == null; i++) {
+        var key: ptr<u8> = utf8(names[i]);
+        (deref s.methods)[i] = function(ctx, key, callback(false));
+        release(key);
+        protect(ctx, (deref s.methods)[i]);
+        if (i == NEXT) {
+            define(ctx, deref s.iterator_parent, names[i], (deref s.methods)[i], ex, true);
+        } else {
+            define(ctx, deref s.parent, names[i], (deref s.methods)[i], ex, false);
+        }
+    }
+    define_key(ctx, deref s.parent, deref s.iterator_symbol, (deref s.methods)[ENTRIES], ex, false);
+    define(ctx, global(ctx), "Headers", deref s.ctor, ex, false);
+    return deref ex == null;
+}
+
+pub fun shutdown_headers(ctx: ptr<u8>) {
+    var s: ptr<State> = state(ctx);
+    if (s == null) {
+        return;
+    }
+    var roots: array<ptr<u8>, 8> = [deref s.records, deref s.keys, deref s.sort, deref s.ctor, deref s.parent,
+        deref s.iterators, deref s.iterator_parent, deref s.iterator_symbol];
+    for (var i: i64 = 0; i < 8; i++) {
+        if (roots[i] != null) {
+            unprotect(ctx, roots[i]);
+        }
+    }
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        if ((deref s.methods)[i] != null) {
+            unprotect(ctx, (deref s.methods)[i]);
+        }
+    }
+    release_context_slot(ctx, SLOT, size_of<State>() as i64);
+}

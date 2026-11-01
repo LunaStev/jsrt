@@ -1,0 +1,776 @@
+import("./context_state")::{context_slot, allocate_context_slot, release_context_slot, SYSTEM_SLOT};
+// Process facilities and binary/text file operations are Wave host policies.
+import("std::env::cwd")::{env_getcwd};
+import("./config")::{FILE_LIMIT, FILE_HANDLE_OPEN_OPERATION, FILE_HANDLE_CLOSE_OPERATION};
+import("./byte_codec")::{encode_utf8, decode_utf8_strict};
+import("./buffer_core")::{buffer_from_bytes, copy_byte_view};
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::mem::cstr")::{mem_len_cstr};
+import("std::mem::ops")::{mem_copy};
+import("std::sys::fs")::{open, fstat, ftruncate, fsync, lseek, Stat, FS_O_RDONLY, FS_O_WRONLY, FS_O_CREAT, FS_O_NONBLOCK,
+    FS_O_APPEND, FS_O_EXCL};
+import("std::io::fd")::{io_read_at_most, io_write_all, io_close};
+
+extern(c, "wr_context_global") fun wr_context_global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_object") fun wr_object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_array") fun wr_array(ctx: ptr<u8>, count: i64, values: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun wr_set_prototype(ctx: ptr<u8>, object: ptr<u8>, prototype: ptr<u8>);
+extern(c, "wr_get_prototype") fun wr_get_prototype(ctx: ptr<u8>, object: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun wr_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_undefined") fun wr_undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_number") fun wr_number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_boolean") fun wr_boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_type") fun wr_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_equal") fun wr_equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_get_index") fun wr_get_index(ctx: ptr<u8>, value: ptr<u8>, index: u32, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_to_number") fun wr_to_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_string_value") fun wr_string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_get") fun wr_get(ctx: ptr<u8>, object: ptr<u8>, name: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set") fun wr_set(ctx: ptr<u8>, object: ptr<u8>, name: ptr<u8>, value: ptr<u8>, attrs: u32,
+    ex: ptr<ptr<u8>>);
+extern(c, "wr_set_index") fun wr_set_index(ctx: ptr<u8>, object: ptr<u8>, index: u32, value: ptr<u8>,
+    ex: ptr<ptr<u8>>);
+extern(c, "wr_function") fun wr_function(ctx: ptr<u8>, name: ptr<u8>, callback: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_construct") fun wr_construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_call") fun wr_call(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun wr_protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "jsrt_system_callback") fun jsrt_system_callback(kind: i32) -> ptr<u8>;
+extern(c, "jsrt_argc") fun jsrt_argc() -> i32;
+extern(c, "jsrt_argv") fun jsrt_argv(index: i32) -> str;
+extern(c, "jsrt_environment") fun jsrt_environment() -> ptr<ptr<u8>>;
+extern(c, "readlink") fun read_link(path: str, output: ptr<u8>, capacity: i64) -> i64;
+extern(c, "wr_engine_version") fun wr_engine_version() -> str;
+
+const PATH_CAP: i64 = 16385;
+const PROCESS_CLOSE_ON_EXEC: i32 = 524288;
+const PROCESS_NO_CONTROLLING_TERMINAL: i32 = 256;
+
+// Reopen stdin with a separate file description so O_NONBLOCK never changes
+// the inherited descriptor or the flags seen by spawned children.
+pub fun open_process_stdin() -> i64 {
+    return open("/proc/self/fd/0", FS_O_RDONLY | FS_O_NONBLOCK | PROCESS_CLOSE_ON_EXEC | PROCESS_NO_CONTROLLING_TERMINAL, 0);
+}
+fun system_errors(ctx: ptr<u8>) -> ptr<ptr<u8>> {
+    return context_slot(ctx, SYSTEM_SLOT) as ptr<ptr<u8>>;
+}
+
+fun exit_code(ctx: ptr<u8>) -> ptr<i32> {
+    return(context_slot(ctx, SYSTEM_SLOT) + 24) as ptr<i32>;
+}
+
+fun text_value(ctx: ptr<u8>, text: str) -> ptr<u8> {
+    var js: ptr<u8> = wr_string_utf8(text);
+    var value: ptr<u8> = wr_string_value(ctx, js);
+    wr_string_release(js);
+    return value;
+}
+
+fun get(ctx: ptr<u8>, object: ptr<u8>, name: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (deref ex != null) {
+        return wr_undefined(ctx);
+    }
+    var key: ptr<u8> = wr_string_utf8(name);
+    var value: ptr<u8> = wr_get(ctx, object, key, ex);
+    wr_string_release(key);
+    if (value == null || deref ex != null) {
+        return wr_undefined(ctx);
+    }
+    return value;
+}
+
+pub fun file_option_keys(ctx: ptr<u8>, value: ptr<u8>, handle: bool, writing: bool,
+    ex: ptr<ptr<u8>>) -> bool {
+    var roots: ptr<ptr<u8>> = system_errors(ctx);
+    var args: array<ptr<u8>, 1> = [value];
+    var keys: ptr<u8> = wr_call(ctx, roots[4], null, 1, &args[0], ex);
+    if (deref ex != null || keys == null) {
+        return false;
+    }
+    wr_protect(ctx, keys);
+    var n: i64 = wr_to_number(ctx, get(ctx, keys, "length", ex), ex) as i64;
+    if (n > 16) {
+        fail(ctx, ex, 1, "too many file options");
+    }
+    for (var i: i64 = 0; i < n && deref ex == null; i++) {
+        var key: ptr<u8> = wr_get_index(ctx, keys, i as u32, ex);
+        wr_protect(ctx, key);
+        var accepted: bool = wr_equal(ctx, key, text_value(ctx, "encoding"));
+        if (!handle) {
+            accepted = accepted || wr_equal(ctx, key, text_value(ctx, "flag"));
+            if (writing) {
+                accepted = accepted || wr_equal(ctx, key, text_value(ctx, "mode")) ||
+                    wr_equal(ctx, key, text_value(ctx, "flush"));
+            }
+        }
+        if (!accepted) {
+            fail(ctx, ex, 1, "unsupported file option");
+        }
+        wr_unprotect(ctx, key);
+    }
+    wr_unprotect(ctx, keys);
+    return deref ex == null;
+}
+
+fun put(ctx: ptr<u8>, object: ptr<u8>, name: str, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    wr_protect(ctx, value);
+    var key: ptr<u8> = wr_string_utf8(name);
+    wr_set(ctx, object, key, value, 0, ex);
+    wr_string_release(key);
+    wr_unprotect(ctx, value);
+}
+
+fun put_index(ctx: ptr<u8>, object: ptr<u8>, index: u32, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    wr_protect(ctx, value);
+    wr_set_index(ctx, object, index, value, ex);
+    wr_unprotect(ctx, value);
+}
+
+// kind: Error, TypeError, RangeError. Constructors are captured before user code.
+fun fail(ctx: ptr<u8>, ex: ptr<ptr<u8>>, kind: i32, message: str) {
+    var errors: ptr<ptr<u8>> = system_errors(ctx);
+    if (ex == null || deref ex != null) {
+        return;
+    }
+    var args: array<ptr<u8>, 1> = [text_value(ctx, message)];
+    wr_protect(ctx, args[0]);
+    var nested: ptr<u8> = null;
+    var error: ptr<u8> = wr_construct(ctx, errors[kind], 1, &args[0], &nested);
+    if (nested != null) {
+        error = nested;
+    }
+    deref ex = error;
+    wr_unprotect(ctx, args[0]);
+}
+
+pub fun io_failure(ctx: ptr<u8>, ex: ptr<ptr<u8>>, operation: str, path: str, number: i64) {
+    if (deref ex != null) {
+        return;
+    }
+    var message: array<u8, 16640>;
+    var a: i64 = mem_len_cstr(operation);
+    var b: i64 = mem_len_cstr(path);
+    mem_copy(&message[0], "File " as ptr<u8>, 5);
+    mem_copy(&message[5], operation as ptr<u8>, a);
+    mem_copy(&message[5 + a], " failed: " as ptr<u8>, 9);
+    mem_copy(&message[14 + a], path as ptr<u8>, b + 1);
+    fail(ctx, ex, 0, &message[0] as str);
+    var error: ptr<u8> = deref ex;
+    wr_protect(ctx, error);
+    var prototype: ptr<u8> = wr_get_prototype(ctx, error);
+    wr_protect(ctx, prototype);
+    wr_set_prototype(ctx, error, wr_null(ctx));
+    var nested: ptr<u8> = null;
+    put(ctx, error, "syscall", text_value(ctx, operation), &nested);
+    put(ctx, error, "path", text_value(ctx, path), &nested);
+    put(ctx, error, "errno", wr_number(ctx, number as f64), &nested);
+    var code: str = "EIO";
+    if (number == -2) {
+        code = "ENOENT";
+    } else if (number == -17) {
+        code = "EEXIST";
+    } else if (number == -18) {
+        code = "EXDEV";
+    } else if (number == -39) {
+        code = "ENOTEMPTY";
+    } else if (number == -13) {
+        code = "EACCES";
+    } else if (number == -20) {
+        code = "ENOTDIR";
+    } else if (number == -21) {
+        code = "EISDIR";
+    } else if (number == -28) {
+        code = "ENOSPC";
+    } else if (number == -30) {
+        code = "EROFS";
+    } else if (number == -40) {
+        code = "ELOOP";
+    } else if (number == -36) {
+        code = "ENAMETOOLONG";
+    } else if (number == -6) {
+        code = "ENXIO";
+    } else if (number == -11) {
+        code = "EAGAIN";
+    } else if (number == -24) {
+        code = "EMFILE";
+    } else if (number == -23) {
+        code = "ENFILE";
+    } else if (number == -22) {
+        code = "EINVAL";
+    } else if (number == -1) {
+        code = "EPERM";
+    } else if (number == -27) {
+        code = "EFBIG";
+    } else if (number != -5) {
+        code = "UNKNOWN";
+    }
+    put(ctx, error, "code", text_value(ctx, code), &nested);
+    wr_set_prototype(ctx, error, prototype);
+    wr_unprotect(ctx, prototype);
+    wr_unprotect(ctx, error);
+}
+
+fun native_function(ctx: ptr<u8>, name: str, kind: i32) -> ptr<u8> {
+    var key: ptr<u8> = wr_string_utf8(name);
+    var result: ptr<u8> = wr_function(ctx, key, jsrt_system_callback(kind));
+    wr_string_release(key);
+    return result;
+}
+
+// Only explicit strings are accepted; no getters or coercion can change paths.
+fun string_bytes(ctx: ptr<u8>, value: ptr<u8>, bytes: ptr<u8>, capacity: i64, path: bool, ex: ptr<ptr<u8>>) -> i64 {
+    return encode_utf8(ctx, value, bytes, capacity, path, ex);
+}
+
+pub fun decode_file(ctx: ptr<u8>, bytes: ptr<u8>, length: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return decode_utf8_strict(ctx, bytes, length, ex);
+}
+
+export(c) fun jsrt_cwd(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var buffer: array<u8, 16385>;
+    if (env_getcwd(&buffer[0], PATH_CAP) < 0) {
+        fail(ctx, ex, 0, "cannot read current directory");
+        return wr_undefined(ctx);
+    }
+    return text_value(ctx, &buffer[0] as str);
+}
+
+export(c) fun jsrt_exit_get(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return wr_number(ctx, deref exit_code(ctx) as f64);
+}
+
+export(c) fun jsrt_exit_set(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0 || wr_type(ctx, args[0]) == 0) {
+        deref exit_code(ctx) = 0;
+        return wr_undefined(ctx);
+    }
+    if (wr_type(ctx, args[0]) != 3) {
+        fail(ctx, ex, 1, "exitCode must be a number");
+        return wr_undefined(ctx);
+    }
+    var number: f64 = wr_to_number(ctx, args[0], ex);
+    if (number != number || number < 0.0 || number > 255.0) {
+        fail(ctx, ex, 2, "exitCode must be an integer from 0 to 255");
+    } else if ((number as i32) as f64 != number) {
+        fail(ctx, ex, 2, "exitCode must be an integer from 0 to 255");
+    } else {
+        deref exit_code(ctx) = number as i32;
+    }
+    return wr_undefined(ctx);
+}
+
+pub struct FileWork {
+    mode: i32;
+    fd: i64;
+    offset: i64;
+    capacity: i64;
+    path: ptr<u8>;
+    bytes: ptr<u8>;
+    length: i64;
+    writing: bool;
+    binary: bool;
+    status: i32;
+    errno: i64;
+    operation: str;
+    other_path: ptr<u8>;
+    permissions: i32;
+    recursive: bool;
+    with_types: bool;
+    entries: i64;
+    info: Stat;
+}
+
+pub fun free_file(work: ptr<FileWork>) {
+    if (work == null) {
+        return;
+    }
+    if (deref work.path != null) {
+        mem_free(deref work.path, PATH_CAP);
+    }
+    if (deref work.other_path != null) {
+        mem_free(deref work.other_path, PATH_CAP);
+    }
+    if ((deref work.mode == 1 || deref work.mode == 2 || deref work.mode == 5 ||
+        deref work.mode == FILE_HANDLE_OPEN_OPERATION || deref work.mode == FILE_HANDLE_CLOSE_OPERATION) && deref work.fd >= 0) {
+        io_close(deref work.fd);
+    }
+    if (deref work.bytes != null) {
+        var capacity: i64 = deref work.capacity;
+        if (capacity == 0) {
+            capacity = FILE_LIMIT + 1;
+        }
+        mem_free(deref work.bytes, capacity);
+    }
+    mem_free(work as ptr<u8>, size_of<FileWork>() as i64);
+}
+
+// Main-thread validation and encoding finish before any filesystem mutation.
+pub fun prepare_file(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>, writing: bool) -> ptr<FileWork> {
+    var required: i64 = 1;
+    if (writing) {
+        required = 2;
+    }
+    if (count < required) {
+        fail(ctx, ex, 1, "missing file arguments");
+        return null;
+    }
+    if (wr_type(ctx, args[0]) != 4) {
+        fail(ctx, ex, 1, "file path must be a string");
+        return null;
+    }
+    if (count > required + 1) {
+        fail(ctx, ex, 1, "unexpected file arguments");
+        return null;
+    }
+    var binary: bool = !writing;
+    var option: ptr<u8> = wr_undefined(ctx);
+    if (count > required) {
+        option = args[required];
+    }
+    var encoding_value: ptr<u8> = option;
+    var file_flag: i64 = 0;
+    var permissions: i32 = 420;
+    var flush: bool = false;
+    if (wr_type(ctx, option) == 5) {
+        if (!file_option_keys(ctx, option, false, writing, ex)) {
+            return null;
+        }
+        encoding_value = get(ctx, option, "encoding", ex);
+        wr_protect(ctx, encoding_value);
+        var flag: ptr<u8> = get(ctx, option, "flag", ex);
+        if (deref ex == null && wr_type(ctx, flag) != 0) {
+            var default_flag: str = "r";
+            if (writing) {
+                default_flag = "w";
+            }
+            if (wr_equal(ctx, flag, text_value(ctx, default_flag))) {
+                file_flag = 0;
+            } else if (writing && wr_equal(ctx, flag, text_value(ctx, "a"))) {
+                file_flag = 1;
+            } else if (writing && wr_equal(ctx, flag, text_value(ctx, "wx"))) {
+                file_flag = 2;
+            } else {
+                fail(ctx, ex, 1, "unsupported file flag");
+            }
+        }
+        if (writing && deref ex == null) {
+            var mode: ptr<u8> = get(ctx, option, "mode", ex);
+            if (deref ex == null && wr_type(ctx, mode) != 0) {
+                if (wr_type(ctx, mode) != 3) {
+                    fail(ctx, ex, 1, "file mode must be a number");
+                } else {
+                    var numeric: f64 = wr_to_number(ctx, mode, ex);
+                    if (!(numeric >= 0.0 && numeric <= 4095.0) || numeric != (numeric as i32) as f64) {
+                        fail(ctx, ex, 2, "file mode must be an integer from 0 to 4095");
+                    } else {
+                        permissions = numeric as i32;
+                    }
+                }
+            }
+            var flushing: ptr<u8> = get(ctx, option, "flush", ex);
+            if (deref ex == null && wr_type(ctx, flushing) != 0 && wr_type(ctx, flushing) != 2) {
+                fail(ctx, ex, 1, "flush must be a boolean");
+            }
+            flush = wr_equal(ctx, flushing, wr_boolean(ctx, true));
+        }
+    } else {
+        wr_protect(ctx, encoding_value);
+    }
+    if (deref ex == null && wr_type(ctx, encoding_value) != 0 && !(binary && wr_type(ctx, encoding_value) == 1)) {
+        var encoding: array<u8, 16>;
+        var encoded: i64 = string_bytes(ctx, encoding_value, &encoding[0], 16, false, ex);
+        if (encoded != 4 || encoding[0] != 117 || encoding[1] != 116 || encoding[2] != 102 || encoding[3] != 56) {
+            fail(ctx, ex, 1, "only utf8 encoding is supported");
+        }
+        binary = false;
+    }
+    wr_unprotect(ctx, encoding_value);
+    if (deref ex != null) {
+        return null;
+    }
+    var work: ptr<FileWork> = mem_alloc_zeroed(size_of<FileWork>() as i64) as ptr<FileWork>;
+    if (work == null) {
+        fail(ctx, ex, 2, "cannot allocate file request");
+        return null;
+    }
+    deref work.path = mem_alloc(PATH_CAP);
+    deref work.bytes = mem_alloc(FILE_LIMIT + 1);
+    deref work.writing = writing;
+    deref work.binary = binary;
+    deref work.offset = file_flag;
+    deref work.permissions = permissions;
+    deref work.recursive = flush;
+    if (deref work.path == null || deref work.bytes == null) {
+        free_file(work);
+        fail(ctx, ex, 2, "cannot allocate file buffer");
+        return null;
+    }
+    if (string_bytes(ctx, args[0], deref work.path, PATH_CAP, true, ex) < 0) {
+        free_file(work);
+        return null;
+    }
+    if (writing) {
+        if (wr_type(ctx, args[1]) == 4) {
+            deref work.length = string_bytes(ctx, args[1], deref work.bytes, FILE_LIMIT + 1, false, ex);
+        } else {
+            deref work.length = copy_byte_view(ctx, args[1], deref work.bytes, FILE_LIMIT, ex);
+        }
+        if (deref work.length < 0) {
+            free_file(work);
+            return null;
+        }
+    }
+    return work;
+}
+
+fun file_errno(work: ptr<FileWork>, operation: str, number: i64) {
+    if (deref work.status != 0) {
+        return;
+    }
+    deref work.status = 1;
+    deref work.operation = operation;
+    deref work.errno = number;
+}
+
+// Worker-safe Wave std operations. This function never accesses JSC handles.
+pub fun perform_file(work: ptr<FileWork>) {
+    if (deref work.mode > 0) {
+        perform_stream_file(work);
+        return;
+    }
+    var flags: i32 = FS_O_RDONLY | FS_O_NONBLOCK;
+    if (deref work.writing) {
+        flags = FS_O_WRONLY | FS_O_CREAT | FS_O_NONBLOCK;
+        if (deref work.offset == 1) {
+            flags = flags | FS_O_APPEND;
+        } else if (deref work.offset == 2) {
+            flags = flags | FS_O_EXCL;
+        }
+    }
+    var fd: i64 = open(deref work.path as str, flags, deref work.permissions);
+    if (fd < 0) {
+        file_errno(work, "open", fd);
+        return;
+    }
+    var info: Stat;
+    var stat_result: i64 = fstat(fd, &info);
+    if (stat_result < 0) {
+        file_errno(work, "fstat", stat_result);
+    } else if (((info.mode as i32) & 61440) != 32768) {
+        deref work.status = 2;
+    } else if (!deref work.writing && info.size > FILE_LIMIT) {
+        deref work.status = 3;
+    } else if (deref work.writing) {
+        var truncated: i64 = 0;
+        if (deref work.offset != 1) {
+            truncated = ftruncate(fd, 0);
+        }
+        if (truncated < 0) {
+            file_errno(work, "ftruncate", truncated);
+        } else {
+            var written: i64 = io_write_all(fd, deref work.bytes, deref work.length);
+            if (written < 0) {
+                file_errno(work, "write", written);
+            } else if (written != deref work.length) {
+                deref work.status = 4;
+            }
+            if (deref work.status == 0 && deref work.recursive) {
+                var synced: i64 = fsync(fd);
+                if (synced < 0) {
+                    file_errno(work, "fsync", synced);
+                }
+            }
+        }
+    } else {
+        deref work.length = io_read_at_most(fd, deref work.bytes, FILE_LIMIT + 1);
+        if (deref work.length < 0) {
+            file_errno(work, "read", deref work.length);
+        } else if (deref work.length > FILE_LIMIT) {
+            deref work.status = 3;
+        }
+    }
+    var closed: i64 = io_close(fd);
+    if (closed < 0) {
+        file_errno(work, "close", closed);
+    }
+}
+
+fun perform_stream_file(work: ptr<FileWork>) {
+    var mode: i32 = deref work.mode;
+    if (mode == 5) {
+        var status: i64 = io_close(deref work.fd);
+        deref work.fd = -1;
+        if (status < 0) {
+            file_errno(work, "close", status);
+        }
+        return;
+    }
+    if (mode == 3) {
+        var positioned: i64 = lseek(deref work.fd, deref work.offset, 0);
+        if (positioned < 0) {
+            file_errno(work, "lseek", positioned);
+            return;
+        }
+        deref work.length = io_read_at_most(deref work.fd, deref work.bytes, deref work.capacity);
+        if (deref work.length < 0) {
+            file_errno(work, "read", deref work.length);
+        }
+        return;
+    }
+    if (mode == 4) {
+        var written: i64 = io_write_all(deref work.fd, deref work.bytes, deref work.length);
+        if (written < 0) {
+            file_errno(work, "write", written);
+        } else if (written != deref work.length) {
+            deref work.status = 4;
+        }
+        return;
+    }
+    var flags: i32 = FS_O_RDONLY | FS_O_NONBLOCK;
+    if (mode == 2) {
+        flags = FS_O_WRONLY | FS_O_CREAT | FS_O_NONBLOCK;
+    }
+    var fd: i64 = open(deref work.path as str, flags, 420);
+    if (fd < 0) {
+        file_errno(work, "open", fd);
+        return;
+    }
+    var info: Stat;
+    var status: i64 = fstat(fd, &info);
+    if (status < 0) {
+        file_errno(work, "fstat", status);
+    } else if (((info.mode as i32) & 61440) != 32768) {
+        deref work.status = 2;
+    } else if (mode == 2) {
+        status = ftruncate(fd, 0);
+        if (status < 0) {
+            file_errno(work, "ftruncate", status);
+        }
+    }
+    if (deref work.status != 0) {
+        io_close(fd);
+    } else {
+        deref work.fd = fd;
+    }
+}
+
+pub fun complete_file(ctx: ptr<u8>, work: ptr<FileWork>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (deref work.status == 1) {
+        io_failure(ctx, ex, deref work.operation, deref work.path as str, deref work.errno);
+    } else if (deref work.status == 2) {
+        fail(ctx, ex, 0, "expected a regular file");
+    } else if (deref work.status == 3) {
+        fail(ctx, ex, 2, "file exceeds 4 MiB");
+    } else if (deref work.status == 4) {
+        fail(ctx, ex, 0, "cannot write complete file");
+    } else if (deref work.mode > 0) {
+        if (deref work.mode == 1 || deref work.mode == 2) {
+            return wr_number(ctx, deref work.fd as f64);
+        }
+        if (deref work.mode == 3) {
+            return buffer_from_bytes(ctx, deref work.bytes, deref work.length, ex);
+        }
+    } else if (!deref work.writing) {
+        if (deref work.binary) {
+            return buffer_from_bytes(ctx, deref work.bytes, deref work.length, ex);
+        }
+        return decode_file(ctx, deref work.bytes, deref work.length, ex);
+    }
+    return wr_undefined(ctx);
+}
+
+pub fun system_fail(ctx: ptr<u8>, ex: ptr<ptr<u8>>, range: bool, message: str) {
+    var kind: i32 = 0;
+    if (range) {
+        kind = 2;
+    }
+    fail(ctx, ex, kind, message);
+}
+
+pub fun system_type_fail(ctx: ptr<u8>, ex: ptr<ptr<u8>>, message: str) {
+    fail(ctx, ex, 1, message);
+}
+
+pub fun encode_host_text(ctx: ptr<u8>, value: ptr<u8>, bytes: ptr<u8>, capacity: i64, ex: ptr<ptr<u8>>) -> i64 {
+    return string_bytes(ctx, value, bytes, capacity, false, ex);
+}
+
+fun file_operation(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>, writing: bool) -> ptr<u8> {
+    var work: ptr<FileWork> = prepare_file(ctx, count, args, ex, writing);
+    if (work == null) {
+        return wr_undefined(ctx);
+    }
+    perform_file(work);
+    var result: ptr<u8> = complete_file(ctx, work, ex);
+    wr_protect(ctx, result);
+    free_file(work);
+    wr_unprotect(ctx, result);
+    return result;
+}
+
+export(c) fun jsrt_read_file(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return file_operation(ctx, count, args, ex, false);
+}
+
+export(c) fun jsrt_write_file(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return file_operation(ctx, count, args, ex, true);
+}
+
+fun install_exit_code(ctx: ptr<u8>, process: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var descriptor: ptr<u8> = wr_object(ctx, null, null);
+    wr_protect(ctx, descriptor);
+    wr_set_prototype(ctx, descriptor, wr_null(ctx));
+    put(ctx, descriptor, "get", native_function(ctx, "get exitCode", 3), ex);
+    put(ctx, descriptor, "set", native_function(ctx, "set exitCode", 4), ex);
+    put(ctx, descriptor, "enumerable", wr_boolean(ctx, true), ex);
+    put(ctx, descriptor, "configurable", wr_boolean(ctx, false), ex);
+    var reflect: ptr<u8> = get(ctx, wr_context_global(ctx), "Reflect", ex);
+    var define: ptr<u8> = get(ctx, reflect, "defineProperty", ex);
+    wr_protect(ctx, define);
+    var args: array<ptr<u8>, 3> = [process, text_value(ctx, "exitCode"), descriptor];
+    wr_protect(ctx, args[1]);
+    wr_call(ctx, define, reflect, 3, &args[0], ex);
+    wr_unprotect(ctx, args[1]);
+    wr_unprotect(ctx, define);
+    wr_unprotect(ctx, descriptor);
+}
+
+pub fun install_system(ctx: ptr<u8>, source_index: i32, eval_mode: bool) -> bool {
+    if (!allocate_context_slot(ctx, SYSTEM_SLOT, 40)) {
+        return false;
+    }
+    var errors: ptr<ptr<u8>> = system_errors(ctx);
+    deref exit_code(ctx) = 0;
+    var ex: ptr<u8> = null;
+    errors[4] = get(ctx, get(ctx, wr_context_global(ctx), "Reflect", &ex), "ownKeys", &ex);
+    if (ex != null || errors[4] == null) {
+        return false;
+    }
+    wr_protect(ctx, errors[4]);
+    var names: array<str, 3> = ["Error", "TypeError", "RangeError"];
+    for (var i: i64 = 0; i < 3; i++) {
+        errors[i] = get(ctx, wr_context_global(ctx), names[i], &ex);
+        if (errors[i] == null || ex != null) {
+            return false;
+        }
+        wr_protect(ctx, errors[i]);
+    }
+    var process: ptr<u8> = wr_object(ctx, null, null);
+    wr_protect(ctx, process);
+    var fs: ptr<u8> = wr_object(ctx, null, null);
+    wr_protect(ctx, fs);
+    var argv: ptr<u8> = wr_array(ctx, 0, null, &ex);
+    wr_protect(ctx, argv);
+    var environment: ptr<u8> = wr_object(ctx, null, null);
+    wr_protect(ctx, environment);
+    wr_set_prototype(ctx, environment, wr_null(ctx));
+    put_index(ctx, argv, 0, text_value(ctx, jsrt_argv(0)), &ex);
+    var script: str = jsrt_argv(source_index);
+    if (eval_mode) {
+        script = "<eval>";
+    }
+    put_index(ctx, argv, 1, text_value(ctx, script), &ex);
+    var start: i32 = source_index + 1;
+    if (start < jsrt_argc()) {
+        var first: str = jsrt_argv(start);
+        if (mem_len_cstr(first) == 2 && first[0] == 45 && first[1] == 45) {
+            start += 1;
+        }
+    }
+    for (var i: i32 = start; i < jsrt_argc(); i++) {
+        put_index(ctx, argv, (2 + i - start) as u32, text_value(ctx, jsrt_argv(i)), &ex);
+    }
+    var entries: ptr<ptr<u8>> = jsrt_environment();
+    for (var i: i64 = 0; entries[i] != null && ex == null; i++) {
+        var entry: ptr<u8> = entries[i];
+        var length: i64 = mem_len_cstr(entry as str);
+        var split: i64 = 0;
+        while (split < length && entry[split] != 61) {
+            split += 1;
+        }
+        if (split > 0 && split < length) {
+            var key: ptr<u8> = mem_alloc(split + 1);
+            if (key == null) {
+                fail(ctx, &ex, 2, "cannot allocate environment name");
+                break;
+            }
+            mem_copy(key, entry, split);
+            deref key[split] = 0;
+            put(ctx, environment, key as str, text_value(ctx, (entry + split + 1) as str), &ex);
+            mem_free(key, split + 1);
+        }
+    }
+    put(ctx, process, "argv", argv, &ex);
+    put(ctx, process, "platform", text_value(ctx, "linux"), &ex);
+    put(ctx, process, "arch", text_value(ctx, "x64"), &ex);
+    var versions: ptr<u8> = wr_object(ctx, null, null);
+    wr_protect(ctx, versions);
+    put(ctx, versions, "jsrt", text_value(ctx, "0.1.0-dev"), &ex);
+    put(ctx, versions, "jsc", text_value(ctx, wr_engine_version()), &ex);
+    put(ctx, process, "versions", versions, &ex);
+    wr_unprotect(ctx, versions);
+    var executable: array<u8, 8192>;
+    var executable_size: i64 = read_link("/proc/self/exe", &executable[0], 8191);
+    if (executable_size > 0 && executable_size < 8192) {
+        executable[executable_size] = 0;
+        put(ctx, process, "execPath", text_value(ctx, &executable[0] as str), &ex);
+    }
+    put(ctx, process, "env", environment, &ex);
+    put(ctx, process, "cwd", native_function(ctx, "cwd", 0), &ex);
+    install_exit_code(ctx, process, &ex);
+    put(ctx, fs, "readFileSync", native_function(ctx, "readFileSync", 1), &ex);
+    put(ctx, fs, "writeFileSync", native_function(ctx, "writeFileSync", 2), &ex);
+    if (ex == null) {
+        put(ctx, wr_context_global(ctx), "process", process, &ex);
+        put(ctx, wr_context_global(ctx), "fs", fs, &ex);
+    }
+    wr_unprotect(ctx, environment);
+    wr_unprotect(ctx, argv);
+    wr_unprotect(ctx, fs);
+    wr_unprotect(ctx, process);
+    return ex == null;
+}
+
+pub fun system_exit_status(ctx: ptr<u8>) -> i32 {
+    return deref exit_code(ctx);
+}
+
+pub fun read_text_file(ctx: ptr<u8>, path: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var encoding: ptr<u8> = text_value(ctx, "utf8");
+    wr_protect(ctx, encoding);
+    var args: array<ptr<u8>, 2> = [path, encoding];
+    var result: ptr<u8> = file_operation(ctx, 2, &args[0], ex, false);
+    wr_unprotect(ctx, encoding);
+    return result;
+}
+
+pub fun copy_host_path(ctx: ptr<u8>, value: ptr<u8>, buffer: ptr<u8>, cap: i64, ex: ptr<ptr<u8>>) -> i64 {
+    return string_bytes(ctx, value, buffer, cap, true, ex);
+}
+
+pub fun shutdown_system(ctx: ptr<u8>) {
+    if (context_slot(ctx, SYSTEM_SLOT) == null) {
+        return;
+    }
+    var errors: ptr<ptr<u8>> = system_errors(ctx);
+    for (var i: i64 = 0; i < 3; i++) {
+        if (errors[i] != null) {
+            wr_unprotect(ctx, errors[i]);
+            errors[i] = null;
+        }
+    }
+    if (errors[4] != null) {
+        wr_unprotect(ctx, errors[4]);
+    }
+    release_context_slot(ctx, SYSTEM_SLOT, 40);
+}

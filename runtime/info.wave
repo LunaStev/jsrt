@@ -1,0 +1,176 @@
+// Native metadata serialization uses the vendored wjson Wave backend.
+import("wjson")::{JsonWriter, json_writer_new, json_writer_finish, json_writer_len, json_writer_free,
+    json_str_is_null, json_version, json_begin_object, json_end_object, json_begin_array, json_end_array,
+    json_key, json_write_str, json_write_i64, json_field_str, json_field_i64, json_field_bool};
+import("std::io::fd")::{io_write_all};
+import("./wjson_platform")::{prepare_wjson};
+import("./config")::{PROCESS_PIPE_LIMIT, PROCESS_PIPE_CHUNK, NEXT_TICK_LIMIT, FORM_DATA_ENTRY_LIMIT,
+    STREAM_CORK_LIMIT, BLOB_TYPE_LIMIT};
+import("./config")::{ENGINE_MAJOR, ENGINE_MINOR, ENGINE_MICRO, ENGINE_PATCH, SOURCE_LIMIT, OUTPUT_LIMIT,
+    FILE_LIMIT, DIRECTORY_ENTRY_LIMIT, DIRECTORY_BYTES_LIMIT, TIMER_LIMIT, ARGUMENT_LIMIT, MODULE_LIMIT,
+    DEPTH_LIMIT, JOB_LIMIT, FILE_WORKERS, FILE_HANDLE_LIMIT, STREAM_OBJECT_HIGH_WATER_MARK, TEST_FILE_LIMIT, CHILD_LIMIT, CHILD_ARGUMENT_LIMIT, ADDON_LIMIT, ADDON_FUNCTION_LIMIT,
+    ADDON_HANDLE_LIMIT, HTTP_SERVER_LIMIT, HTTP_CONNECTION_LIMIT, HTTP_HEADER_LIMIT, HTTP_HEADER_COUNT,
+    HTTP_BODY_LIMIT, HTTP_URL_LIMIT, HTTP_WIRE_OVERHEAD_LIMIT, BUFFER_LIMIT, BUFFER_TEXT_LIMIT, BUFFER_PART_LIMIT,
+    EVENT_LISTENER_LIMIT, STREAM_BYTE_LIMIT, STREAM_CHUNK_LIMIT, STREAM_HIGH_WATER_MARK, FILE_STREAM_LIMIT,
+    CLIENT_LIMIT, HTTP_REQUEST_LIMIT, CLIENT_CONNECT_TIMEOUT_MS, HTTP_HEADERS_TIMEOUT_MS, HTTP_REQUEST_TIMEOUT_MS,
+    HTTP_IDLE_TIMEOUT_MS, URL_CAP, URL_PAIR_LIMIT, HTTP_PIPELINE_LIMIT, HTTP_KEEP_ALIVE_TIMEOUT_MS, PACKAGE_ARCHIVE_LIMIT,
+    PACKAGE_EXTRACT_LIMIT, PACKAGE_CACHE_BYTE_LIMIT, PACKAGE_CACHE_ENTRY_LIMIT, PACKAGE_ENTRY_LIMIT, PACKAGE_COUNT_LIMIT, PACKAGE_DEPTH_LIMIT, PACKAGE_PATH_CAP,
+    PACKAGE_DOWNLOAD_TIMEOUT_MS, PACKAGE_REDIRECT_LIMIT, PACKAGE_VERSION_TEXT_LIMIT, PACKAGE_RANGE_TEXT_LIMIT,
+    PACKAGE_COMPARATOR_LIMIT, PACKAGE_RANGE_GROUP_LIMIT, PACKAGE_REGISTRY_VERSION_LIMIT, WORKER_LIMIT,
+    WORKER_MESSAGE_LIMIT, CLONE_NODE_LIMIT, CLONE_BYTE_LIMIT, CLONE_DEPTH_LIMIT, MODULE_EXPORT_LIMIT};
+extern(c, "jsrt_esm_synthetic_available") fun synthetic_engine_available() -> bool;
+extern(c, "jsrt_worker_engine_available") fun worker_engine_available() -> bool;
+extern(c, "jsrt_callable_constructor_available") fun constructor_engine_available() -> bool;
+extern(c, "jsrt_clone_engine_available") fun clone_engine_available() -> bool;
+extern(c, "curl_version") fun curl_version() -> str;
+extern(c, "OpenSSL_version") fun openssl_version(selector: i32) -> str;
+extern(c, "archive_version_string") fun archive_version() -> str;
+extern(c, "wr_engine_name") fun wr_engine_name() -> str;
+extern(c, "wr_engine_version") fun wr_engine_version() -> str;
+extern(c, "uv_version_string") fun uv_version_string() -> str;
+extern(c, "jsrt_http_parser_version") fun http_parser_version() -> str;
+extern(c, "jsrt_esm_available") fun esm_available() -> bool;
+
+pub fun write_runtime_info(major: u32, minor: u32, micro: u32, patch: u32, compatibility: bool) -> i32 {
+    if (prepare_wjson() != 0) {
+        return 1;
+    }
+    var w: JsonWriter = json_writer_new(2);
+    var ok: bool = json_begin_object(&w) && json_field_str(&w, "runtime", "jsrt") && json_field_str(&w,
+        "version", "0.1.0-dev") && json_field_str(&w, "implementation", "Wave") && json_field_bool(&w,
+        "compatibilityBuild", compatibility) && json_key(&w, "engine") && json_begin_object(&w) && json_field_str(&w,
+        "name", wr_engine_name()) && json_field_str(&w, "version", wr_engine_version()) && json_field_i64(&w,
+        "major", major as i64) && json_field_i64(&w, "minor", minor as i64) && json_field_i64(&w, "micro",
+        micro as i64) && json_field_i64(&w, "patch", patch as i64) && json_field_bool(&w,
+        "moduleHostABI", esm_available()) && json_field_bool(&w, "workerHostABI", worker_engine_available()) &&
+        json_field_bool(&w, "callableConstructorABI", constructor_engine_available()) &&
+        json_field_str(&w, "constructorFactoryContract", "JSRTMakeConstructor / legacy Worker ABI v2") &&
+        json_field_bool(&w, "cloneHostABI", clone_engine_available()) &&
+        json_field_bool(&w, "syntheticModuleHostABI", synthetic_engine_available()) && json_end_object(&w) && json_key(&w,
+        "enginePolicy") && json_begin_object(&w) && json_field_str(&w, "name", "JavaScriptCoreGTK") && json_key(&w,
+        "minimumVersion") && json_begin_array(&w) && json_write_i64(&w, ENGINE_MAJOR as i64) && json_write_i64(&w,
+        ENGINE_MINOR as i64) && json_write_i64(&w, ENGINE_MICRO as i64) && json_write_i64(&w, ENGINE_PATCH as i64);
+    // Keep version components numeric instead of assembling JSON by hand.
+    if (ok) {
+        ok = json_end_array(&w) && json_end_object(&w) && json_key(&w, "serialization") && json_begin_object(&w) && json_field_str(&w,
+            "library", "wjson") && json_field_str(&w, "version", json_version()) && json_field_str(&w,
+            "backend", "Wave") && json_field_bool(&w, "replacesJsonGlobals", true) && json_field_str(&w,
+            "commit", "ca2a8cd9f029db5d1d6790342ba507efe0d84d32") && json_end_object(&w) && json_key(&w,
+            "network") && json_begin_object(&w) && json_field_str(&w, "backend", "libuv") && json_field_str(&w,
+            "version", uv_version_string()) && json_field_str(&w, "httpParser", "llhttp") && json_field_str(&w,
+            "httpParserVersion", http_parser_version()) && json_field_i64(&w, "defaultHeadersTimeoutMs",
+            HTTP_HEADERS_TIMEOUT_MS) && json_field_i64(&w, "defaultRequestTimeoutMs", HTTP_REQUEST_TIMEOUT_MS) && json_field_i64(&w,
+            "defaultIdleTimeoutMs", HTTP_IDLE_TIMEOUT_MS) && json_field_bool(&w, "keepAliveDefault",
+            false) && json_field_i64(&w, "defaultKeepAliveTimeoutMs", HTTP_KEEP_ALIVE_TIMEOUT_MS) && json_end_object(&w) && json_key(&w,
+            "client") && json_begin_object(&w) && json_field_str(&w, "backend", "libcurl") && json_field_str(&w,
+            "versionDetails", curl_version()) && json_field_str(&w, "minimumVersion", "8.13.0") && json_field_bool(&w,
+            "verifyCertificates", true) && json_field_i64(&w, "defaultConnectTimeoutMs", CLIENT_CONNECT_TIMEOUT_MS) && json_end_object(&w) && json_key(&w,
+            "crypto") && json_begin_object(&w) && json_field_str(&w, "backend", "OpenSSL") && json_field_str(&w,
+            "versionDetails", openssl_version(0)) && json_field_str(&w, "entropy", "Wave std OS random") && json_field_bool(&w,
+            "incrementalHash", true) && json_field_bool(&w, "hmac", true) && json_end_object(&w) && json_key(&w,
+            "installer") && json_begin_object(&w) && json_field_str(&w, "archiveBackend", archive_version()) && json_field_str(&w,
+            "lockfile", "jsrt.lock.wjson v1") && json_field_bool(&w, "exactVersionsOnly", false) && json_field_bool(&w,
+            "semverRanges", true) && json_field_bool(&w, "archiveCache", true) && json_field_bool(&w,
+            "includeDevOption", true) && json_field_str(&w, "cacheEviction", "oldest publication first; owned regular archives only") &&
+            json_field_bool(&w, "workspaces", true) && json_field_str(&w, "workspaceMode", "managed content-locked snapshots; no source symlinks") &&
+            json_field_bool(&w, "managedReplacement", true) &&
+            json_field_bool(&w, "optionalDependencies", true) && json_field_bool(&w, "peerDependencies", true) &&
+            json_field_str(&w, "peerResolution", "shared-scope range intersection and visible scope validation; no backtracking") &&
+            json_field_bool(&w, "updateOption", true) && json_field_bool(&w,
+            "lifecycleScripts", false) && json_field_str(&w, "recoveryJournal", ".jsrt-transaction/state.wjson v1/v2") && json_field_str(&w,
+            "projectLock", "directory flock") && json_field_bool(&w, "atomicAcrossPaths", false) && json_field_i64(&w,
+            "connectTimeoutMs", CLIENT_CONNECT_TIMEOUT_MS) && json_field_i64(&w, "downloadTimeoutMs",
+            PACKAGE_DOWNLOAD_TIMEOUT_MS) && json_field_i64(&w, "maxRedirects", PACKAGE_REDIRECT_LIMIT) && json_end_object(&w);
+    }
+    if (ok) {
+        ok = json_key(&w, "addons") && json_begin_object(&w) && json_field_str(&w, "api", "Node-API v1 subset") && json_field_str(&w,
+            "bridge", "C++ / JavaScriptCore C API") && json_field_bool(&w, "complete", false) && json_field_bool(&w,
+            "async", false) && json_field_i64(&w, "libraries", ADDON_LIMIT) && json_field_i64(&w, "functions",
+            ADDON_FUNCTION_LIMIT) && json_field_i64(&w, "handles", ADDON_HANDLE_LIMIT) && json_field_i64(&w,
+            "stringBytes", SOURCE_LIMIT) && json_end_object(&w);
+    }
+    if (ok) {
+        ok = json_key(&w, "limits") && json_begin_object(&w) && json_field_i64(&w, "testFiles", TEST_FILE_LIMIT) &&
+            json_field_i64(&w, "childProcesses",
+            CHILD_LIMIT) && json_field_i64(&w, "processPipes", PROCESS_PIPE_LIMIT) &&
+            json_field_i64(&w, "processPipeChunkBytes", PROCESS_PIPE_CHUNK) &&
+            json_field_i64(&w, "childArguments", CHILD_ARGUMENT_LIMIT) && json_field_str(&w,
+            "processMemoryPolicy", "opt-in POSIX RLIMIT_AS soft limit; not a JS heap limit") && json_field_i64(&w,
+            "urlBytes", URL_CAP - 1) && json_field_i64(&w, "formDataEntries", FORM_DATA_ENTRY_LIMIT) &&
+            json_field_i64(&w, "webStreamQueueEntries", STREAM_CHUNK_LIMIT) &&
+            json_field_i64(&w, "webStreamPendingReads", STREAM_CHUNK_LIMIT) &&
+            json_field_i64(&w, "textCodecBytes", BUFFER_LIMIT) &&
+            json_field_i64(&w, "streamCorkDepth", STREAM_CORK_LIMIT) && json_field_i64(&w, "blobTypeBytes", BLOB_TYPE_LIMIT) &&
+            json_field_i64(&w, "urlSearchPairs", URL_PAIR_LIMIT) && json_field_i64(&w,
+            "httpPipelineBytes", HTTP_PIPELINE_LIMIT) && json_field_i64(&w, "packageArchiveBytes", PACKAGE_ARCHIVE_LIMIT) && json_field_i64(&w,
+            "packageCacheBytes", PACKAGE_CACHE_BYTE_LIMIT) && json_field_i64(&w, "packageCacheEntries", PACKAGE_CACHE_ENTRY_LIMIT) &&
+            json_field_i64(&w, "packageExtractBytes", PACKAGE_EXTRACT_LIMIT) && json_field_i64(&w, "packageEntries", PACKAGE_ENTRY_LIMIT) && json_field_i64(&w,
+            "packageCount", PACKAGE_COUNT_LIMIT) && json_field_i64(&w, "packageVersionTextBytes", PACKAGE_VERSION_TEXT_LIMIT) && json_field_i64(&w,
+            "packageAttempts", PACKAGE_COUNT_LIMIT) && json_field_i64(&w, "packagePeerEdges", PACKAGE_COUNT_LIMIT) &&
+            json_field_i64(&w, "packageOptionalSkips", PACKAGE_COUNT_LIMIT) && json_field_i64(&w,
+            "packageRangeTextBytes", PACKAGE_RANGE_TEXT_LIMIT) && json_field_i64(&w, "packageComparators",
+            PACKAGE_COMPARATOR_LIMIT) && json_field_i64(&w, "packageRangeGroups", PACKAGE_RANGE_GROUP_LIMIT) && json_field_i64(&w,
+            "packageRegistryVersions", PACKAGE_REGISTRY_VERSION_LIMIT) && json_field_i64(&w, "packageDepth",
+            PACKAGE_DEPTH_LIMIT) && json_field_i64(&w, "packagePathBytes", PACKAGE_PATH_CAP - 1) && json_field_i64(&w,
+            "hashUpdateBytes", BUFFER_LIMIT) && json_field_i64(&w, "sourceBytes", SOURCE_LIMIT) && json_field_i64(&w,
+            "consoleUtf8Capacity", OUTPUT_LIMIT) && json_field_i64(&w, "fileBytes", FILE_LIMIT) && json_field_i64(&w,
+            "directoryEntries", DIRECTORY_ENTRY_LIMIT) && json_field_i64(&w, "directoryNameBytes", DIRECTORY_BYTES_LIMIT) && json_field_i64(&w,
+            "timers", TIMER_LIMIT) && json_field_i64(&w, "nextTicks", NEXT_TICK_LIMIT) &&
+            json_field_i64(&w, "timerArguments", ARGUMENT_LIMIT) && json_field_i64(&w,
+            "moduleRecords", MODULE_LIMIT) && json_field_i64(&w, "moduleDepth", DEPTH_LIMIT) && json_field_i64(&w,
+            "esmSources", MODULE_LIMIT) && json_field_i64(&w, "moduleExports", MODULE_EXPORT_LIMIT) && json_field_i64(&w,
+            "fileJobs", JOB_LIMIT) && json_field_i64(&w, "fileWorkers", FILE_WORKERS) &&
+            json_field_i64(&w, "fileHandles", FILE_HANDLE_LIMIT) && json_field_i64(&w, "fileHandleJobs", JOB_LIMIT) &&
+            json_field_i64(&w, "streamObjectHighWaterMark", STREAM_OBJECT_HIGH_WATER_MARK) &&
+            json_field_i64(&w, "workers", WORKER_LIMIT) && json_field_i64(&w, "workerMessages", WORKER_MESSAGE_LIMIT) &&
+            json_field_i64(&w, "cloneNodes", CLONE_NODE_LIMIT) && json_field_i64(&w, "cloneBytes", CLONE_BYTE_LIMIT) &&
+            json_field_i64(&w, "cloneDepth", CLONE_DEPTH_LIMIT) && json_field_i64(&w,
+            "httpServerRecords", HTTP_SERVER_LIMIT) && json_field_i64(&w, "httpConnections", HTTP_CONNECTION_LIMIT) && json_field_i64(&w,
+            "httpHeaderBytes", HTTP_HEADER_LIMIT) && json_field_i64(&w, "httpHeaderCount", HTTP_HEADER_COUNT) && json_field_i64(&w,
+            "httpBodyBytes", HTTP_BODY_LIMIT) && json_field_i64(&w, "httpUrlBytes", HTTP_URL_LIMIT) && json_field_i64(&w,
+            "httpWireOverheadBytes", HTTP_WIRE_OVERHEAD_LIMIT) && json_field_i64(&w, "bufferBytes", BUFFER_LIMIT) && json_field_i64(&w,
+            "bufferTextUnits", BUFFER_TEXT_LIMIT) && json_field_i64(&w, "bufferConcatParts", BUFFER_PART_LIMIT) && json_field_i64(&w,
+            "eventListeners", EVENT_LISTENER_LIMIT) && json_field_i64(&w, "streamQueueBytes", STREAM_BYTE_LIMIT) && json_field_i64(&w,
+            "streamQueueChunks", STREAM_CHUNK_LIMIT) && json_field_i64(&w, "streamHighWaterMark", STREAM_HIGH_WATER_MARK) && json_field_i64(&w,
+            "fileStreams", FILE_STREAM_LIMIT) && json_field_i64(&w, "httpClients", CLIENT_LIMIT) && json_field_i64(&w,
+            "httpRequestBytes", HTTP_REQUEST_LIMIT) && json_field_bool(&w, "sandbox", false) && json_field_bool(&w,
+            "heapBounded", false) && json_end_object(&w) && json_key(&w, "features") && json_begin_array(&w) && json_write_str(&w,
+            "console") && json_write_str(&w, "timers") && json_write_str(&w, "queueMicrotask") && json_write_str(&w,
+            "process") && json_write_str(&w, "fsSyncUtf8") && json_write_str(&w, "commonjs") && json_write_str(&w,
+            "fsPromises") && json_write_str(&w, "unhandledRejections") && json_write_str(&w, "httpServer") && json_write_str(&w,
+            "buffer") && json_write_str(&w, "fsBinary") && json_write_str(&w, "events") && json_write_str(&w,
+            "byteStreams") && json_write_str(&w, "fileStreams") && json_write_str(&w, "streamUtilities") && json_write_str(&w,
+            "httpStreams") && json_write_str(&w, "httpClient") && json_write_str(&w, "fetch") && json_write_str(&w,
+            "abortSignals") && json_write_str(&w, "networkTimeouts") && json_write_str(&w, "streamingUpload") && json_write_str(&w,
+            "utilityModules") && json_write_str(&w, "packageMaps") && json_write_str(&w, "crypto") && json_write_str(&w,
+            "url") && json_write_str(&w, "httpKeepAlive") && json_write_str(&w, "packageInstall") && json_write_str(&w,
+            "childProcesses") && json_write_str(&w, "nativeAddonsSubset") && json_write_str(&w,
+            "headersSubset") && json_write_str(&w, "testFiles") && json_write_str(&w, "fsDirents") &&
+            json_write_str(&w, "fileHandlesSubset") && json_write_str(&w, "transformStreams") &&
+            json_write_str(&w, "objectStreams") && json_write_str(&w, "utf8TextCodecs") &&
+            json_write_str(&w, "eventTargetSubset") && json_write_str(&w, "webStreamsSubset") &&
+            json_write_str(&w, "webReadableAdapters") && json_write_str(&w, "jsonReviverSource");
+        if (ok && worker_engine_available()) {
+            ok = json_write_str(&w, "workerThreadsSubset");
+        }
+        if (ok && clone_engine_available()) {
+            ok = json_write_str(&w, "structuredCloneSubset");
+        }
+        ok = ok && json_end_array(&w) && json_end_object(&w);
+    }
+    var text: str = json_writer_finish(&w);
+    if (!ok || json_str_is_null(text)) {
+        json_writer_free(&w);
+        return 1;
+    }
+    var length: i64 = json_writer_len(&w);
+    ok = io_write_all(1, text as ptr<u8>, length) == length;
+    json_writer_free(&w);
+    if (ok) {
+        ok = io_write_all(1, "\n" as ptr<u8>, 1) == 1;
+    }
+    if (!ok) {
+        return 1;
+    }
+    return 0;
+}

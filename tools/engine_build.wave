@@ -1,0 +1,177 @@
+// Build the bounded private-API adapter together with its matching JSC source.
+// This creates a candidate engine only; build/test still gate runtime publication.
+import("./support")::{run, join, concat, absolute, env, executable, ensure_directory, private_directory,
+    cleanup};
+import("std::fs::file")::{Metadata, metadata, write};
+import("std::mem::cstr")::{mem_len_cstr};
+
+const SOURCE: str = "target/engine-source/webkitgtk-2.54.1";
+const BUILD: str = "target/engine-build/jsc-2.54.1";
+const ARCHIVE: str = "target/engine-source/webkitgtk-2.54.1.tar.xz";
+const MARKER: str = "target/engine-source/webkitgtk-2.54.1/.jsrt-module-api-v1";
+const OUTPUT_MARKER: str = "target/engine-source/webkitgtk-2.54.1/.jsrt-module-output-v1";
+const SYNTHETIC_MARKER: str = "target/engine-source/webkitgtk-2.54.1/.jsrt-synthetic-modules-v1";
+
+fun exists(path: str) -> bool {
+    var info: Metadata;
+    return metadata(path, &info) == 0;
+}
+
+fun prepare_synthetic() -> i32 {
+    if (exists(SYNTHETIC_MARKER)) {
+        // A marker alone must not reuse stale layouts after an adapter update.
+        var verify: array<str, 10> = ["patch", "--batch", "--reverse", "--dry-run", "--fuzz=0", "-d", SOURCE,
+            "-p1", "-i", absolute("native/engine/synthetic-modules.patch") as str];
+        var checked: i32 = run(&verify[0], 10);
+        if (checked != 0) {
+            println("Engine source does not match the current synthetic module patch; preserving the source cache");
+        }
+        return checked;
+    }
+    var patch: array<str, 9> = ["patch", "--batch", "--forward", "--fuzz=0", "-d", SOURCE, "-p1", "-i",
+        absolute("native/engine/synthetic-modules.patch") as str];
+    var result: i32 = run(&patch[0], 9);
+    if (result != 0) {
+        return result;
+    }
+    var marker: str = "jsrt synthetic module handoff v1\n";
+    if (write(SYNTHETIC_MARKER, marker as ptr<u8>, mem_len_cstr(marker)) < 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fun prepare_output() -> i32 {
+    if (exists(OUTPUT_MARKER)) {
+        return prepare_synthetic();
+    }
+    var patch: array<str, 9> = ["patch", "--batch", "--forward", "--fuzz=0", "-d", SOURCE, "-p1", "-i",
+        absolute("native/engine/module-output.patch") as str];
+    var result: i32 = run(&patch[0], 9);
+    if (result != 0) {
+        return result;
+    }
+    var marker: str = "jsrt isolated engine output v1\n";
+    if (write(OUTPUT_MARKER, marker as ptr<u8>, mem_len_cstr(marker)) < 0) {
+        return 1;
+    }
+    return prepare_synthetic();
+}
+
+fun prepare_source() -> i32 {
+    if (!ensure_directory("target") || !ensure_directory("target/engine-source") || !ensure_directory("target/engine-build")) {
+        return 1;
+    }
+    if (exists(MARKER)) {
+        return prepare_output();
+    }
+    if (!exists(ARCHIVE)) {
+        var download: array<str, 8> = ["curl", "--fail", "--location", "--max-time", "300",
+            "https://webkitgtk.org/releases/webkitgtk-2.54.1.tar.xz", "--output", ARCHIVE];
+        var result: i32 = run(&download[0], 8);
+        if (result != 0) {
+            return result;
+        }
+    }
+    var verify: array<str, 3> = ["sha256sum", "--check", "native/engine/webkitgtk-2.54.1.sha256"];
+    var result: i32 = run(&verify[0], 3);
+    if (result != 0) {
+        return result;
+    }
+    if (exists(SOURCE)) {
+        println("Unmarked engine source exists; preserve it and inspect before retrying: {}", SOURCE);
+        return 1;
+    }
+    var extract: array<str, 5> = ["tar", "-xf", ARCHIVE, "-C", "target/engine-source"];
+    result = run(&extract[0], 5);
+    if (result != 0) {
+        return result;
+    }
+    var patch: array<str, 9> = ["patch", "--batch", "--forward", "--fuzz=0", "-d", SOURCE, "-p1", "-i",
+        absolute("native/engine/webkitgtk-2.54.1.patch") as str];
+    result = run(&patch[0], 9);
+    if (result != 0) {
+        return result;
+    }
+    var marker: str = "jsrt module ABI v1 / WebKitGTK 2.54.1\n";
+    if (write(MARKER, marker as ptr<u8>, mem_len_cstr(marker)) < 0) {
+        return 1;
+    }
+    return prepare_output();
+}
+
+fun run_with_local_tools(arguments: ptr<str>, count: i64) -> i32 {
+    if (!exists("target/engine-build-tools/root/usr/bin/ruby3.3")) {
+        return run(arguments, count);
+    }
+    var libraries: str = absolute("target/engine-build-tools/root/usr/lib/x86_64-linux-gnu") as str;
+    var ruby: str = absolute("target/engine-build-tools/root/usr/lib/ruby/3.3.0") as str;
+    ruby = concat(concat(ruby, ":") as str,
+        absolute("target/engine-build-tools/root/usr/lib/x86_64-linux-gnu/ruby/3.3.0") as str) as str;
+    var inherited: str = env("LD_LIBRARY_PATH", "") as str;
+    if (mem_len_cstr(inherited) > 0) {
+        libraries = concat(concat(libraries, ":") as str, inherited) as str;
+    }
+    var command: array<str, 64>;
+    command[0] = "env";
+    command[1] = concat("LD_LIBRARY_PATH=", libraries) as str;
+    command[2] = concat("RUBYLIB=", ruby) as str;
+    if (count > 61) {
+        return 1;
+    }
+    for (var i: i64 = 0; i < count; i++) {
+        command[i + 3] = arguments[i];
+    }
+    return run(&command[0], count + 3);
+}
+
+pub fun build_engine() -> i32 {
+    var result: i32 = prepare_source();
+    if (result != 0) {
+        return result;
+    }
+    if (!ensure_directory("target/engines/jsc-module-2.54.1")) {
+        return 1;
+    }
+    var output: ptr<u8> = private_directory("target/engines/jsc-module-2.54.1", "candidate-");
+    if (output == null) {
+        return 1;
+    }
+    var configure: array<str, 28> = ["cmake", "-S", SOURCE, "-B", BUILD, "-G", "Ninja", "-DPORT=JSCOnly",
+        "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_CXX_FLAGS_RELEASE=-O1 -DNDEBUG", "-DCMAKE_C_FLAGS_RELEASE=-O1 -DNDEBUG",
+        "-DENABLE_JIT=ON", "-DENABLE_DFG_JIT=ON", "-DENABLE_FTL_JIT=OFF", "-DENABLE_WEBASSEMBLY=OFF",
+        "-DUSE_SYSTEM_MALLOC=ON", "-DENABLE_TOOLS=OFF", "-DENABLE_API_TESTS=OFF", "", "", "", "", "", "", "", "", "", ""];
+    var count: i64 = 18;
+    configure[count] = concat("-DJSRT_MODULE_OUTPUT_DIRECTORY=", absolute(output as str) as str) as str;
+    count += 1;
+    if (exists("target/engine-build-tools/root/usr/bin/ruby3.3")) {
+        configure[count] = concat("-DRUBY_EXECUTABLE=",
+            absolute("target/engine-build-tools/root/usr/bin/ruby3.3") as str) as str;
+        count += 1;
+    }
+    if (exists("target/engine-build-tools/root/usr/include/unicode/utypes.h")) {
+        configure[count] = concat("-DICU_INCLUDE_DIR=",
+            absolute("target/engine-build-tools/root/usr/include") as str) as str;
+        count += 1;
+        configure[count] = "-DICU_DATA_LIBRARY_RELEASE=/usr/lib/x86_64-linux-gnu/libicudata.so.78";
+        count += 1;
+        configure[count] = "-DICU_I18N_LIBRARY_RELEASE=/usr/lib/x86_64-linux-gnu/libicui18n.so.78";
+        count += 1;
+        configure[count] = "-DICU_UC_LIBRARY_RELEASE=/usr/lib/x86_64-linux-gnu/libicuuc.so.78";
+        count += 1;
+    }
+    result = run_with_local_tools(&configure[0], count);
+    if (result != 0) {
+        cleanup(output as str);
+        return result;
+    }
+    var build: array<str, 7> = ["cmake", "--build", BUILD, "--target", "JavaScriptCore", "--parallel", "2"];
+    result = run_with_local_tools(&build[0], 7);
+    if (result == 0) {
+        println("Candidate engine: {}/libJavaScriptCore.so", output as str);
+        println("Validate using --engine-library; this command does not publish a runtime");
+    } else {
+        cleanup(output as str);
+    }
+    return result;
+}

@@ -1,0 +1,275 @@
+// wjson parsing, JS value conversion and reviver traversal.
+import("./json_support")::{callable, error, call, is_array, length_of, own_keys, data_property, intrinsic, DEPTH_LIMIT,
+    ITEM_LIMIT};
+import("wjson")::{Json, JsonDoc, JsonError, JSON_STRICT, JSON_NULL, JSON_BOOL, JSON_NUMBER, JSON_STRING,
+    JSON_ARRAY, json_parse_bytes, json_ok, json_error, json_root, json_free, json_node_count, json_type,
+    json_len, json_at, json_key_at_bytes, json_get_bytes, json_as_bytes, json_as_bool, json_as_f64_checked};
+import("./wjson_text")::{JsonText, encode_json_text, free_json_text, decode_json_text};
+import("./json_source")::{source_metadata};
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_type") fun wr_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_undefined") fun wr_undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun wr_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_boolean") fun wr_boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_number") fun wr_number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_string_value") fun wr_string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_to_string") fun wr_to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun wr_protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_object") fun wr_object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_array") fun wr_array(ctx: ptr<u8>, length: i64, values: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_get_prototype") fun wr_get_prototype(ctx: ptr<u8>, object: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun wr_set_prototype(ctx: ptr<u8>, object: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_get") fun wr_get(ctx: ptr<u8>, obj: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set") fun wr_set(ctx: ptr<u8>, obj: ptr<u8>, key: ptr<u8>, value: ptr<u8>, flags: u32,
+    ex: ptr<ptr<u8>>);
+extern(c, "wr_delete") fun wr_delete(ctx: ptr<u8>, obj: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> bool;
+extern(c, "wr_get_index") fun wr_get_index(ctx: ptr<u8>, obj: ptr<u8>, index: u32, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set_index") fun wr_set_index(ctx: ptr<u8>, obj: ptr<u8>, index: u32, value: ptr<u8>, ex: ptr<ptr<u8>>);
+
+pub fun from_json(ctx: ptr<u8>, node: Json, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var kind: i32 = json_type(node);
+    if (kind == JSON_NULL) {
+        return wr_null(ctx);
+    }
+    if (kind == JSON_BOOL) {
+        var b: bool = false;
+        json_as_bool(node, &b);
+        return wr_boolean(ctx, b);
+    }
+    if (kind == JSON_NUMBER) {
+        var n: f64 = 0.0;
+        json_as_f64_checked(node, &n);
+        return wr_number(ctx, n);
+    }
+    if (kind == JSON_STRING) {
+        var length: i64 = 0;
+        var data: ptr<u8> = json_as_bytes(node, &length);
+        var text: ptr<u8> = decode_json_text(data, length, false);
+        if (text == null) {
+            error(ctx, ex, 2, "cannot allocate wjson string");
+            return null;
+        }
+        var result: ptr<u8> = wr_string_value(ctx, text);
+        wr_string_release(text);
+        return result;
+    }
+    var object: ptr<u8> = null;
+    if (kind == JSON_ARRAY) {
+        object = wr_array(ctx, 0, null, ex);
+    } else {
+        object = wr_object(ctx, null, null);
+    }
+    if (object == null || deref ex != null) {
+        return null;
+    }
+    wr_protect(ctx, object);
+    var prototype: ptr<u8> = wr_get_prototype(ctx, object);
+    wr_protect(ctx, prototype);
+    // JSON parsing creates own data properties, including __proto__, without
+    // invoking setters that user code may have added to either prototype.
+    wr_set_prototype(ctx, object, wr_null(ctx));
+    var count: i64 = json_len(node);
+    if (kind == JSON_ARRAY) {
+        for (var i: i64 = 0; i < count && deref ex == null; i++) {
+            var child: ptr<u8> = from_json(ctx, json_at(node, i), ex);
+            if (deref ex == null) {
+                wr_set_index(ctx, object, i as u32, child, ex);
+            }
+        }
+    } else {
+        // Establish first-occurrence insertion order before filling values.
+        // Fill backwards so aliases/duplicates materialize the final subtree
+        // once, rather than repeatedly converting a large duplicate value.
+        for (var i: i64 = 0; i < count && deref ex == null; i++) {
+            var size: i64 = 0;
+            var bytes: ptr<u8> = json_key_at_bytes(node, i, &size);
+            var key: ptr<u8> = decode_json_text(bytes, size, false);
+            if (key == null) {
+                error(ctx, ex, 2, "cannot allocate wjson key");
+                break;
+            }
+            wr_set(ctx, object, key, wr_undefined(ctx), 0, ex);
+            wr_string_release(key);
+        }
+        for (var i: i64 = count; i > 0 && deref ex == null; i--) {
+            var size: i64 = 0;
+            var bytes: ptr<u8> = json_key_at_bytes(node, i - 1, &size);
+            var key: ptr<u8> = decode_json_text(bytes, size, false);
+            if (key == null) {
+                error(ctx, ex, 2, "cannot allocate wjson key");
+                break;
+            }
+            var previous: ptr<u8> = wr_get(ctx, object, key, ex);
+            if (deref ex == null && wr_type(ctx, previous) == 0) {
+                var child: ptr<u8> = from_json(ctx, json_get_bytes(node, bytes, size), ex);
+                if (deref ex == null) {
+                    wr_set(ctx, object, key, child, 0, ex);
+                }
+            }
+            wr_string_release(key);
+        }
+    }
+    wr_set_prototype(ctx, object, prototype);
+    wr_unprotect(ctx, prototype);
+    wr_unprotect(ctx, object);
+    return object;
+}
+
+pub fun revive(ctx: ptr<u8>, holder: ptr<u8>, key: ptr<u8>, fn: ptr<u8>, meta: ptr<u8>, depth: i64, budget: ptr<i64>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (depth > DEPTH_LIMIT || deref budget <= 0) {
+        error(ctx, ex, 2, "wjson reviver traversal limit exceeded");
+        return null;
+    }
+    deref budget = deref budget - 1;
+    var value: ptr<u8> = wr_get(ctx, holder, key, ex);
+    if (deref ex != null) {
+        return null;
+    }
+    wr_protect(ctx, value);
+    var matches: bool = false;
+    var children: ptr<u8> = wr_undefined(ctx);
+    if (wr_type(ctx, meta) == 5) {
+        var field: ptr<u8> = wr_string_utf8("value");
+        var original: ptr<u8> = wr_get(ctx, meta, field, ex);
+        wr_string_release(field);
+        var equality: array<ptr<u8>, 2> = [value, original];
+        matches = truth(ctx, call(ctx, deref intrinsic(ctx, 12), wr_undefined(ctx), &equality[0], 2, ex));
+        if (matches && wr_type(ctx, value) == 5) {
+            field = wr_string_utf8("children");
+            children = wr_get(ctx, meta, field, ex);
+            wr_string_release(field);
+        }
+    }
+    if (wr_type(ctx, value) == 5) {
+        var array: bool = is_array(ctx, value, ex);
+        var keys: ptr<u8> = null;
+        var count: i64 = 0;
+        if (deref ex == null && array) {
+            count = length_of(ctx, value, ex);
+        } else if (deref ex == null) {
+            keys = own_keys(ctx, value, ex);
+            if (deref ex == null) {
+                wr_protect(ctx, keys);
+                count = length_of(ctx, keys, ex);
+            }
+        }
+        for (var i: i64 = 0; i < count && deref ex == null; i++) {
+            var name: ptr<u8> = null;
+            if (array) {
+                name = wr_to_string(ctx, wr_number(ctx, i as f64), ex);
+            } else {
+                name = wr_to_string(ctx, wr_get_index(ctx, keys, i as u32, ex), ex);
+            }
+            if (deref ex != null) {
+                break;
+            }
+            var child_meta: ptr<u8> = wr_undefined(ctx);
+            if (wr_type(ctx, children) == 5) {
+                child_meta = wr_get(ctx, children, name, ex);
+            }
+            var child: ptr<u8> = revive(ctx, value, name, fn, child_meta, depth + 1, budget, ex);
+            if (deref ex == null) {
+                if (wr_type(ctx, child) == 0) {
+                    wr_delete(ctx, value, name, ex);
+                } else {
+                    data_property(ctx, value, name, child, ex);
+                }
+            }
+            wr_string_release(name);
+        }
+        if (keys != null) {
+            wr_unprotect(ctx, keys);
+        }
+    }
+    var result: ptr<u8> = null;
+    if (deref ex == null) {
+        var context: ptr<u8> = wr_object(ctx, null, null);
+        wr_protect(ctx, context);
+        if (matches && wr_type(ctx, value) != 5) {
+            var source_key: ptr<u8> = wr_string_utf8("source");
+            var source: ptr<u8> = wr_get(ctx, meta, source_key, ex);
+            data_property(ctx, context, source_key, source, ex);
+            wr_string_release(source_key);
+        }
+        var args: array<ptr<u8>, 3> = [wr_string_value(ctx, key), value, context];
+        result = call(ctx, fn, holder, &args[0], 3, ex);
+        wr_unprotect(ctx, context);
+    }
+    wr_unprotect(ctx, value);
+    return result;
+}
+
+pub fun parse_json(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var input_value: ptr<u8> = wr_undefined(ctx);
+    if (count > 0) {
+        input_value = args[0];
+    }
+    var original: ptr<u8> = wr_to_string(ctx, input_value, ex);
+    if (original == null || deref ex != null) {
+        return wr_undefined(ctx);
+    }
+    input_value = wr_string_value(ctx, original);
+    wr_string_release(original);
+    wr_protect(ctx, input_value);
+    var text: JsonText = encode_json_text(ctx, input_value, true, ex);
+    if (text.data == null) {
+        error(ctx, ex, 2, "wjson input exceeds 4 Mi UTF-16 units or allocation failed");
+        wr_unprotect(ctx, input_value);
+        return wr_undefined(ctx);
+    }
+    // wjson accepts a file BOM; ECMAScript JSON.parse must reject it.
+    if (text.len >= 3 && text.data[0] == 239 && text.data[1] == 187 && text.data[2] == 191) {
+        free_json_text(text);
+        error(ctx, ex, 1, "unexpected BOM in JSON text");
+        wr_unprotect(ctx, input_value);
+        return wr_undefined(ctx);
+    }
+    var doc: JsonDoc = json_parse_bytes(text.data, text.len, DEPTH_LIMIT as i32, JSON_STRICT);
+    free_json_text(text);
+    if (!json_ok(doc)) {
+        var detail: JsonError = json_error(doc);
+        var category: i32 = 1;
+        if (detail.code == 11 || detail.code == 12) {
+            category = 2;
+        }
+        error(ctx, ex, category, detail.message);
+        json_free(&doc);
+        wr_unprotect(ctx, input_value);
+        return wr_undefined(ctx);
+    }
+    if (json_node_count(doc) > ITEM_LIMIT) {
+        error(ctx, ex, 2, "wjson node limit exceeded (131072)");
+        json_free(&doc);
+        wr_unprotect(ctx, input_value);
+        return wr_undefined(ctx);
+    }
+    var result: ptr<u8> = from_json(ctx, json_root(doc), ex);
+    json_free(&doc);
+    if (deref ex == null && count > 1 && callable(ctx, args[1])) {
+        wr_protect(ctx, result);
+        var meta: ptr<u8> = source_metadata(ctx, input_value, result, ex);
+        wr_protect(ctx, meta);
+        var holder: ptr<u8> = wr_object(ctx, null, null);
+        wr_protect(ctx, holder);
+        var key: ptr<u8> = wr_string_utf8("");
+        data_property(ctx, holder, key, result, ex);
+        wr_unprotect(ctx, result);
+        var budget: i64 = ITEM_LIMIT;
+        if (deref ex == null) {
+            result = revive(ctx, holder, key, args[1], meta, 0, &budget, ex);
+        }
+        wr_string_release(key);
+        wr_unprotect(ctx, holder);
+        wr_unprotect(ctx, meta);
+    }
+    wr_unprotect(ctx, input_value);
+    if (deref ex != null) {
+        return wr_undefined(ctx);
+    }
+    return result;
+}

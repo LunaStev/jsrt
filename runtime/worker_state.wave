@@ -1,0 +1,185 @@
+// Shared links contain native snapshots and a retained VM group, never JS values.
+// Context state and every JS root are private to their owning thread.
+import("./clone")::{CloneGraph, free_clone};
+import("./config")::{WORKER_LIMIT, WORKER_MESSAGE_LIMIT};
+import("./context_state")::{context_slot};
+import("std::mem::alloc")::{mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+extern(c, "pthread_mutex_init") fun mutex_init(mutex: ptr<u8>, attr: ptr<u8>) -> i32;
+extern(c, "pthread_mutex_destroy") fun mutex_destroy(mutex: ptr<u8>) -> i32;
+extern(c, "pthread_mutex_lock") fun native_lock(mutex: ptr<u8>) -> i32;
+extern(c, "pthread_mutex_unlock") fun native_unlock(mutex: ptr<u8>) -> i32;
+extern(c, "jsrt_mutex_size") fun mutex_size() -> i64;
+extern(c, "jsrt_request_worker_termination") fun request_termination(group: ptr<u8>);
+extern(c, "JSContextGroupRelease") fun release_group(group: ptr<u8>);
+pub const SLOT: i64 = 34;
+pub const PATH_CAP: i64 = 8192;
+pub const ERROR_UNITS: i64 = 8192;
+pub fun lock(mutex: ptr<u8>) {
+    native_lock(mutex);
+}
+pub fun unlock(mutex: ptr<u8>) {
+    native_unlock(mutex);
+}
+pub struct Message {
+    graph: ptr<CloneGraph>;
+    sequence: i64;
+    state: i32;
+    // 0 free, 1 reserved before sender getters, 2 queued.
+}
+pub struct WorkerLink {
+    mutex: ptr<u8>;
+    thread: u64;
+    started: bool;
+    group: ptr<u8>;
+    stop: bool;
+    done: bool;
+    online: bool;
+    port_closed: bool;
+    failed: bool;
+    code: i32;
+    id: i64;
+    path: ptr<u8>;
+    source: ptr<CloneGraph>;
+    data: ptr<CloneGraph>;
+    incoming: array<Message, 16>;
+    outgoing: array<Message, 16>;
+    sequence: i64;
+    error: ptr<u16>;
+    error_length: i64;
+}
+pub struct WorkerSlot {
+    link: ptr<WorkerLink>;
+    owner: ptr<u8>;
+    resolve: ptr<u8>;
+    reserved: bool;
+    online: bool;
+}
+pub struct WorkerState {
+    api: ptr<u8>;
+    prototype: ptr<u8>;
+    records: ptr<u8>;
+    port: ptr<u8>;
+    keys: ptr<u8>;
+    post: ptr<u8>;
+    terminate: ptr<u8>;
+    close: ptr<u8>;
+    slots: ptr<WorkerSlot>;
+    parent: ptr<WorkerLink>;
+    next_id: i64;
+    port_closed: bool;
+}
+pub fun worker_state(ctx: ptr<u8>) -> ptr<WorkerState> {
+    return context_slot(ctx, SLOT) as ptr<WorkerState>;
+}
+pub fun new_link() -> ptr<WorkerLink> {
+    var link: ptr<WorkerLink> = mem_alloc_zeroed(size_of<WorkerLink>() as i64) as ptr<WorkerLink>;
+    if (link == null) {
+        return null;
+    }
+    deref link.mutex = mem_alloc_zeroed(mutex_size());
+    if (deref link.mutex == null) {
+        mem_free(link as ptr<u8>, size_of<WorkerLink>() as i64);
+        return null;
+    }
+    if (mutex_init(deref link.mutex, null) != 0) {
+        mem_free(deref link.mutex, mutex_size());
+        mem_free(link as ptr<u8>, size_of<WorkerLink>() as i64);
+        return null;
+    }
+    return link;
+}
+pub fun stopped(link: ptr<WorkerLink>) -> bool {
+    lock(deref link.mutex);
+    var stop: bool = deref link.stop;
+    unlock(deref link.mutex);
+    return stop;
+}
+pub fun stop_link(link: ptr<WorkerLink>) {
+    lock(deref link.mutex);
+    deref link.stop = true;
+    if (deref link.group != null && !deref link.done) {
+        request_termination(deref link.group);
+    }
+    unlock(deref link.mutex);
+}
+pub fun reserve_message(link: ptr<WorkerLink>, outgoing: bool) -> ptr<Message> {
+    lock(deref link.mutex);
+    var result: ptr<Message> = null;
+    if (!deref link.stop && !deref link.done && !deref link.port_closed) {
+        var messages: ptr<Message> = &(deref link.incoming)[0];
+        if (outgoing) {
+            messages = &(deref link.outgoing)[0];
+        }
+        for (var i: i64 = 0; i < WORKER_MESSAGE_LIMIT; i++) {
+            var entry: ptr<Message> = messages + i;
+            if (deref entry.state == 0) {
+                deref entry.state = 1;
+                result = entry;
+                break;
+            }
+        }
+    }
+    unlock(deref link.mutex);
+    return result;
+}
+pub fun publish_message(link: ptr<WorkerLink>, entry: ptr<Message>, graph: ptr<CloneGraph>) -> bool {
+    lock(deref link.mutex);
+    var valid: bool = graph != null && !deref link.stop && !deref link.done && !deref link.port_closed;
+    if (valid) {
+        deref entry.graph = graph;
+        deref entry.sequence = deref link.sequence;
+        deref link.sequence += 1;
+        deref entry.state = 2;
+    } else {
+        deref entry.state = 0;
+    }
+    unlock(deref link.mutex);
+    return valid;
+}
+pub fun pop_message(link: ptr<WorkerLink>, outgoing: bool) -> ptr<CloneGraph> {
+    lock(deref link.mutex);
+    var messages: ptr<Message> = &(deref link.incoming)[0];
+    if (outgoing) {
+        messages = &(deref link.outgoing)[0];
+    }
+    var selected: ptr<Message> = null;
+    for (var i: i64 = 0; i < WORKER_MESSAGE_LIMIT; i++) {
+        var entry: ptr<Message> = messages + i;
+        if (deref entry.state == 2 && (selected == null || deref entry.sequence < deref selected.sequence)) {
+            selected = entry;
+        }
+    }
+    var result: ptr<CloneGraph> = null;
+    if (selected != null) {
+        result = deref selected.graph;
+        deref selected.graph = null;
+        deref selected.state = 0;
+    }
+    unlock(deref link.mutex);
+    return result;
+}
+// Call only after joining the owner, or before any thread was started.
+pub fun free_link(link: ptr<WorkerLink>) {
+    if (link == null) {
+        return;
+    }
+    for (var i: i64 = 0; i < WORKER_MESSAGE_LIMIT; i++) {
+        free_clone((deref link.incoming)[i].graph);
+        free_clone((deref link.outgoing)[i].graph);
+    }
+    free_clone(deref link.source);
+    free_clone(deref link.data);
+    if (deref link.path != null) {
+        mem_free(deref link.path, PATH_CAP);
+    }
+    if (deref link.error != null) {
+        mem_free(deref link.error as ptr<u8>, ERROR_UNITS * 2);
+    }
+    if (deref link.group != null) {
+        release_group(deref link.group);
+    }
+    mutex_destroy(deref link.mutex);
+    mem_free(deref link.mutex, mutex_size());
+    mem_free(link as ptr<u8>, size_of<WorkerLink>() as i64);
+}

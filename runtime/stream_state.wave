@@ -1,0 +1,252 @@
+import("./context_state")::{owned_context_slot, active_context};
+import("std::mem::layout")::{size_of};
+pub const STREAM_METHOD_COUNT: i64 = 34;
+pub const STREAM_CLASS_COUNT: i64 = 5;
+pub const STREAM_DUPLEX_CLASS: i64 = 4;
+pub const STREAM_CORK_METHOD: i64 = 29;
+pub const STREAM_UNCORK_METHOD: i64 = 30;
+pub const STREAM_CORKED_GETTER: i64 = 31;
+pub const STREAM_ABORT_METHOD: i64 = 32;
+pub const STREAM_INSTANCE_METHOD: i64 = 33;
+pub struct StreamHostState {
+    stream_constructors: array<ptr<u8>, 5>;
+    stream_prototypes: array<ptr<u8>, 5>;
+    stream_methods: array<ptr<u8>, 34>;
+    stream_exports: ptr<u8>;
+    stream_states: ptr<u8>;
+    is_prototype_of: ptr<u8>;
+}
+
+pub fun stream_state_storage(ctx: ptr<u8>) -> ptr<StreamHostState> {
+    return owned_context_slot(ctx, 21, size_of<StreamHostState>() as i64) as ptr<StreamHostState>;
+}
+
+// Private stream state stays in the engine's GC graph, never in a native registry.
+import("./values")::{get, put, plain, define, fail};
+import("./abort")::{unsubscribe_abort};
+import("./collections")::{weak_map, weak_get, weak_set, list, integer, set_integer, flag, set_flag};
+import("./buffer")::{copy_buffer_input, buffer_integer};
+import("./buffer_core")::{is_byte_view, byte_view_length};
+import("./stream_text")::{text_length};
+import("./config")::{STREAM_BYTE_LIMIT, STREAM_HIGH_WATER_MARK, STREAM_OBJECT_HIGH_WATER_MARK};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+
+pub fun is_stream(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var host_state: ptr<StreamHostState> = stream_state_storage(ctx);
+    return kind(ctx, value) == 5 && kind(ctx, weak_get(ctx, (deref host_state.stream_states), value,
+        ex)) == 5;
+}
+
+pub fun initialize_stream_state(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var host_state: ptr<StreamHostState> = stream_state_storage(ctx);
+    (deref host_state.stream_states) = weak_map(ctx, ex);
+    protect(ctx, (deref host_state.stream_states));
+    return deref ex == null;
+}
+
+pub fun stream_state(ctx: ptr<u8>, receiver: ptr<u8>, capability: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<StreamHostState> = stream_state_storage(ctx);
+    if (kind(ctx, receiver) != 5) {
+        fail(ctx, ex, 1, "invalid stream receiver");
+        return null;
+    }
+    var state: ptr<u8> = weak_get(ctx, (deref host_state.stream_states), receiver, ex);
+    if (deref ex != null) {
+        return null;
+    }
+    if (kind(ctx, state) != 5) {
+        fail(ctx, ex, 1, "invalid stream receiver");
+        return null;
+    }
+    if ((integer(ctx, state, "type", ex) & capability) != capability) {
+        fail(ctx, ex, 1, "stream lacks requested capability");
+        return null;
+    }
+    return state;
+}
+
+pub fun new_stream_state(ctx: ptr<u8>, receiver: ptr<u8>, category: i64, options: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var host_state: ptr<StreamHostState> = stream_state_storage(ctx);
+    var high: i64 = STREAM_HIGH_WATER_MARK;
+    var readable_mode: bool = false;
+    var writable_mode: bool = false;
+    var read_high: i64 = -1;
+    var write_high: i64 = -1;
+    var read_hook: ptr<u8> = undefined(ctx);
+    var write_hook: ptr<u8> = undefined(ctx);
+    if (options != null && kind(ctx, options) != 0 && kind(ctx, options) != 1) {
+        if (kind(ctx, options) != 5) {
+            fail(ctx, ex, 1, "stream options must be an object");
+            return null;
+        }
+        var mode: bool = truth(ctx, get(ctx, options, "objectMode", ex));
+        readable_mode = truth(ctx, get(ctx, options, "readableObjectMode", ex)) || mode;
+        writable_mode = truth(ctx, get(ctx, options, "writableObjectMode", ex)) || mode;
+        var hwm: ptr<u8> = get(ctx, options, "highWaterMark", ex);
+        if (kind(ctx, hwm) != 0) {
+            high = buffer_integer(ctx, hwm, 0, STREAM_BYTE_LIMIT, ex);
+        }
+        read_high = high;
+        write_high = high;
+        if (kind(ctx, hwm) == 0 && readable_mode) {
+            read_high = STREAM_OBJECT_HIGH_WATER_MARK;
+        }
+        if (kind(ctx, hwm) == 0 && writable_mode) {
+            write_high = STREAM_OBJECT_HIGH_WATER_MARK;
+        }
+        if (category == 3) {
+            var side: ptr<u8> = get(ctx, options, "readableHighWaterMark", ex);
+            if (kind(ctx, side) != 0 && kind(ctx, hwm) == 0) {
+                read_high = buffer_integer(ctx, side, 0, STREAM_BYTE_LIMIT, ex);
+            }
+            side = get(ctx, options, "writableHighWaterMark", ex);
+            if (kind(ctx, side) != 0 && kind(ctx, hwm) == 0) {
+                write_high = buffer_integer(ctx, side, 0, STREAM_BYTE_LIMIT, ex);
+            }
+        }
+        read_hook = get(ctx, options, "read", ex);
+        protect(ctx, read_hook);
+        write_hook = get(ctx, options, "write", ex);
+        protect(ctx, write_hook);
+        if ((kind(ctx, read_hook) != 0 && (kind(ctx, read_hook) != 5 || !callable(ctx, read_hook))) || (kind(ctx,
+            write_hook) != 0 && (kind(ctx, write_hook) != 5 || !callable(ctx, write_hook)))) {
+            fail(ctx, ex, 1, "stream read/write hooks must be functions");
+        }
+        var final_hook: ptr<u8> = get(ctx, options, "final", ex);
+        protect(ctx, final_hook);
+        var destroy_hook: ptr<u8> = get(ctx, options, "destroy", ex);
+        protect(ctx, destroy_hook);
+        if (kind(ctx, final_hook) != 0 && (kind(ctx, final_hook) != 5 || !callable(ctx, final_hook))) {
+            fail(ctx, ex, 1, "final hook must be a function");
+        }
+        if (kind(ctx, destroy_hook) != 0 && (kind(ctx, destroy_hook) != 5 || !callable(ctx, destroy_hook))) {
+            fail(ctx, ex, 1, "destroy hook must be a function");
+        }
+        if (deref ex == null) {
+            if (kind(ctx, read_hook) != 0) {
+                define(ctx, receiver, "_read", read_hook, ex, false);
+            }
+            if (kind(ctx, write_hook) != 0) {
+                define(ctx, receiver, "_write", write_hook, ex, false);
+            }
+            if (kind(ctx, final_hook) != 0) {
+                define(ctx, receiver, "_final", final_hook, ex, false);
+            }
+            if (kind(ctx, destroy_hook) != 0) {
+                define(ctx, receiver, "_destroy", destroy_hook, ex, false);
+            }
+        }
+        unprotect(ctx, destroy_hook);
+        unprotect(ctx, final_hook);
+        unprotect(ctx, write_hook);
+        unprotect(ctx, read_hook);
+    }
+    if (deref ex != null) {
+        return null;
+    }
+    var state: ptr<u8> = plain(ctx);
+    protect(ctx, state);
+    set_integer(ctx, state, "type", category, ex);
+    set_integer(ctx, state, "high", high, ex);
+    if (read_high < 0) {
+        read_high = high;
+    }
+    if (write_high < 0) {
+        write_high = high;
+    }
+    set_integer(ctx, state, "readHigh", read_high, ex);
+    set_integer(ctx, state, "writeHigh", write_high, ex);
+    set_flag(ctx, state, "readableObjectMode", readable_mode, ex);
+    set_flag(ctx, state, "writableObjectMode", writable_mode, ex);
+    set_integer(ctx, state, "rbytes", 0, ex);
+    set_integer(ctx, state, "wbytes", 0, ex);
+    put(ctx, state, "reads", list(ctx, ex), ex);
+    put(ctx, state, "writes", list(ctx, ex), ex);
+    weak_set(ctx, (deref host_state.stream_states), receiver, state, ex);
+    unprotect(ctx, state);
+    return state;
+}
+
+pub fun stream_chunk(ctx: ptr<u8>, value: ptr<u8>, enc: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (kind(ctx, value) != 4 && !is_byte_view(ctx, value, ex)) {
+        fail(ctx, ex, 1, "stream chunks must be strings, Buffers or Uint8Arrays");
+        return null;
+    }
+    return copy_buffer_input(ctx, value, enc, ex);
+}
+
+pub fun stream_chunk_size(ctx: ptr<u8>, state: ptr<u8>, chunk: ptr<u8>, reading: bool,
+    ex: ptr<ptr<u8>>) -> i64 {
+    var key: str = "writableObjectMode";
+    if (reading) {
+        key = "readableObjectMode";
+    }
+    if (flag(ctx, state, key, ex)) {
+        return 1;
+    }
+    if (reading && flag(ctx, state, "utf8", ex)) {
+        return text_length(ctx, chunk, ex);
+    }
+    return byte_view_length(ctx, chunk, ex);
+}
+
+pub fun shutdown_stream_state(ctx: ptr<u8>) {
+    var host_state: ptr<StreamHostState> = stream_state_storage(ctx);
+    if (deref host_state.is_prototype_of != null) {
+        unprotect(ctx, deref host_state.is_prototype_of);
+        deref host_state.is_prototype_of = null;
+    }
+    for (var i: i64 = 0; i < STREAM_METHOD_COUNT; i++) {
+        if ((deref host_state.stream_methods)[i] != null) {
+            unprotect(ctx, (deref host_state.stream_methods)[i]);
+            (deref host_state.stream_methods)[i] = null;
+        }
+    }
+    for (var i: i64 = 0; i < STREAM_CLASS_COUNT; i++) {
+        if ((deref host_state.stream_prototypes)[i] != null) {
+            unprotect(ctx, (deref host_state.stream_prototypes)[i]);
+            (deref host_state.stream_prototypes)[i] = null;
+        }
+        if ((deref host_state.stream_constructors)[i] != null) {
+            unprotect(ctx, (deref host_state.stream_constructors)[i]);
+            (deref host_state.stream_constructors)[i] = null;
+        }
+    }
+    if ((deref host_state.stream_exports) != null) {
+        unprotect(ctx, (deref host_state.stream_exports));
+        (deref host_state.stream_exports) = null;
+    }
+    if ((deref host_state.stream_states) != null) {
+        unprotect(ctx, (deref host_state.stream_states));
+        (deref host_state.stream_states) = null;
+    }
+}
+
+pub fun detach_stream_signal(ctx: ptr<u8>, state: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var signal: ptr<u8> = get(ctx, state, "signal", ex);
+    if (kind(ctx, signal) != 5 || deref ex != null) {
+        return;
+    }
+    protect(ctx, signal);
+    var callback: ptr<u8> = get(ctx, state, "abortCallback", ex);
+    protect(ctx, callback);
+    put(ctx, state, "signal", undefined(ctx), ex);
+    put(ctx, state, "abortCallback", undefined(ctx), ex);
+    unsubscribe_abort(ctx, signal, callback, ex);
+    unprotect(ctx, callback);
+    unprotect(ctx, signal);
+}
+
+pub fun finish_stream_signal(ctx: ptr<u8>, state: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var category: i64 = integer(ctx, state, "type", ex);
+    if (((category & 1) == 0 || flag(ctx, state, "endEmitted", ex)) &&
+        ((category & 2) == 0 || flag(ctx, state, "finished", ex))) {
+        detach_stream_signal(ctx, state, ex);
+    }
+}
+

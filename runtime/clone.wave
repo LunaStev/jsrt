@@ -1,0 +1,399 @@
+// Native graph snapshots contain no JSC handles. Sender roots are temporary and
+// receiver values are rebuilt only by the receiver's owning thread.
+import("./config")::{CLONE_NODE_LIMIT, CLONE_BYTE_LIMIT, CLONE_DEPTH_LIMIT};
+import("./context_state")::{context_slot, allocate_context_slot, release_context_slot};
+import("./values")::{get, text, capture, define, define_key, fail};
+import("./collections")::{length, at};
+import("./buffer_core")::{copy_byte_view};
+import("std::mem::alloc")::{mem_alloc_zeroed, mem_alloc, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::mem::ops")::{mem_copy};
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_is_array") fun is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_is_date") fun is_date(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "jsrt_clone_proxy_status") fun proxy_status(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_to_number") fun numeric(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_to_string") fun string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_length") fun string_length(value: ptr<u8>) -> i64;
+extern(c, "wr_string_characters") fun characters(value: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_utf16") fun utf16(value: ptr<u16>, count: i64) -> ptr<u8>;
+extern(c, "wr_string_value") fun string_value(ctx: ptr<u8>, value: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_construct") fun construct(ctx: ptr<u8>, fn: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_get") fun property(ctx: ptr<u8>, value: ptr<u8>, name: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_set") fun set(ctx: ptr<u8>, value: ptr<u8>, name: ptr<u8>, content: ptr<u8>,
+    flags: u32, ex: ptr<ptr<u8>>);
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_typed_type") fun typed_type(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i32;
+extern(c, "wr_typed_length") fun typed_length(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64;
+extern(c, "wr_typed_bytes") fun typed_bytes(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_u8_new") fun new_u8(ctx: ptr<u8>, count: i64, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "jsrt_clone_callback") fun clone_callback() -> ptr<u8>;
+const SLOT: i64 = 33;
+const RECORD: i32 = 5;
+const ARRAY: i32 = 8;
+const BYTES: i32 = 9;
+const DATE: i32 = 10;
+const ROOT_COUNT: i64 = 8;
+struct CloneState {
+    roots: array<ptr<u8>, 8>;
+}
+pub struct CloneNode {
+    tag: i32;
+    value: f64;
+    bytes: ptr<u8>;
+    size: i64;
+    edges: ptr<i64>;
+    count: i64;
+}
+pub struct CloneGraph {
+    nodes: ptr<CloneNode>;
+    count: i64;
+    bytes: i64;
+}
+struct Walk {
+    graph: ptr<CloneGraph>;
+    refs: ptr<ptr<u8>>;
+}
+fun storage(ctx: ptr<u8>) -> ptr<CloneState> {
+    return context_slot(ctx, SLOT) as ptr<CloneState>;
+}
+pub fun clone_failure(ctx: ptr<u8>, ex: ptr<ptr<u8>>, message: str) {
+    if (deref ex != null) {
+        return;
+    }
+    fail(ctx, ex, 0, message);
+    protect(ctx, deref ex);
+    var nested: ptr<u8> = null;
+    define(ctx, deref ex, "name", text(ctx, "DataCloneError"), &nested, true);
+    unprotect(ctx, deref ex);
+}
+pub fun free_clone(graph: ptr<CloneGraph>) {
+    if (graph == null) {
+        return;
+    }
+    if (deref graph.nodes != null) {
+        for (var i: i64 = 0; i < deref graph.count; i++) {
+            var node: ptr<CloneNode> = deref graph.nodes + i;
+            if (deref node.bytes != null) {
+                var bytes: i64 = deref node.size;
+                if (deref node.tag != BYTES) {
+                    bytes = bytes * 2;
+                }
+                mem_free(deref node.bytes, bytes + 2);
+            }
+            if (deref node.edges != null) {
+                mem_free(deref node.edges as ptr<u8>, deref node.count * 16);
+            }
+        }
+        mem_free(deref graph.nodes as ptr<u8>, CLONE_NODE_LIMIT * (size_of<CloneNode>() as i64));
+    }
+    mem_free(graph as ptr<u8>, size_of<CloneGraph>() as i64);
+}
+fun payload(ctx: ptr<u8>, walk: ptr<Walk>, node: ptr<CloneNode>, bytes: i64,
+    ex: ptr<ptr<u8>>) -> bool {
+    var graph: ptr<CloneGraph> = deref walk.graph;
+    if (bytes < 0 || bytes > CLONE_BYTE_LIMIT - deref graph.bytes) {
+        clone_failure(ctx, ex, "clone byte limit exceeded");
+        return false;
+    }
+    deref node.bytes = mem_alloc(bytes + 2);
+    if (deref node.bytes == null) {
+        clone_failure(ctx, ex, "cannot allocate clone bytes");
+        return false;
+    }
+    deref graph.bytes += bytes;
+    return true;
+}
+fun visit(ctx: ptr<u8>, walk: ptr<Walk>, value: ptr<u8>, depth: i64,
+    ex: ptr<ptr<u8>>) -> i64 {
+    if (deref ex != null) {
+        return -1;
+    }
+    var graph: ptr<CloneGraph> = deref walk.graph;
+    var tag: i32 = kind(ctx, value);
+    if (tag == RECORD) {
+        for (var i: i64 = 0; i < deref graph.count; i++) {
+            if ((deref walk.refs)[i] != null && equal(ctx, (deref walk.refs)[i], value)) {
+                return i;
+            }
+        }
+    }
+    if (depth > CLONE_DEPTH_LIMIT || deref graph.count >= CLONE_NODE_LIMIT) {
+        clone_failure(ctx, ex, "clone graph limit exceeded");
+        return -1;
+    }
+    var index: i64 = deref graph.count;
+    deref graph.count += 1;
+    var node: ptr<CloneNode> = deref graph.nodes + index;
+    deref node.tag = tag;
+    (deref walk.refs)[index] = value;
+    protect(ctx, value);
+    if (tag == 0 || tag == 1) {
+        return index;
+    }
+    if (tag == 2) {
+        if (truth(ctx, value)) {
+            deref node.value = 1.0;
+        }
+    } else if (tag == 3) {
+        deref node.value = numeric(ctx, value, ex);
+    } else if (tag == 4 || tag == 7) {
+        var content: ptr<u8> = string(ctx, value, ex);
+        if (deref ex == null && content != null) {
+            deref node.size = string_length(content);
+            if (payload(ctx, walk, node, deref node.size * 2, ex)) {
+                mem_copy(deref node.bytes, characters(content) as ptr<u8>, deref node.size * 2);
+            }
+        }
+        if (content != null) {
+            release(content);
+        }
+    } else if (tag == RECORD && !callable(ctx, value)) {
+        visit_object(ctx, walk, node, value, depth, ex);
+    } else {
+        clone_failure(ctx, ex, "value is not supported by the clone subset");
+    }
+    return index;
+}
+fun visit_object(ctx: ptr<u8>, walk: ptr<Walk>, node: ptr<CloneNode>, value: ptr<u8>, depth: i64,
+    ex: ptr<ptr<u8>>) {
+    var state: ptr<CloneState> = storage(ctx);
+    var proxy: i32 = proxy_status(ctx, value);
+    if (proxy != 0) {
+        clone_failure(ctx, ex, "Proxy cloning is unsupported; object clones require the matching engine clone ABI");
+        return;
+    }
+    var view_kind: i32 = typed_type(ctx, value, ex);
+    if (deref ex != null) {
+        return;
+    }
+    // JSC's Uint8Array enum is 3; other views/backings are explicitly unsupported.
+    if (view_kind == 3) {
+        deref node.tag = BYTES;
+        deref node.size = typed_length(ctx, value, ex);
+        if (deref ex == null && payload(ctx, walk, node, deref node.size, ex)) {
+            copy_byte_view(ctx, value, deref node.bytes, deref node.size, ex);
+        }
+        return;
+    }
+    var arg: array<ptr<u8>, 1> = [value];
+    var parent: ptr<u8> = call(ctx, (deref state.roots)[1], null, 1, &arg[0], ex);
+    if (deref ex != null) {
+        return;
+    }
+    if (is_date(ctx, value)) {
+        deref node.tag = DATE;
+        var stamp: ptr<u8> = call(ctx, (deref state.roots)[6], value, 0, null, ex);
+        if (deref ex == null) {
+            deref node.value = numeric(ctx, stamp, ex);
+        }
+        return;
+    }
+    if (is_array(ctx, value)) {
+        deref node.tag = ARRAY;
+        deref node.value = numeric(ctx, get(ctx, value, "length", ex), ex);
+    } else if (!equal(ctx, parent, (deref state.roots)[2]) && kind(ctx, parent) != 1) {
+        clone_failure(ctx, ex, "only plain records arrays Date and Uint8Array objects can be cloned");
+        return;
+    }
+    if (deref ex != null) {
+        return;
+    }
+    var keys: ptr<u8> = call(ctx, (deref state.roots)[0], null, 1, &arg[0], ex);
+    if (deref ex != null) {
+        return;
+    }
+    protect(ctx, keys);
+    var count: i64 = length(ctx, keys, ex);
+    if (count > CLONE_NODE_LIMIT || count < 0) {
+        clone_failure(ctx, ex, "clone property limit exceeded");
+    } else if (count > 0 && deref ex == null) {
+        deref node.count = count;
+        deref node.edges = mem_alloc_zeroed(count * 16) as ptr<i64>;
+        if (deref node.edges == null) {
+            clone_failure(ctx, ex, "cannot allocate clone properties");
+        }
+        for (var i: i64 = 0; i < count && deref ex == null; i++) {
+            var key: ptr<u8> = at(ctx, keys, i, ex);
+            var key_index: i64 = visit(ctx, walk, key, depth + 1, ex);
+            if (deref ex != null) {
+                break;
+            }
+            var child: ptr<u8> = property(ctx, value, key, ex);
+            var child_index: i64 = visit(ctx, walk, child, depth + 1, ex);
+            if (deref ex == null) {
+                (deref node.edges)[i * 2] = key_index;
+                (deref node.edges)[i * 2 + 1] = child_index;
+            }
+        }
+    }
+    unprotect(ctx, keys);
+}
+pub fun snapshot_clone(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<CloneGraph> {
+    var graph: ptr<CloneGraph> = mem_alloc_zeroed(size_of<CloneGraph>() as i64) as ptr<CloneGraph>;
+    if (graph == null) {
+        clone_failure(ctx, ex, "cannot allocate clone graph");
+        return null;
+    }
+    deref graph.nodes = mem_alloc_zeroed(CLONE_NODE_LIMIT * (size_of<CloneNode>() as i64)) as ptr<CloneNode>;
+    var walk: Walk;
+    walk.graph = graph;
+    walk.refs = mem_alloc_zeroed(CLONE_NODE_LIMIT * 8) as ptr<ptr<u8>>;
+    if (deref graph.nodes == null || walk.refs == null) {
+        clone_failure(ctx, ex, "cannot allocate clone traversal");
+    } else {
+        visit(ctx, &walk, value, 0, ex);
+    }
+    if (walk.refs != null) {
+        for (var i: i64 = 0; i < deref graph.count; i++) {
+            if (walk.refs[i] != null) {
+                unprotect(ctx, walk.refs[i]);
+            }
+        }
+        mem_free(walk.refs as ptr<u8>, CLONE_NODE_LIMIT * 8);
+    }
+    if (deref ex != null) {
+        free_clone(graph);
+        return null;
+    }
+    return graph;
+}
+pub fun restore_clone(ctx: ptr<u8>, graph: ptr<CloneGraph>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var refs: ptr<ptr<u8>> = mem_alloc_zeroed(deref graph.count * 8) as ptr<ptr<u8>>;
+    if (refs == null) {
+        clone_failure(ctx, ex, "cannot allocate clone receiver");
+        return undefined(ctx);
+    }
+    var state: ptr<CloneState> = storage(ctx);
+    for (var i: i64 = 0; i < deref graph.count && deref ex == null; i++) {
+        var node: ptr<CloneNode> = deref graph.nodes + i;
+        var tag: i32 = deref node.tag;
+        var value: ptr<u8> = undefined(ctx);
+        if (tag == 1) {
+            value = js_null(ctx);
+        } else if (tag == 2) {
+            value = boolean(ctx, deref node.value != 0.0);
+        } else if (tag == 3) {
+            value = number(ctx, deref node.value);
+        } else if (tag == 4 || tag == 7) {
+            var content: ptr<u8> = utf16(deref node.bytes as ptr<u16>, deref node.size);
+            value = string_value(ctx, content);
+            release(content);
+            if (tag == 7) {
+                protect(ctx, value);
+                var arg: array<ptr<u8>, 1> = [value];
+                value = call(ctx, (deref state.roots)[4], null, 1, &arg[0], ex);
+                unprotect(ctx, arg[0]);
+            }
+        } else if (tag == RECORD) {
+            value = object(ctx, null, null);
+        } else if (tag == ARRAY) {
+            value = array(ctx, 0, null, ex);
+        } else if (tag == DATE) {
+            var arg: array<ptr<u8>, 1> = [number(ctx, deref node.value)];
+            value = construct(ctx, (deref state.roots)[5], 1, &arg[0], ex);
+        } else if (tag == BYTES) {
+            value = new_u8(ctx, deref node.size, ex);
+            if (deref ex == null) {
+                protect(ctx, value);
+                var bytes: ptr<u8> = typed_bytes(ctx, value, ex);
+                if (deref ex == null && deref node.size > 0) {
+                    mem_copy(bytes, deref node.bytes, deref node.size);
+                }
+                unprotect(ctx, value);
+            }
+        }
+        if (value != null) {
+            protect(ctx, value);
+            refs[i] = value;
+        }
+    }
+    for (var i: i64 = 0; i < deref graph.count && deref ex == null; i++) {
+        var node: ptr<CloneNode> = deref graph.nodes + i;
+        for (var j: i64 = 0; j < deref node.count && deref ex == null; j++) {
+            var key: i64 = (deref node.edges)[j * 2];
+            var value: i64 = (deref node.edges)[j * 2 + 1];
+            define_key(ctx, refs[i], refs[key], refs[value], ex, true);
+        }
+        if (deref node.tag == ARRAY && deref ex == null) {
+            var key: ptr<u8> = utf8("length");
+            set(ctx, refs[i], key, number(ctx, deref node.value), 0, ex);
+            release(key);
+        }
+    }
+    var result: ptr<u8> = refs[0];
+    if (deref ex != null || result == null) {
+        result = undefined(ctx);
+    }
+    for (var i: i64 = 0; i < deref graph.count; i++) {
+        if (refs[i] != null) {
+            unprotect(ctx, refs[i]);
+        }
+    }
+    mem_free(refs as ptr<u8>, deref graph.count * 8);
+    return result;
+}
+export(c) fun jsrt_structured_clone(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count < 1 || (count > 1 && kind(ctx, args[1]) != 0)) {
+        clone_failure(ctx, ex, "structuredClone requires a value; transfer options are not implemented");
+        return undefined(ctx);
+    }
+    var graph: ptr<CloneGraph> = snapshot_clone(ctx, args[0], ex);
+    if (graph == null) {
+        return undefined(ctx);
+    }
+    var result: ptr<u8> = restore_clone(ctx, graph, ex);
+    free_clone(graph);
+    return result;
+}
+pub fun install_clone(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (!allocate_context_slot(ctx, SLOT, size_of<CloneState>() as i64)) {
+        return false;
+    }
+    var state: ptr<CloneState> = storage(ctx);
+    var obj: ptr<u8> = get(ctx, global(ctx), "Object", ex);
+    (deref state.roots)[0] = capture(ctx, obj, "keys", ex);
+    (deref state.roots)[1] = capture(ctx, obj, "getPrototypeOf", ex);
+    (deref state.roots)[2] = capture(ctx, obj, "prototype", ex);
+    var arr: ptr<u8> = get(ctx, global(ctx), "Array", ex);
+    (deref state.roots)[3] = capture(ctx, arr, "prototype", ex);
+    (deref state.roots)[4] = capture(ctx, global(ctx), "BigInt", ex);
+    (deref state.roots)[5] = capture(ctx, global(ctx), "Date", ex);
+    (deref state.roots)[7] = capture(ctx, (deref state.roots)[5], "prototype", ex);
+    (deref state.roots)[6] = capture(ctx, (deref state.roots)[7], "getTime", ex);
+    var name: ptr<u8> = utf8("structuredClone");
+    var fn: ptr<u8> = function(ctx, name, clone_callback());
+    release(name);
+    define(ctx, global(ctx), "structuredClone", fn, ex, true);
+    return deref ex == null;
+}
+pub fun shutdown_clone(ctx: ptr<u8>) {
+    var state: ptr<CloneState> = storage(ctx);
+    if (state == null) {
+        return;
+    }
+    for (var i: i64 = 0; i < ROOT_COUNT; i++) {
+        if ((deref state.roots)[i] != null) {
+            unprotect(ctx, (deref state.roots)[i]);
+        }
+    }
+    release_context_slot(ctx, SLOT, size_of<CloneState>() as i64);
+}
