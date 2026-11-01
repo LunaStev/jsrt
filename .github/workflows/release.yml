@@ -20,7 +20,23 @@ jobs:
         with:
           persist-credentials: false
       - name: Validate build, real packages, relocated release and recovery
-        run: ./bootstrap.sh release
+        shell: bash
+        run: |
+          set -o pipefail
+          ./bootstrap.sh release 2>&1 | tee "$RUNNER_TEMP/release.log"
+      - name: Select the archive produced by this run
+        shell: bash
+        run: |
+          # target/dist can hold older archives on a persistent runner. Only the
+          # archive this run reports, with its checksum, is signed and uploaded.
+          archive=$(sed -n 's/^Release artifact: //p' "$RUNNER_TEMP/release.log" | tail -n 1)
+          test -n "$archive"
+          test -f "$archive"
+          test -f "$archive.sha256"
+          rm -rf target/upload
+          mkdir -p target/upload
+          cp -- "$archive" "$archive.sha256" target/upload/
+          echo "JSRT_ARCHIVE=target/upload/$(basename -- "$archive")" >> "$GITHUB_ENV"
       - name: Independently validate the published runtime
         run: ./bootstrap.sh test --require-tcp --probe-worker-termination
       - name: Check bounded Worker lifecycle with Valgrind
@@ -29,14 +45,11 @@ jobs:
         if: vars.JSRT_RELEASE_SIGNING_KEY_PATH != ''
         env:
           JSRT_RELEASE_SIGNING_KEY_PATH: ${{ vars.JSRT_RELEASE_SIGNING_KEY_PATH }}
-        run: |
-          for archive in target/dist/*.tar.gz; do
-            ./bootstrap.sh sign-release --archive "$archive" --key "$JSRT_RELEASE_SIGNING_KEY_PATH" --output "$archive.signatures"
-          done
+        run: ./bootstrap.sh sign-release --archive "$JSRT_ARCHIVE" --key "$JSRT_RELEASE_SIGNING_KEY_PATH" --output "$JSRT_ARCHIVE.signatures"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: jsrt-linux-x86_64
-          path: target/dist/
+          path: target/upload/
           if-no-files-found: error
           retention-days: 14
   linux:
@@ -53,12 +66,18 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+      - name: Clear stale downloaded archives
+        run: rm -rf target/upload
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: jsrt-linux-x86_64
-          path: target/dist
+          path: target/upload
       - name: Check actual distribution libraries and deployment
-        run: ./bootstrap.sh linux-check --image '${{ matrix.image }}'
+        shell: bash
+        run: |
+          set -- target/upload/*.tar.gz
+          test "$#" -eq 1
+          ./bootstrap.sh linux-check --archive "$1" --image '${{ matrix.image }}'
   native-vm:
     needs: release
     runs-on: ubuntu-26.04

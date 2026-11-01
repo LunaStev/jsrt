@@ -543,6 +543,10 @@ extern JSValue jsrt_extras_api(const void *, void *, void *, size_t, const JSVal
 JSCallback jsrt_extras_callback(void) {
     return jsrt_extras_api;
 }
+extern JSValue jsrt_callbacks_api(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+JSCallback jsrt_callbacks_callback(void) {
+    return jsrt_callbacks_api;
+}
 extern JSValue jsrt_assert_api(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 JSCallback jsrt_assert_callback(void) {
     return jsrt_assert_api;

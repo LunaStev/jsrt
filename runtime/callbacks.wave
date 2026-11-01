@@ -1,0 +1,310 @@
+// Callback adapters over Promise-returning host functions: util.callbackify and
+// the callback forms of fs. A wrapper pops its trailing callback, runs the
+// original function and reports through process.nextTick, as Node does.
+// Promise jobs stay engine-owned; this module only chains captured intrinsics.
+import("std::mem::layout")::{size_of};
+import("./context_state")::{owned_context_slot, release_context_slot, CALLBACKS_SLOT};
+import("./values")::{get, put, define, fail, plain, capture};
+import("./collections")::{bind_one, weak_map, weak_get, weak_set};
+import("./config")::{ARGUMENT_LIMIT};
+import("./util")::{util_module};
+
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun js_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "jsrt_callbacks_callback") fun callbacks_callback() -> ptr<u8>;
+
+const ERROR_TYPE: i32 = 1;
+const ERROR_RANGE: i32 = 2;
+const JS_OBJECT: i32 = 5;
+
+// Native function handles in CallbacksState.methods.
+const METHOD_CALLBACKIFY: i64 = 0;
+const METHOD_ON_OK: i64 = 1;
+const METHOD_ON_ERROR: i64 = 2;
+const METHOD_COUNT: i64 = 3;
+
+struct CallbacksState {
+    methods: array<ptr<u8>, 3>;
+    originals: ptr<u8>;
+    promise: ptr<u8>;
+    promise_resolve: ptr<u8>;
+    promise_then: ptr<u8>;
+    next_tick: ptr<u8>;
+    process: ptr<u8>;
+}
+
+fun callbacks_state(ctx: ptr<u8>) -> ptr<CallbacksState> {
+    return owned_context_slot(ctx, CALLBACKS_SLOT, size_of<CallbacksState>() as i64) as ptr<CallbacksState>;
+}
+
+// Delivers (callback, ...values) through the captured process.nextTick.
+fun deliver(ctx: ptr<u8>, callback: ptr<u8>, count: i64, first: ptr<u8>, second: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var s: ptr<CallbacksState> = callbacks_state(ctx);
+    if (deref s.next_tick == null) {
+        fail(ctx, ex, 0, "process.nextTick is unavailable for callback delivery");
+        return;
+    }
+    var args: array<ptr<u8>, 3> = [callback, first, second];
+    call(ctx, deref s.next_tick, deref s.process, count, &args[0], ex);
+}
+
+// Builds an error carrying Node's string code. `put` skips work once an
+// exception is pending, so the code is attached before publishing it.
+fun coded_error(ctx: ptr<u8>, ex: ptr<ptr<u8>>, error_kind: i32, message: str, code: str) -> ptr<u8> {
+    if (deref ex != null) {
+        return null;
+    }
+    var created: ptr<u8> = null;
+    fail(ctx, &created, error_kind, message);
+    if (created == null) {
+        return null;
+    }
+    protect(ctx, created);
+    var nested: ptr<u8> = null;
+    put(ctx, created, "code", text_value(ctx, code), &nested);
+    unprotect(ctx, created);
+    if (nested != null) {
+        deref ex = nested;
+    } else {
+        deref ex = created;
+    }
+    return created;
+}
+
+fun invalid_callback(ctx: ptr<u8>, ex: ptr<ptr<u8>>) {
+    coded_error(ctx, ex, ERROR_TYPE, "The last argument must be of type function", "ERR_INVALID_ARG_TYPE");
+}
+
+fun text_value(ctx: ptr<u8>, value: str) -> ptr<u8> {
+    var key: ptr<u8> = utf8(value);
+    var result: ptr<u8> = string_value(ctx, key);
+    release(key);
+    return result;
+}
+
+extern(c, "wr_string_value") fun string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+
+// Chains the original's Promise to the bound settle functions.
+fun run_wrapper(ctx: ptr<u8>, original: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<CallbacksState> = callbacks_state(ctx);
+    if (count < 1 || kind(ctx, args[count - 1]) != JS_OBJECT || !callable(ctx, args[count - 1])) {
+        invalid_callback(ctx, ex);
+        return undefined(ctx);
+    }
+    if (count - 1 > ARGUMENT_LIMIT) {
+        fail(ctx, ex, ERROR_RANGE, "callback argument limit exceeded");
+        return undefined(ctx);
+    }
+    var callback: ptr<u8> = args[count - 1];
+    protect(ctx, callback);
+    protect(ctx, original);
+    var result: ptr<u8> = call(ctx, original, receiver, count - 1, args, ex);
+    if (deref ex == null) {
+        protect(ctx, result);
+        var wrapped_args: array<ptr<u8>, 1> = [result];
+        var promise: ptr<u8> = call(ctx, deref s.promise_resolve, deref s.promise, 1, &wrapped_args[0], ex);
+        if (deref ex == null) {
+            protect(ctx, promise);
+            var on_ok: ptr<u8> = bind_one(ctx, (deref s.methods)[METHOD_ON_OK], null, callback, ex);
+            var on_error: ptr<u8> = null;
+            if (deref ex == null) {
+                protect(ctx, on_ok);
+                on_error = bind_one(ctx, (deref s.methods)[METHOD_ON_ERROR], null, callback, ex);
+            }
+            if (deref ex == null) {
+                protect(ctx, on_error);
+                var handlers: array<ptr<u8>, 2> = [on_ok, on_error];
+                call(ctx, deref s.promise_then, promise, 2, &handlers[0], ex);
+                unprotect(ctx, on_error);
+            }
+            if (on_ok != null) {
+                unprotect(ctx, on_ok);
+            }
+            unprotect(ctx, promise);
+        }
+        unprotect(ctx, result);
+    }
+    unprotect(ctx, original);
+    unprotect(ctx, callback);
+    return undefined(ctx);
+}
+
+fun make_wrapper(ctx: ptr<u8>, original: ptr<u8>, name: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<CallbacksState> = callbacks_state(ctx);
+    var key: ptr<u8> = utf8(name);
+    var wrapper: ptr<u8> = function(ctx, key, callbacks_callback());
+    release(key);
+    if (wrapper == null) {
+        fail(ctx, ex, 0, "cannot create callback wrapper");
+        return undefined(ctx);
+    }
+    protect(ctx, wrapper);
+    weak_set(ctx, deref s.originals, wrapper, original, ex);
+    unprotect(ctx, wrapper);
+    return wrapper;
+}
+
+export(c) fun jsrt_callbacks_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var s: ptr<CallbacksState> = callbacks_state(ctx);
+    if (equal(ctx, fn, (deref s.methods)[METHOD_CALLBACKIFY])) {
+        if (count < 1 || kind(ctx, args[0]) != JS_OBJECT || !callable(ctx, args[0])) {
+            coded_error(ctx, ex, ERROR_TYPE, "The original argument must be of type function", "ERR_INVALID_ARG_TYPE");
+            return undefined(ctx);
+        }
+        return make_wrapper(ctx, args[0], "callbackified", ex);
+    }
+    if (equal(ctx, fn, (deref s.methods)[METHOD_ON_OK])) {
+        // bound arguments arrive as (callback, value)
+        var value: ptr<u8> = undefined(ctx);
+        if (count > 1) {
+            value = args[1];
+        }
+        deliver(ctx, args[0], 3, js_null(ctx), value, ex);
+        return undefined(ctx);
+    }
+    if (equal(ctx, fn, (deref s.methods)[METHOD_ON_ERROR])) {
+        var wrapper_error: ptr<u8> = null;
+        var reason: ptr<u8> = undefined(ctx);
+        if (count > 1) {
+            reason = args[1];
+        }
+        // Node wraps falsy rejection reasons so the callback sees a truthy error.
+        if (!truth(ctx, reason)) {
+            var original_reason: ptr<u8> = reason;
+            protect(ctx, original_reason);
+            var wrapped: ptr<u8> = coded_error(ctx, &wrapper_error, ERROR_TYPE, "Promise was rejected with a falsy value",
+                "ERR_FALSY_VALUE_REJECTION");
+            unprotect(ctx, original_reason);
+            if (wrapped == null) {
+                return undefined(ctx);
+            }
+            protect(ctx, wrapped);
+            put(ctx, wrapped, "reason", original_reason, ex);
+            reason = wrapped;
+            deliver(ctx, args[0], 2, reason, undefined(ctx), ex);
+            unprotect(ctx, wrapped);
+            return undefined(ctx);
+        }
+        deliver(ctx, args[0], 2, reason, undefined(ctx), ex);
+        return undefined(ctx);
+    }
+    var original: ptr<u8> = weak_get(ctx, deref s.originals, fn, ex);
+    if (deref ex != null || kind(ctx, original) != JS_OBJECT) {
+        fail(ctx, ex, ERROR_TYPE, "invalid callback wrapper");
+        return undefined(ctx);
+    }
+    return run_wrapper(ctx, original, receiver, count, args, ex);
+}
+
+fun make_method(ctx: ptr<u8>, index: i64, name: str) -> bool {
+    var s: ptr<CallbacksState> = callbacks_state(ctx);
+    var key: ptr<u8> = utf8(name);
+    var method: ptr<u8> = function(ctx, key, callbacks_callback());
+    release(key);
+    if (method == null) {
+        return false;
+    }
+    protect(ctx, method);
+    (deref s.methods)[index] = method;
+    return true;
+}
+
+// Phase one: util.callbackify and the callback fs functions. Runs before the
+// CommonJS loader takes the fs object off the global.
+pub fun install_callbacks(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var s: ptr<CallbacksState> = callbacks_state(ctx);
+    var root: ptr<u8> = global(ctx);
+    if (!make_method(ctx, METHOD_CALLBACKIFY, "callbackify") || !make_method(ctx, METHOD_ON_OK, "onFulfilled") ||
+        !make_method(ctx, METHOD_ON_ERROR, "onRejected")) {
+        return false;
+    }
+    deref s.originals = weak_map(ctx, ex);
+    protect(ctx, deref s.originals);
+    var promise: ptr<u8> = capture(ctx, root, "Promise", ex);
+    if (promise == null) {
+        return false;
+    }
+    deref s.promise = promise;
+    deref s.promise_resolve = capture(ctx, promise, "resolve", ex);
+    var prototype: ptr<u8> = get(ctx, promise, "prototype", ex);
+    deref s.promise_then = capture(ctx, prototype, "then", ex);
+    if (deref ex != null || deref s.promise_resolve == null || deref s.promise_then == null) {
+        return false;
+    }
+    define(ctx, util_module(), "callbackify", (deref s.methods)[METHOD_CALLBACKIFY], ex, true);
+    var fs: ptr<u8> = get(ctx, root, "fs", ex);
+    var promises: ptr<u8> = get(ctx, fs, "promises", ex);
+    if (deref ex != null || kind(ctx, fs) != JS_OBJECT || kind(ctx, promises) != JS_OBJECT) {
+        return false;
+    }
+    var names: array<str, 10> = ["readFile", "writeFile", "stat", "lstat", "access", "mkdir", "unlink", "rmdir",
+        "rename", "readdir"];
+    for (var i: i64 = 0; i < 10 && deref ex == null; i++) {
+        var original: ptr<u8> = get(ctx, promises, names[i], ex);
+        if (deref ex == null && kind(ctx, original) == JS_OBJECT && callable(ctx, original)) {
+            define(ctx, fs, names[i], make_wrapper(ctx, original, names[i], ex), ex, true);
+        }
+    }
+    return deref ex == null;
+}
+
+// Phase two: capture process.nextTick once process events are installed.
+pub fun finish_callbacks(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var s: ptr<CallbacksState> = callbacks_state(ctx);
+    var process: ptr<u8> = capture(ctx, global(ctx), "process", ex);
+    if (process == null) {
+        return false;
+    }
+    deref s.process = process;
+    deref s.next_tick = capture(ctx, process, "nextTick", ex);
+    return deref ex == null && deref s.next_tick != null;
+}
+
+pub fun shutdown_callbacks(ctx: ptr<u8>) {
+    var s: ptr<CallbacksState> = callbacks_state(ctx);
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
+        if ((deref s.methods)[i] != null) {
+            unprotect(ctx, (deref s.methods)[i]);
+            (deref s.methods)[i] = null;
+        }
+    }
+    if (deref s.originals != null) {
+        unprotect(ctx, deref s.originals);
+        deref s.originals = null;
+    }
+    if (deref s.promise != null) {
+        unprotect(ctx, deref s.promise);
+        deref s.promise = null;
+    }
+    if (deref s.promise_resolve != null) {
+        unprotect(ctx, deref s.promise_resolve);
+        deref s.promise_resolve = null;
+    }
+    if (deref s.promise_then != null) {
+        unprotect(ctx, deref s.promise_then);
+        deref s.promise_then = null;
+    }
+    if (deref s.next_tick != null) {
+        unprotect(ctx, deref s.next_tick);
+        deref s.next_tick = null;
+    }
+    if (deref s.process != null) {
+        unprotect(ctx, deref s.process);
+        deref s.process = null;
+    }
+    release_context_slot(ctx, CALLBACKS_SLOT, size_of<CallbacksState>() as i64);
+}
