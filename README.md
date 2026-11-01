@@ -14,11 +14,14 @@ JSC 기준선은 2.54.1입니다. HTTP 클라이언트에는 TLS·비동기 DNS�
 실제 TLS 통합 검사에는 Go 컴파일러도 필요합니다. Wave 테스트 도구가 독립 TLS 검사 상대만
 컴파일하며 Go 코드가 런타임에 링크되지는 않습니다. 경로는 JSRT_GO로 지정할 수 있습니다.
 
-검증 중인 모듈·Worker 엔진은 다음 경로입니다.
+새 clone에서의 전체 순서(엔진 빌드, 환경 변수, 흔한 실패)는 [docs/building.md](docs/building.md)를 따릅니다.
+`target/`은 Git에 포함되지 않으므로 먼저 엔진 후보를 만들고 그 경로를 `ENGINE`에 지정합니다.
 
 ```sh
-./bootstrap.sh build --engine-library target/engines/jsc-module-2.54.1/candidate-92596ae086a103c82a53c64b1c3c875a/libJavaScriptCore.so
-./bootstrap.sh test --engine-library target/engines/jsc-module-2.54.1/candidate-92596ae086a103c82a53c64b1c3c875a/libJavaScriptCore.so
+./bootstrap.sh engine-build        # 마지막 줄의 "Candidate engine: …/libJavaScriptCore.so"를 사용
+export ENGINE=target/engines/jsc-module-2.54.1/candidate-<해시>/libJavaScriptCore.so
+./bootstrap.sh build --engine-library "$ENGINE"
+./bootstrap.sh test --engine-library "$ENGINE" --require-tcp
 ./target/native/jsrt --info
 ./target/native/jsrt app.js
 ./target/native/jsrt -e "console.log('hello')"

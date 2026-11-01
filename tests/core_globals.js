@@ -189,12 +189,72 @@ async function timerCases() {
     setTimeout(() => { throw new Error('unref\'d timer fired'); }, 600000).unref();
 }
 
+function once(register) {
+    return new Promise((resolve, reject) => register((error, value) => (error ? reject(error) : resolve(value))));
+}
+
+async function callbackCases() {
+    const fs = require('fs');
+    const path = require('path');
+    const os = require('os');
+    for (const name of ['readFile', 'writeFile', 'stat', 'lstat', 'access', 'mkdir', 'unlink', 'rmdir', 'rename', 'readdir']) {
+        equal(typeof fs[name], 'function', 'callback fs.' + name);
+        equal(fs[name].name, name, 'callback fs.' + name + ' name');
+    }
+    const dir = path.join(os.tmpdir(), 'jsrt-callbacks-' + process.pid);
+    const file = path.join(dir, 'a.txt');
+    await once(done => fs.mkdir(dir, done));
+    await once(done => fs.writeFile(file, 'hello', done));
+    equal(await once(done => fs.readFile(file, 'utf8', done)), 'hello', 'readFile callback value');
+    const stats = await once(done => fs.stat(file, done));
+    check(stats.isFile() && stats.size === 5, 'stat callback value');
+    check((await once(done => fs.readdir(dir, done))).includes('a.txt'), 'readdir callback value');
+    await once(done => fs.rename(file, file + '.b', done));
+    let missing = null;
+    await once(done => fs.readFile(file, 'utf8', error => { missing = error; done(null); }));
+    check(missing !== null && missing.code === 'ENOENT', 'callback receives the OS error code');
+    await once(done => fs.unlink(file + '.b', done));
+    await once(done => fs.rmdir(dir, done));
+    rejects(() => fs.readFile(file), 'TypeError', 'missing callback is rejected synchronously');
+    let code = null;
+    try {
+        fs.readFile(file);
+    } catch (error) {
+        code = error.code;
+    }
+    equal(code, 'ERR_INVALID_ARG_TYPE', 'missing callback error code');
+    // The callback must run asynchronously, after the caller returns.
+    const order = [];
+    const finished = once(done => fs.access(__filename, error => { order.push('callback'); done(error); }));
+    order.push('returned');
+    await finished;
+    equal(order.join(','), 'returned,callback', 'callbacks are asynchronous');
+
+    const callbackified = util.callbackify(async (a, b) => a + b);
+    equal(await once(done => callbackified(2, 3, done)), 5, 'callbackify value');
+    const failure = new Error('rejected');
+    const failing = util.callbackify(async () => { throw failure; });
+    let received = null;
+    await once(done => failing(error => { received = error; done(null); }));
+    check(received === failure, 'callbackify error identity');
+    const falsy = util.callbackify(async () => { throw 0; });
+    let wrapped = null;
+    await once(done => falsy(error => { wrapped = error; done(null); }));
+    check(wrapped instanceof Error && wrapped.code === 'ERR_FALSY_VALUE_REJECTION' && wrapped.reason === 0, 'falsy reason wrapped');
+    rejects(() => util.callbackify(1), 'TypeError', 'callbackify requires a function');
+    rejects(() => callbackified(1, 2), 'TypeError', 'callbackify wrapper requires a callback');
+    // The receiver is preserved for methods.
+    const object = {value: 7, read: util.callbackify(async function () { return this.value; })};
+    equal(await once(done => object.read(done)), 7, 'callbackify preserves the receiver');
+}
+
 async function main() {
     inspectCases();
     formatCases();
     base64Cases();
     processCases();
     await timerCases();
+    await callbackCases();
     console.log('Core global checks passed');
 }
 main().catch(error => {
