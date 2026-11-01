@@ -224,3 +224,16 @@ File·multipart 파싱, 추가 Node API는 남아 있다. [ROADMAP.md](ROADMAP.m
 worker-leaks의 still reachable은 직전 기록과 같은 1,152바이트(19블록)이다. 첫 실행에서 한 번 1,808바이트(28블록)가
 나왔으나 같은 조건의 재측정 4회(이전·현재 실행 파일 각 1회, 공식 도구 2회)에서 재현되지 않았다. 원인은 조사하지 않았으며
 확정/간접 누수가 아니므로 전체 누수 부재로 확대하지 않는다.
+
+### 검증 직후 새 release
+
+모듈 분할·Proxy 변경이 반영된 커밋(396a3d1)에서 `./bootstrap.sh release`를 다시 실행해 exit 0이었다.
+일반/이동 후보 각각 전체 **1058/0/0**, 공개 npm **38/0**, 필수 60초 혼합 부하 PASS
+(61표본·424 batches·1699 lanes·55672832바이트·3052 Worker·763 abort, RSS warm/peak/end KiB
+54912/56484/51308, 최대 지연 **4922 ms**). 지연은 같은 컴퓨터의 단독 부하에서 3.1~3.8초였으므로
+release 안에서 앞 단계 직후 실행되는 영향이 있을 수 있으나 원인은 확인하지 않았고 SLO 판정이 아니다.
+
+- runtime SHA-256: **e18a7c3721e8d6440a125122faac43a03f78a1caaa05fc73490897b6da3e6a23**
+- 최신 archive: `target/dist/jsrt-linux-x86_64-8f4ae8ea3be6e18f52e4ca3f9ef94445668c8f45194402cc8bb7c14879a19233.tar.gz`,
+  SHA-256 **2687b574a6188aa6a65ba1ca1b42be14361f8184eb88f50980ab77724e26c63b**.
+  이전 archive 24dd2de3…(307e4726 파일명)는 모듈 분할·Proxy 변경 이전 소스의 산출물이다.
