@@ -17,7 +17,7 @@ import("./collections")::{bind_one, flag, set_flag, weak_map, weak_get, weak_set
 import("./buffer_core")::{is_byte_view};
 import("./config")::{ARGUMENT_LIMIT};
 import("./format")::{format_to_value, inspect_to_value};
-import("./inspect")::{set_inspect_function, inspect_intrinsic, INSPECT_CUSTOM};
+import("./inspect_engine")::{set_inspect_function, inspect_intrinsic, INSPECT_CUSTOM};
 extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
 extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
 extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;

@@ -87,9 +87,9 @@ util.inherits와 기본 구분자 querystring.parse/decode를 추가했다. quer
 RegExp/Error(stack 줄을 `at` 형식으로 변환)/박싱 원시값/함수·클래스/null prototype/`Symbol.toStringTag`/
 `[util.inspect.custom]`을 처리한다. 접근자는 `[Getter]`·`[Setter]`로만 표시하며 호출하지 않는다.
 옵션은 depth·breakLength·maxArrayLength·maxStringLength만 읽고 나머지(colors, compact, sorted,
-showHidden 등)는 무시한다. 출력은 UTF-16 4Mi 단위, 중첩 256단계로 제한한다.
+showHidden 등)는 무시한다. Proxy는 트랩을 실행하지 않고 `Proxy(<target unavailable>)`로 표시한다(Node는 대상을 출력하지만 엔진 ABI가 대상을 노출하지 않는다). 출력은 UTF-16 4Mi 단위, 중첩 256단계로 제한한다.
 알려진 차이: `%o`의 showHidden 출력(`[length]`)과 Promise 상태(`Promise { <unknown> }`), WeakMap/WeakSet
-내용, Proxy 감지(JSC C API로 식별할 수 없어 트랩이 관찰될 수 있음), `[Arguments]`, Buffer의
+내용, Proxy 대상, `[Arguments]`, Buffer의
 `constructor.name`은 Uint8Array이므로 라벨을 고정 `<Buffer …>`로 표시한다.
 출력은 tests/core_globals.js의 선택 사례와 설치된 Node의 출력을 대조했으며 전체 적합성 검사는 아니다.
 

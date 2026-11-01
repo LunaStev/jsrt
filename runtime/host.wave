@@ -26,7 +26,7 @@ import("./abort")::{install_abort, shutdown_abort};
 import("./path")::{install_path, shutdown_path};
 import("./os")::{install_os, shutdown_os};
 import("./util")::{install_util, shutdown_util};
-import("./inspect")::{install_inspect, shutdown_inspect};
+import("./inspect_engine")::{install_inspect, shutdown_inspect};
 import("./callbacks")::{install_callbacks, finish_callbacks, shutdown_callbacks};
 import("./process_extras")::{install_process_extras, shutdown_process_extras};
 import("./assert")::{install_assert, shutdown_assert};

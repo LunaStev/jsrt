@@ -1,0 +1,332 @@
+// UTF-16 output buffers, entry lists and the shared Inspector state for inspection.
+// Everything here is engine-independent except the final conversion to a JS string.
+import("std::mem::alloc")::{mem_alloc, mem_alloc_zeroed, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::mem::cstr")::{mem_len_cstr};
+import("./config")::{INSPECT_OUTPUT_LIMIT};
+
+extern(c, "wr_to_string") fun wr_to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_utf16") fun wr_string_utf16(text: ptr<u16>, length: i64) -> ptr<u8>;
+extern(c, "wr_string_value") fun wr_string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_characters") fun wr_string_characters(text: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_length") fun wr_string_length(text: ptr<u8>) -> i64;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+
+// UTF-16 code units appended one at a time by the formatter.
+pub const UNIT_NEWLINE: u16 = 10;
+pub const UNIT_SPACE: u16 = 32;
+pub const UNIT_OPEN_PAREN: u16 = 40;
+pub const UNIT_CLOSE_PAREN: u16 = 41;
+pub const UNIT_COMMA: u16 = 44;
+pub const UNIT_MINUS: u16 = 45;
+pub const UNIT_ZERO: u16 = 48;
+pub const UNIT_LESS_THAN: u16 = 60;
+pub const UNIT_GREATER_THAN: u16 = 62;
+pub const UNIT_OPEN_BRACKET: u16 = 91;
+pub const UNIT_CLOSE_BRACKET: u16 = 93;
+pub const UNIT_LOWER_N: u16 = 110;
+pub const UNIT_LOWER_S: u16 = 115;
+pub const UNIT_OPEN_BRACE: u16 = 123;
+pub const UNIT_CLOSE_BRACE: u16 = 125;
+
+pub struct Text {
+    data: ptr<u16>;
+    length: i64;
+    capacity: i64;
+}
+
+pub struct Entries {
+    items: ptr<ptr<Text>>;
+    count: i64;
+    capacity: i64;
+}
+
+pub struct Seen {
+    value: ptr<u8>;
+    reference: i64;
+}
+
+pub struct Inspector {
+    ctx: ptr<u8>;
+    ex: ptr<ptr<u8>>;
+    depth: i64;
+    break_length: i64;
+    max_array: i64;
+    max_string: i64;
+    indentation: i64;
+    current_depth: i64;
+    circular: i64;
+    seen: ptr<Seen>;
+    seen_count: i64;
+    overflow: bool;
+    options: ptr<u8>;
+}
+
+// UTF-16 text buffers
+
+pub fun text_new(ins: ptr<Inspector>) -> ptr<Text> {
+    var t: ptr<Text> = mem_alloc_zeroed(size_of<Text>() as i64) as ptr<Text>;
+    if (t == null) {
+        deref ins.overflow = true;
+    }
+    return t;
+}
+
+pub fun text_free(t: ptr<Text>) {
+    if (t == null) {
+        return;
+    }
+    if (deref t.data != null) {
+        mem_free(deref t.data as ptr<u8>, deref t.capacity * 2);
+    }
+    mem_free(t as ptr<u8>, size_of<Text>() as i64);
+}
+
+pub fun text_reserve(ins: ptr<Inspector>, t: ptr<Text>, extra: i64) -> bool {
+    if (deref ins.overflow || t == null) {
+        return false;
+    }
+    var needed: i64 = deref t.length + extra;
+    if (needed > INSPECT_OUTPUT_LIMIT) {
+        deref ins.overflow = true;
+        return false;
+    }
+    if (needed <= deref t.capacity) {
+        return true;
+    }
+    var next: i64 = deref t.capacity * 2;
+    if (next < 64) {
+        next = 64;
+    }
+    while (next < needed) {
+        next = next * 2;
+    }
+    if (next > INSPECT_OUTPUT_LIMIT) {
+        next = INSPECT_OUTPUT_LIMIT;
+    }
+    var data: ptr<u16> = mem_alloc(next * 2) as ptr<u16>;
+    if (data == null) {
+        deref ins.overflow = true;
+        return false;
+    }
+    if (deref t.data != null) {
+        for (var i: i64 = 0; i < deref t.length; i++) {
+            data[i] = (deref t.data)[i];
+        }
+        mem_free(deref t.data as ptr<u8>, deref t.capacity * 2);
+    }
+    deref t.data = data;
+    deref t.capacity = next;
+    return true;
+}
+
+pub fun text_unit(ins: ptr<Inspector>, t: ptr<Text>, unit: u16) {
+    if (!text_reserve(ins, t, 1)) {
+        return;
+    }
+    (deref t.data)[deref t.length] = unit;
+    deref t.length = deref t.length + 1;
+}
+
+pub fun text_ascii(ins: ptr<Inspector>, t: ptr<Text>, value: str) {
+    var length: i64 = mem_len_cstr(value);
+    if (!text_reserve(ins, t, length)) {
+        return;
+    }
+    for (var i: i64 = 0; i < length; i++) {
+        (deref t.data)[deref t.length + i] = value[i] as u16;
+    }
+    deref t.length = deref t.length + length;
+}
+
+pub fun text_units(ins: ptr<Inspector>, t: ptr<Text>, units: ptr<u16>, length: i64) {
+    if (length <= 0 || !text_reserve(ins, t, length)) {
+        return;
+    }
+    for (var i: i64 = 0; i < length; i++) {
+        (deref t.data)[deref t.length + i] = units[i];
+    }
+    deref t.length = deref t.length + length;
+}
+
+pub fun text_append(ins: ptr<Inspector>, t: ptr<Text>, other: ptr<Text>) {
+    if (other == null) {
+        return;
+    }
+    text_units(ins, t, deref other.data, deref other.length);
+}
+
+pub fun text_spaces(ins: ptr<Inspector>, t: ptr<Text>, count: i64) {
+    for (var i: i64 = 0; i < count; i++) {
+        text_unit(ins, t, UNIT_SPACE);
+    }
+}
+
+pub fun text_integer(ins: ptr<Inspector>, t: ptr<Text>, value: i64) {
+    var digits: array<u8, 24>;
+    var used: i64 = 0;
+    var n: i64 = value;
+    if (n < 0) {
+        text_unit(ins, t, UNIT_MINUS);
+        n = 0 - n;
+    }
+    if (n == 0) {
+        text_unit(ins, t, UNIT_ZERO);
+        return;
+    }
+    while (n > 0 && used < 24) {
+        digits[used] = (48 + n % 10) as u8;
+        n = n / 10;
+        used += 1;
+    }
+    while (used > 0) {
+        used -= 1;
+        text_unit(ins, t, digits[used] as u16);
+    }
+}
+
+pub fun text_contains(t: ptr<Text>, unit: u16) -> bool {
+    if (t == null) {
+        return false;
+    }
+    for (var i: i64 = 0; i < deref t.length; i++) {
+        if ((deref t.data)[i] == unit) {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fun text_equals_ascii(t: ptr<Text>, value: str) -> bool {
+    var length: i64 = mem_len_cstr(value);
+    if (t == null || deref t.length != length) {
+        return false;
+    }
+    for (var i: i64 = 0; i < length; i++) {
+        if ((deref t.data)[i] != value[i] as u16) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fun text_equals(a: ptr<Text>, b: ptr<Text>) -> bool {
+    if (deref a.length != deref b.length) {
+        return false;
+    }
+    for (var i: i64 = 0; i < deref a.length; i++) {
+        if ((deref a.data)[i] != (deref b.data)[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Appends text and indents each following line, as Node does for nested hooks.
+pub fun text_indented(ins: ptr<Inspector>, t: ptr<Text>, units: ptr<u16>, length: i64) {
+    for (var i: i64 = 0; i < length; i++) {
+        text_unit(ins, t, units[i]);
+        if (units[i] == 10) {
+            text_spaces(ins, t, deref ins.indentation);
+        }
+    }
+}
+
+pub fun text_to_value(ctx: ptr<u8>, t: ptr<Text>) -> ptr<u8> {
+    var empty: array<u16, 1> = [0];
+    var units: ptr<u16> = &empty[0];
+    var length: i64 = 0;
+    if (t != null && deref t.data != null) {
+        units = deref t.data;
+        length = deref t.length;
+    }
+    var js: ptr<u8> = wr_string_utf16(units, length);
+    var result: ptr<u8> = wr_string_value(ctx, js);
+    wr_string_release(js);
+    return result;
+}
+
+// Appends the engine's ToString result. Exceptions remain in ins.ex.
+pub fun text_js(ins: ptr<Inspector>, t: ptr<Text>, value: ptr<u8>) {
+    if (deref deref ins.ex != null) {
+        return;
+    }
+    var js: ptr<u8> = wr_to_string(deref ins.ctx, value, deref ins.ex);
+    if (js == null) {
+        return;
+    }
+    text_units(ins, t, wr_string_characters(js), wr_string_length(js));
+    wr_string_release(js);
+}
+
+// Entry lists
+
+pub fun entries_push(ins: ptr<Inspector>, list: ptr<Entries>, item: ptr<Text>) {
+    if (item == null) {
+        return;
+    }
+    if (deref list.count == deref list.capacity) {
+        var next: i64 = deref list.capacity * 2;
+        if (next < 8) {
+            next = 8;
+        }
+        var items: ptr<ptr<Text>> = mem_alloc(next * 8) as ptr<ptr<Text>>;
+        if (items == null) {
+            deref ins.overflow = true;
+            text_free(item);
+            return;
+        }
+        for (var i: i64 = 0; i < deref list.count; i++) {
+            items[i] = (deref list.items)[i];
+        }
+        if (deref list.items != null) {
+            mem_free(deref list.items as ptr<u8>, deref list.capacity * 8);
+        }
+        deref list.items = items;
+        deref list.capacity = next;
+    }
+    (deref list.items)[deref list.count] = item;
+    deref list.count = deref list.count + 1;
+}
+
+pub fun entries_free(list: ptr<Entries>) {
+    for (var i: i64 = 0; i < deref list.count; i++) {
+        text_free((deref list.items)[i]);
+    }
+    if (deref list.items != null) {
+        mem_free(deref list.items as ptr<u8>, deref list.capacity * 8);
+    }
+    deref list.items = null;
+    deref list.count = 0;
+    deref list.capacity = 0;
+}
+
+pub fun push_ascii(ins: ptr<Inspector>, list: ptr<Entries>, value: str) {
+    var item: ptr<Text> = text_new(ins);
+    text_ascii(ins, item, value);
+    entries_push(ins, list, item);
+}
+
+pub fun push_remaining(ins: ptr<Inspector>, list: ptr<Entries>, remaining: i64, noun: str) {
+    var item: ptr<Text> = text_new(ins);
+    text_ascii(ins, item, "... ");
+    text_integer(ins, item, remaining);
+    text_ascii(ins, item, " more ");
+    text_ascii(ins, item, noun);
+    if (remaining > 1) {
+        text_unit(ins, item, UNIT_LOWER_S);
+    }
+    entries_push(ins, list, item);
+}
+
+pub fun push_empty_items(ins: ptr<Inspector>, list: ptr<Entries>, count: i64) {
+    var item: ptr<Text> = text_new(ins);
+    text_unit(ins, item, UNIT_LESS_THAN);
+    text_integer(ins, item, count);
+    text_ascii(ins, item, " empty item");
+    if (count > 1) {
+        text_unit(ins, item, UNIT_LOWER_S);
+    }
+    text_unit(ins, item, UNIT_GREATER_THAN);
+    entries_push(ins, list, item);
+}

@@ -1,0 +1,466 @@
+// Captured intrinsics, engine call helpers and installation for util.inspect.
+// Intrinsics are read once at startup so later changes to globals cannot affect output.
+import("std::mem::layout")::{size_of};
+import("./context_state")::{allocate_context_slot, context_slot, release_context_slot, INSPECT_SLOT};
+import("./values")::{get, fail};
+import("./inspect_text")::{Inspector};
+
+extern(c, "wr_type") fun wr_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_equal") fun wr_equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun wr_undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_call") fun wr_call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun wr_protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_value") fun wr_string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_context_global") fun wr_context_global(ctx: ptr<u8>) -> ptr<u8>;
+
+// JSValueGetType results.
+pub const JS_UNDEFINED: i32 = 0;
+
+pub const JS_NULL: i32 = 1;
+
+pub const JS_BOOLEAN: i32 = 2;
+
+pub const JS_NUMBER: i32 = 3;
+
+pub const JS_STRING: i32 = 4;
+
+pub const JS_OBJECT: i32 = 5;
+
+pub const JS_SYMBOL: i32 = 6;
+
+pub const JS_BIGINT: i32 = 7;
+
+// JSTypedArrayType results used by the formatter.
+pub const TYPED_UINT8: i32 = 3;
+
+pub const TYPED_FLOAT64: i32 = 8;
+
+pub const TYPED_ARRAY_BUFFER: i32 = 9;
+
+pub const TYPED_NONE: i32 = 10;
+
+pub const TYPED_BIGINT64: i32 = 11;
+
+pub const TYPED_BIGUINT64: i32 = 12;
+
+// Captured intrinsic slots. User changes to globals after startup do not
+// affect inspection.
+pub const I_OWN_KEYS: i64 = 0;
+
+pub const I_DESCRIPTOR: i64 = 1;
+
+pub const I_REFLECT_GET: i64 = 2;
+
+pub const I_OBJECT_TO_STRING: i64 = 3;
+
+pub const I_FUNCTION_TO_STRING: i64 = 4;
+
+pub const I_MAP_ENTRIES: i64 = 5;
+
+pub const I_MAP_NEXT: i64 = 6;
+
+pub const I_SET_VALUES: i64 = 7;
+
+pub const I_SET_NEXT: i64 = 8;
+
+pub const I_MAP_SIZE: i64 = 9;
+
+pub const I_SET_SIZE: i64 = 10;
+
+pub const I_DATE_TIME: i64 = 11;
+
+pub const I_DATE_ISO: i64 = 12;
+
+pub const I_DATE_STRING: i64 = 13;
+
+pub const I_REGEXP_STRING: i64 = 14;
+
+pub const I_REGEXP_SOURCE: i64 = 15;
+
+pub const I_ERROR_PROTOTYPE: i64 = 16;
+
+pub const I_SYMBOL_STRING: i64 = 17;
+
+pub const I_SYMBOL_VALUE: i64 = 18;
+
+pub const I_NUMBER_VALUE: i64 = 19;
+
+pub const I_STRING_VALUE: i64 = 20;
+
+pub const I_BOOLEAN_VALUE: i64 = 21;
+
+pub const I_BIGINT_VALUE: i64 = 22;
+
+pub const I_BUFFER_PROTOTYPE: i64 = 23;
+
+pub const I_TAG_SYMBOL: i64 = 24;
+
+pub const I_CUSTOM_SYMBOL: i64 = 25;
+
+pub const I_WEAKMAP_HAS: i64 = 26;
+
+pub const I_WEAKSET_HAS: i64 = 27;
+
+pub const I_JSON_STRINGIFY: i64 = 28;
+
+pub const I_PARSE_INT: i64 = 29;
+
+pub const I_PARSE_FLOAT: i64 = 30;
+
+pub const I_STRING: i64 = 31;
+
+pub const I_INSPECT: i64 = 32;
+
+pub const I_FUNCTION_PROTOTYPE: i64 = 33;
+
+pub const I_GET_PROTOTYPE: i64 = 34;
+
+pub const INTRINSIC_COUNT: i64 = 35;
+
+// Node defaults for util.inspect.
+pub const DEFAULT_DEPTH: i64 = 2;
+
+pub const UNLIMITED_DEPTH: i64 = 1099511627776;
+
+pub const DEFAULT_BREAK_LENGTH: i64 = 80;
+
+pub const DEFAULT_ARRAY_LIMIT: i64 = 100;
+
+pub const DEFAULT_STRING_LIMIT: i64 = 10000;
+
+pub const COMPACT_LEVELS: i64 = 3;
+
+pub const MIN_LINE_WIDTH: i64 = 16;
+
+pub const BUFFER_INSPECT_BYTES: i64 = 50;
+
+pub const GROUP_MINIMUM_ENTRIES: i64 = 6;
+
+pub const GROUP_COLUMN_LIMIT: i64 = 15;
+
+pub const ARRAY_INDEX_LIMIT: f64 = 4294967295.0;
+
+// Property formatting modes from Node's formatProperty.
+pub const PROPERTY_OBJECT: i32 = 0;
+
+pub const PROPERTY_ARRAY: i32 = 1;
+
+pub const PROPERTY_ARRAY_EXTRA: i32 = 2;
+
+pub struct InspectState {
+    values: array<ptr<u8>, 35>;
+}
+
+extern(c, "jsrt_clone_proxy_status") fun proxy_status(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+
+// The patched engine tells a Proxy apart without running any trap. The probe is
+// -1 when the engine lacks the clone ABI, in which case values are inspected normally.
+pub fun is_proxy(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    return proxy_status(ctx, value) == 1;
+}
+
+pub fun state(ctx: ptr<u8>) -> ptr<InspectState> {
+    return context_slot(ctx, INSPECT_SLOT) as ptr<InspectState>;
+}
+
+pub fun intrinsic(ctx: ptr<u8>, index: i64) -> ptr<u8> {
+    var s: ptr<InspectState> = state(ctx);
+    if (s == null) {
+        return null;
+    }
+    return (deref s.values)[index];
+}
+
+// Prototype lookup goes through Reflect.getPrototypeOf so Proxy objects report
+// their target's prototype; the raw C API returns null for them.
+pub fun prototype_of(ins: ptr<Inspector>, value: ptr<u8>) -> ptr<u8> {
+    var ctx: ptr<u8> = deref ins.ctx;
+    var args: array<ptr<u8>, 1> = [value];
+    var ignored: ptr<u8> = null;
+    var result: ptr<u8> = wr_call(ctx, intrinsic(ctx, I_GET_PROTOTYPE), null, 1, &args[0], &ignored);
+    if (ignored != null) {
+        if (deref deref ins.ex == null) {
+            deref deref ins.ex = ignored;
+        }
+        return null;
+    }
+    return result;
+}
+
+// Engine helpers
+
+pub fun failed(ins: ptr<Inspector>) -> bool {
+    return deref deref ins.ex != null || deref ins.overflow;
+}
+
+pub fun call0(ins: ptr<Inspector>, fn: ptr<u8>, receiver: ptr<u8>) -> ptr<u8> {
+    if (failed(ins) || fn == null) {
+        return wr_undefined(deref ins.ctx);
+    }
+    var result: ptr<u8> = wr_call(deref ins.ctx, fn, receiver, 0, null, deref ins.ex);
+    if (result == null) {
+        return wr_undefined(deref ins.ctx);
+    }
+    return result;
+}
+
+pub fun call2(ins: ptr<Inspector>, fn: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> ptr<u8> {
+    if (failed(ins) || fn == null) {
+        return wr_undefined(deref ins.ctx);
+    }
+    var args: array<ptr<u8>, 2> = [a, b];
+    var result: ptr<u8> = wr_call(deref ins.ctx, fn, null, 2, &args[0], deref ins.ex);
+    if (result == null) {
+        return wr_undefined(deref ins.ctx);
+    }
+    return result;
+}
+
+// Brand probe: a captured intrinsic accepts only its own receiver type. The
+// probe's TypeError is deliberately discarded.
+pub fun probe(ins: ptr<Inspector>, index: i64, value: ptr<u8>, result: ptr<ptr<u8>>) -> bool {
+    var fn: ptr<u8> = intrinsic(deref ins.ctx, index);
+    if (fn == null) {
+        return false;
+    }
+    var ignored: ptr<u8> = null;
+    var output: ptr<u8> = wr_call(deref ins.ctx, fn, value, 0, null, &ignored);
+    if (ignored != null || output == null) {
+        return false;
+    }
+    if (result != null) {
+        deref result = output;
+    }
+    return true;
+}
+
+pub fun descriptor(ins: ptr<Inspector>, object: ptr<u8>, key: ptr<u8>) -> ptr<u8> {
+    return call2(ins, intrinsic(deref ins.ctx, I_DESCRIPTOR), object, key);
+}
+
+pub fun reflect_get(ins: ptr<Inspector>, object: ptr<u8>, key: ptr<u8>) -> ptr<u8> {
+    return call2(ins, intrinsic(deref ins.ctx, I_REFLECT_GET), object, key);
+}
+
+pub fun is_undefined(ins: ptr<Inspector>, value: ptr<u8>) -> bool {
+    return value == null || wr_type(deref ins.ctx, value) == JS_UNDEFINED;
+}
+
+pub fun ascii_value(ins: ptr<Inspector>, value: str) -> ptr<u8> {
+    var js: ptr<u8> = wr_string_utf8(value);
+    var result: ptr<u8> = wr_string_value(deref ins.ctx, js);
+    wr_string_release(js);
+    return result;
+}
+
+// Returns true when the prototype chain contains `target` within a bound.
+pub fun chain_contains(ins: ptr<Inspector>, value: ptr<u8>, target: ptr<u8>) -> bool {
+    var ctx: ptr<u8> = deref ins.ctx;
+    if (target == null || wr_type(ctx, target) != JS_OBJECT) {
+        return false;
+    }
+    var current: ptr<u8> = prototype_of(ins, value);
+    for (var i: i64 = 0; i < 256; i++) {
+        if (current == null || wr_type(ctx, current) != JS_OBJECT) {
+            return false;
+        }
+        if (wr_equal(ctx, current, target)) {
+            return true;
+        }
+        current = prototype_of(ins, current);
+    }
+    return false;
+}
+
+// Formatter selection made by format_object before children are visited.
+pub const SHAPE_KEYS: i32 = 0;
+
+pub const SHAPE_ARRAY: i32 = 1;
+
+pub const SHAPE_SET: i32 = 2;
+
+pub const SHAPE_MAP: i32 = 3;
+
+pub const SHAPE_TYPED: i32 = 4;
+
+pub const SHAPE_ARRAY_BUFFER: i32 = 5;
+
+pub const SHAPE_UNKNOWN: i32 = 6;
+
+pub fun inspect_failed(ins: ptr<Inspector>) -> bool {
+    return failed(ins);
+}
+
+pub fun inspect_intrinsic(ctx: ptr<u8>, index: i64) -> ptr<u8> {
+    return intrinsic(ctx, index);
+}
+
+pub const INSPECT_JSON_STRINGIFY: i64 = 28;
+
+pub const INSPECT_PARSE_INT: i64 = 29;
+
+pub const INSPECT_PARSE_FLOAT: i64 = 30;
+
+pub const INSPECT_STRING: i64 = 31;
+
+pub const INSPECT_CUSTOM: i64 = 25;
+
+pub fun capture_path(ctx: ptr<u8>, root: ptr<u8>, first: str, second: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var object: ptr<u8> = get(ctx, root, first, ex);
+    if (deref ex != null) {
+        return null;
+    }
+    var result: ptr<u8> = get(ctx, object, second, ex);
+    if (deref ex != null || result == null) {
+        return null;
+    }
+    return result;
+}
+
+pub fun capture_prototype(ctx: ptr<u8>, name: str, member: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var ctor: ptr<u8> = get(ctx, wr_context_global(ctx), name, ex);
+    var is_proto: ptr<u8> = get(ctx, ctor, "prototype", ex);
+    return get(ctx, is_proto, member, ex);
+}
+
+pub fun capture_getter(ctx: ptr<u8>, name: str, member: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var reflect: ptr<u8> = get(ctx, wr_context_global(ctx), "Reflect", ex);
+    var describe: ptr<u8> = get(ctx, reflect, "getOwnPropertyDescriptor", ex);
+    var ctor: ptr<u8> = get(ctx, wr_context_global(ctx), name, ex);
+    var is_proto: ptr<u8> = get(ctx, ctor, "prototype", ex);
+    if (deref ex != null) {
+        return null;
+    }
+    var key: ptr<u8> = wr_string_utf8(member);
+    var args: array<ptr<u8>, 2> = [is_proto, wr_string_value(ctx, key)];
+    wr_string_release(key);
+    var desc: ptr<u8> = wr_call(ctx, describe, null, 2, &args[0], ex);
+    if (deref ex != null || desc == null) {
+        return null;
+    }
+    return get(ctx, desc, "get", ex);
+}
+
+pub fun store(ctx: ptr<u8>, index: i64, value: ptr<u8>) {
+    var s: ptr<InspectState> = state(ctx);
+    if (value == null || wr_type(ctx, value) == JS_UNDEFINED) {
+        (deref s.values)[index] = null;
+        return;
+    }
+    wr_protect(ctx, value);
+    (deref s.values)[index] = value;
+}
+
+// Captures intrinsics after JSON (wjson), Buffer and the global constructors
+// exist and before user code runs.
+pub fun install_inspect(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (!allocate_context_slot(ctx, INSPECT_SLOT, size_of<InspectState>() as i64)) {
+        return false;
+    }
+    var root: ptr<u8> = wr_context_global(ctx);
+    store(ctx, I_OWN_KEYS, capture_path(ctx, root, "Reflect", "ownKeys", ex));
+    store(ctx, I_DESCRIPTOR, capture_path(ctx, root, "Reflect", "getOwnPropertyDescriptor", ex));
+    store(ctx, I_REFLECT_GET, capture_path(ctx, root, "Reflect", "get", ex));
+    store(ctx, I_OBJECT_TO_STRING, capture_prototype(ctx, "Object", "toString", ex));
+    store(ctx, I_FUNCTION_TO_STRING, capture_prototype(ctx, "Function", "toString", ex));
+    store(ctx, I_MAP_ENTRIES, capture_prototype(ctx, "Map", "entries", ex));
+    store(ctx, I_SET_VALUES, capture_prototype(ctx, "Set", "values", ex));
+    store(ctx, I_MAP_SIZE, capture_getter(ctx, "Map", "size", ex));
+    store(ctx, I_SET_SIZE, capture_getter(ctx, "Set", "size", ex));
+    store(ctx, I_DATE_TIME, capture_prototype(ctx, "Date", "getTime", ex));
+    store(ctx, I_DATE_ISO, capture_prototype(ctx, "Date", "toISOString", ex));
+    store(ctx, I_DATE_STRING, capture_prototype(ctx, "Date", "toString", ex));
+    store(ctx, I_REGEXP_STRING, capture_prototype(ctx, "RegExp", "toString", ex));
+    store(ctx, I_REGEXP_SOURCE, capture_getter(ctx, "RegExp", "source", ex));
+    store(ctx, I_ERROR_PROTOTYPE, capture_path(ctx, root, "Error", "prototype", ex));
+    store(ctx, I_SYMBOL_STRING, capture_prototype(ctx, "Symbol", "toString", ex));
+    store(ctx, I_SYMBOL_VALUE, capture_prototype(ctx, "Symbol", "valueOf", ex));
+    store(ctx, I_NUMBER_VALUE, capture_prototype(ctx, "Number", "valueOf", ex));
+    store(ctx, I_STRING_VALUE, capture_prototype(ctx, "String", "valueOf", ex));
+    store(ctx, I_BOOLEAN_VALUE, capture_prototype(ctx, "Boolean", "valueOf", ex));
+    store(ctx, I_BIGINT_VALUE, capture_prototype(ctx, "BigInt", "valueOf", ex));
+    store(ctx, I_BUFFER_PROTOTYPE, capture_path(ctx, root, "Buffer", "prototype", ex));
+    store(ctx, I_TAG_SYMBOL, capture_path(ctx, root, "Symbol", "toStringTag", ex));
+    store(ctx, I_WEAKMAP_HAS, capture_prototype(ctx, "WeakMap", "has", ex));
+    store(ctx, I_WEAKSET_HAS, capture_prototype(ctx, "WeakSet", "has", ex));
+    store(ctx, I_JSON_STRINGIFY, capture_path(ctx, root, "JSON", "stringify", ex));
+    store(ctx, I_PARSE_INT, get(ctx, root, "parseInt", ex));
+    store(ctx, I_PARSE_FLOAT, get(ctx, root, "parseFloat", ex));
+    store(ctx, I_STRING, get(ctx, root, "String", ex));
+    store(ctx, I_FUNCTION_PROTOTYPE, capture_path(ctx, root, "Function", "prototype", ex));
+    store(ctx, I_GET_PROTOTYPE, capture_path(ctx, root, "Reflect", "getPrototypeOf", ex));
+    if (deref ex != null) {
+        return false;
+    }
+    // Iterator prototypes' next methods come from fresh private collections.
+    var map_ctor: ptr<u8> = get(ctx, root, "Map", ex);
+    var set_ctor: ptr<u8> = get(ctx, root, "Set", ex);
+    var construct: ptr<u8> = capture_path(ctx, root, "Reflect", "construct", ex);
+    if (deref ex != null) {
+        return false;
+    }
+    var no_values: ptr<u8> = null;
+    var list_ctor: ptr<u8> = get(ctx, root, "Array", ex);
+    no_values = wr_call(ctx, get(ctx, list_ctor, "of", ex), list_ctor, 0, null, ex);
+    if (deref ex != null || no_values == null) {
+        return false;
+    }
+    wr_protect(ctx, no_values);
+    var map_args: array<ptr<u8>, 2> = [map_ctor, no_values];
+    var map: ptr<u8> = wr_call(ctx, construct, null, 2, &map_args[0], ex);
+    var set_args: array<ptr<u8>, 2> = [set_ctor, no_values];
+    var set: ptr<u8> = wr_call(ctx, construct, null, 2, &set_args[0], ex);
+    wr_unprotect(ctx, no_values);
+    if (deref ex != null || map == null || set == null) {
+        return false;
+    }
+    var map_iterator: ptr<u8> = wr_call(ctx, intrinsic(ctx, I_MAP_ENTRIES), map, 0, null, ex);
+    var set_iterator: ptr<u8> = wr_call(ctx, intrinsic(ctx, I_SET_VALUES), set, 0, null, ex);
+    if (deref ex != null) {
+        return false;
+    }
+    store(ctx, I_MAP_NEXT, get(ctx, map_iterator, "next", ex));
+    store(ctx, I_SET_NEXT, get(ctx, set_iterator, "next", ex));
+    // util.inspect.custom is the shared registry symbol used by npm packages.
+    var symbol_ctor: ptr<u8> = get(ctx, root, "Symbol", ex);
+    var symbol_for: ptr<u8> = get(ctx, symbol_ctor, "for", ex);
+    var custom_name: ptr<u8> = wr_string_utf8("nodejs.util.inspect.custom");
+    var custom_args: array<ptr<u8>, 1> = [wr_string_value(ctx, custom_name)];
+    wr_string_release(custom_name);
+    if (deref ex == null) {
+        store(ctx, I_CUSTOM_SYMBOL, wr_call(ctx, symbol_for, symbol_ctor, 1, &custom_args[0], ex));
+    }
+    if (deref ex != null) {
+        return false;
+    }
+    for (var i: i64 = 0; i < INTRINSIC_COUNT; i++) {
+        if (i != I_INSPECT && i != I_BUFFER_PROTOTYPE && intrinsic(ctx, i) == null) {
+            fail(ctx, ex, 0, "cannot capture inspection intrinsics");
+            return false;
+        }
+    }
+    return true;
+}
+
+// util.inspect itself is excluded from custom hooks to avoid self-recursion.
+pub fun set_inspect_function(ctx: ptr<u8>, fn: ptr<u8>) {
+    store(ctx, I_INSPECT, fn);
+}
+
+pub fun shutdown_inspect(ctx: ptr<u8>) {
+    var s: ptr<InspectState> = state(ctx);
+    if (s == null) {
+        return;
+    }
+    for (var i: i64 = 0; i < INTRINSIC_COUNT; i++) {
+        if ((deref s.values)[i] != null) {
+            wr_unprotect(ctx, (deref s.values)[i]);
+            (deref s.values)[i] = null;
+        }
+    }
+    release_context_slot(ctx, INSPECT_SLOT, size_of<InspectState>() as i64);
+}

@@ -1,0 +1,246 @@
+// Primitive, string-escape and property-key formatting shared by inspection.
+import("std::math::float")::{float_to_bits_f64};
+import("./inspect_text")::{Inspector, Text, UNIT_CLOSE_BRACKET, UNIT_LOWER_N, UNIT_LOWER_S,
+    UNIT_OPEN_BRACKET, text_ascii, text_integer, text_js, text_spaces, text_unit, text_units};
+import("./inspect_engine")::{ARRAY_INDEX_LIMIT, I_SYMBOL_STRING, JS_STRING, JS_SYMBOL, MIN_LINE_WIDTH,
+    call0, failed, intrinsic};
+
+extern(c, "wr_type") fun wr_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_to_number") fun wr_to_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_to_string") fun wr_to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_characters") fun wr_string_characters(text: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_length") fun wr_string_length(text: ptr<u8>) -> i64;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+
+// Primitive formatting
+
+pub fun format_number(ins: ptr<Inspector>, dest: ptr<Text>, value: ptr<u8>) {
+    var number: f64 = wr_to_number(deref ins.ctx, value, deref ins.ex);
+    if (number == 0.0 && (float_to_bits_f64(number) >> 63) == 1) {
+        text_ascii(ins, dest, "-0");
+        return;
+    }
+    text_js(ins, dest, value);
+}
+
+pub fun format_bigint(ins: ptr<Inspector>, dest: ptr<Text>, value: ptr<u8>) {
+    text_js(ins, dest, value);
+    text_unit(ins, dest, UNIT_LOWER_N);
+}
+
+pub fun format_symbol(ins: ptr<Inspector>, dest: ptr<Text>, value: ptr<u8>) {
+    var result: ptr<u8> = call0(ins, intrinsic(deref ins.ctx, I_SYMBOL_STRING), value);
+    if (!failed(ins)) {
+        text_js(ins, dest, result);
+    }
+}
+
+pub fun hex_unit(value: i64) -> u16 {
+    if (value < 10) {
+        return (48 + value) as u16;
+    }
+    return (55 + value) as u16;
+}
+
+pub fun lower_hex_unit(value: i64) -> u16 {
+    if (value < 10) {
+        return (48 + value) as u16;
+    }
+    return (87 + value) as u16;
+}
+
+pub fun is_high_surrogate(unit: u16) -> bool {
+    return unit >= 55296 && unit <= 56319;
+}
+
+pub fun is_low_surrogate(unit: u16) -> bool {
+    return unit >= 56320 && unit <= 57343;
+}
+
+// Node's strEscape: choose ', " or ` and escape control and lone surrogate units.
+pub fun escape_units(ins: ptr<Inspector>, dest: ptr<Text>, units: ptr<u16>, length: i64) {
+    var has_single: bool = false;
+    var has_double: bool = false;
+    var has_backtick: bool = false;
+    for (var i: i64 = 0; i < length; i++) {
+        if (units[i] == 39) {
+            has_single = true;
+        } else if (units[i] == 34) {
+            has_double = true;
+        } else if (units[i] == 96) {
+            has_backtick = true;
+        } else if (units[i] == 36 && i + 1 < length && units[i + 1] == 123) {
+            has_backtick = true;
+        }
+    }
+    var quote: u16 = 39;
+    if (has_single) {
+        if (!has_double) {
+            quote = 34;
+        } else if (!has_backtick) {
+            quote = 96;
+        }
+    }
+    text_unit(ins, dest, quote);
+    for (var i: i64 = 0; i < length; i++) {
+        var unit: u16 = units[i];
+        if (unit == 39 && quote == 39) {
+            text_ascii(ins, dest, "\\'");
+        } else if (unit == 92) {
+            text_ascii(ins, dest, "\\\\");
+        } else if (unit == 8) {
+            text_ascii(ins, dest, "\\b");
+        } else if (unit == 9) {
+            text_ascii(ins, dest, "\\t");
+        } else if (unit == 10) {
+            text_ascii(ins, dest, "\\n");
+        } else if (unit == 12) {
+            text_ascii(ins, dest, "\\f");
+        } else if (unit == 13) {
+            text_ascii(ins, dest, "\\r");
+        } else if (unit < 32 || (unit >= 127 && unit <= 159)) {
+            text_ascii(ins, dest, "\\x");
+            text_unit(ins, dest, hex_unit((unit / 16) as i64));
+            text_unit(ins, dest, hex_unit((unit % 16) as i64));
+        } else if (is_high_surrogate(unit) && (i + 1 >= length || !is_low_surrogate(units[i + 1]))) {
+            escape_surrogate(ins, dest, unit);
+        } else if (is_low_surrogate(unit) && (i == 0 || !is_high_surrogate(units[i - 1]))) {
+            escape_surrogate(ins, dest, unit);
+        } else {
+            text_unit(ins, dest, unit);
+        }
+    }
+    text_unit(ins, dest, quote);
+}
+
+pub fun escape_surrogate(ins: ptr<Inspector>, dest: ptr<Text>, unit: u16) {
+    text_ascii(ins, dest, "\\u");
+    var value: i64 = unit as i64;
+    text_unit(ins, dest, lower_hex_unit((value / 4096) % 16));
+    text_unit(ins, dest, lower_hex_unit((value / 256) % 16));
+    text_unit(ins, dest, lower_hex_unit((value / 16) % 16));
+    text_unit(ins, dest, lower_hex_unit(value % 16));
+}
+
+pub fun format_string(ins: ptr<Inspector>, dest: ptr<Text>, value: ptr<u8>) {
+    if (failed(ins)) {
+        return;
+    }
+    var js: ptr<u8> = wr_to_string(deref ins.ctx, value, deref ins.ex);
+    if (js == null) {
+        return;
+    }
+    var units: ptr<u16> = wr_string_characters(js);
+    var length: i64 = wr_string_length(js);
+    var remaining: i64 = 0;
+    if (length > deref ins.max_string) {
+        remaining = length - deref ins.max_string;
+        length = deref ins.max_string;
+    }
+    var width: i64 = deref ins.break_length - deref ins.indentation - 4;
+    if (length > MIN_LINE_WIDTH && length > width) {
+        // Long strings are split after each newline and joined with " +".
+        var start: i64 = 0;
+        var first: bool = true;
+        for (var i: i64 = 0; i < length; i++) {
+            if (units[i] == 10 || i == length - 1) {
+                if (!first) {
+                    text_ascii(ins, dest, " +\n");
+                    text_spaces(ins, dest, deref ins.indentation + 2);
+                }
+                escape_units(ins, dest, units + start, i + 1 - start);
+                start = i + 1;
+                first = false;
+            }
+        }
+    } else {
+        escape_units(ins, dest, units, length);
+    }
+    wr_string_release(js);
+    if (remaining > 0) {
+        text_ascii(ins, dest, "... ");
+        text_integer(ins, dest, remaining);
+        text_ascii(ins, dest, " more character");
+        if (remaining > 1) {
+            text_unit(ins, dest, UNIT_LOWER_S);
+        }
+    }
+}
+
+pub fun is_identifier(units: ptr<u16>, length: i64) -> bool {
+    if (length == 0) {
+        return false;
+    }
+    for (var i: i64 = 0; i < length; i++) {
+        var unit: u16 = units[i];
+        var letter: bool = (unit >= 65 && unit <= 90) || (unit >= 97 && unit <= 122) || unit == 95;
+        var digit: bool = unit >= 48 && unit <= 57;
+        if (!letter && !(digit && i > 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fun format_key(ins: ptr<Inspector>, dest: ptr<Text>, key: ptr<u8>, enumerable: bool) {
+    var ctx: ptr<u8> = deref ins.ctx;
+    if (wr_type(ctx, key) == JS_SYMBOL) {
+        if (!enumerable) {
+            text_unit(ins, dest, UNIT_OPEN_BRACKET);
+        }
+        format_symbol(ins, dest, key);
+        if (!enumerable) {
+            text_unit(ins, dest, UNIT_CLOSE_BRACKET);
+        }
+        return;
+    }
+    var js: ptr<u8> = wr_to_string(ctx, key, deref ins.ex);
+    if (js == null) {
+        return;
+    }
+    var units: ptr<u16> = wr_string_characters(js);
+    var length: i64 = wr_string_length(js);
+    var is_proto: bool = length == 9 && units[0] == 95 && units[1] == 95 && units[2] == 112 && units[7] == 95 &&
+        units[8] == 95;
+    if (is_proto) {
+        text_ascii(ins, dest, "['__proto__']");
+    } else if (!enumerable) {
+        text_unit(ins, dest, UNIT_OPEN_BRACKET);
+        text_units(ins, dest, units, length);
+        text_unit(ins, dest, UNIT_CLOSE_BRACKET);
+    } else if (is_identifier(units, length)) {
+        text_units(ins, dest, units, length);
+    } else {
+        escape_units(ins, dest, units, length);
+    }
+    wr_string_release(js);
+}
+
+// Canonical array index below `limit`, or -1.
+pub fun index_key(ins: ptr<Inspector>, key: ptr<u8>, limit: f64) -> f64 {
+    var ctx: ptr<u8> = deref ins.ctx;
+    if (wr_type(ctx, key) != JS_STRING) {
+        return -1.0;
+    }
+    var ignored: ptr<u8> = null;
+    var js: ptr<u8> = wr_to_string(ctx, key, &ignored);
+    if (js == null) {
+        return -1.0;
+    }
+    var units: ptr<u16> = wr_string_characters(js);
+    var length: i64 = wr_string_length(js);
+    var value: f64 = 0.0;
+    var valid: bool = length > 0 && length <= 10 && !(length > 1 && units[0] == 48);
+    for (var i: i64 = 0; i < length && valid; i++) {
+        if (units[i] < 48 || units[i] > 57) {
+            valid = false;
+        } else {
+            value = value * 10.0 + ((units[i] - 48) as f64);
+        }
+    }
+    wr_string_release(js);
+    if (!valid || value >= limit || value >= ARRAY_INDEX_LIMIT) {
+        return -1.0;
+    }
+    return value;
+}

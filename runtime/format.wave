@@ -1,8 +1,10 @@
 // util.format placeholder handling and formatted console output.
 // Placeholders follow Node's formatWithOptions: %s %d %i %f %j %o %O %c %%.
-import("./inspect")::{Inspector, Text, inspector_init, inspector_options, inspector_free, inspector_finish, inspector_depth,
+import("./inspect_text")::{Inspector, Text, text_to_value};
+import("./inspect")::{inspector_init, inspector_options, inspector_free, inspector_finish, inspector_depth,
     format_value, text_create, text_release, text_add_ascii, text_add_units, text_add_js, text_add_number,
-    text_to_value, inspect_failed, inspect_intrinsic, builtin_to_string, INSPECT_JSON_STRINGIFY, INSPECT_PARSE_INT,
+    builtin_to_string};
+import("./inspect_engine")::{is_proxy, inspect_failed, inspect_intrinsic, INSPECT_JSON_STRINGIFY, INSPECT_PARSE_INT,
     INSPECT_PARSE_FLOAT, INSPECT_STRING};
 import("./values")::{coerce_number, get};
 import("./output")::{write_units};
@@ -67,11 +69,34 @@ fun string_placeholder(ins: ptr<Inspector>, value: ptr<u8>, dest: ptr<Text>) {
     var kind: i32 = wr_type(deref ins.ctx, value);
     if (kind == JS_NUMBER || kind == JS_BIGINT) {
         text_add_number(ins, dest, value);
+    } else if (kind == JS_OBJECT && is_proxy(deref ins.ctx, value)) {
+        // toString must not be read from a Proxy: that would run its get trap.
+        inspect_argument(ins, value, STRING_PLACEHOLDER_DEPTH, dest);
     } else if (kind != JS_OBJECT || wr_callable(deref ins.ctx, value) || !builtin_to_string(ins, value)) {
         append_string_conversion(ins, value, dest);
     } else {
         inspect_argument(ins, value, STRING_PLACEHOLDER_DEPTH, dest);
     }
+}
+
+// wjson reports cycles as "cyclic object cannot be serialized"; match the
+// stable "cycli" prefix so a wording tweak in the tail does not matter.
+const CYCLE_PREFIX: array<u16, 5> = [99, 121, 99, 108, 105];
+
+fun mentions_cycle(units: ptr<u16>, length: i64) -> bool {
+    var prefix_length: i64 = 5;
+    for (var start: i64 = 0; start + prefix_length <= length; start++) {
+        var matches: bool = true;
+        for (var offset: i64 = 0; offset < prefix_length; offset++) {
+            if (units[start + offset] != CYCLE_PREFIX[offset]) {
+                matches = false;
+            }
+        }
+        if (matches) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fun json_placeholder(ins: ptr<Inspector>, value: ptr<u8>, dest: ptr<Text>) {
@@ -86,14 +111,7 @@ fun json_placeholder(ins: ptr<Inspector>, value: ptr<u8>, dest: ptr<Text>) {
         if (wr_type(ctx, message) == JS_STRING) {
             var js: ptr<u8> = wr_to_string(ctx, message, deref ins.ex);
             if (js != null) {
-                var units: ptr<u16> = wr_string_characters(js);
-                var length: i64 = wr_string_length(js);
-                for (var i: i64 = 0; i + 5 <= length; i++) {
-                    if (units[i] == 99 && units[i + 1] == 121 && units[i + 2] == 99 && units[i + 3] == 108 &&
-                        units[i + 4] == 105) {
-                        cyclic = true;
-                    }
-                }
+                cyclic = mentions_cycle(wr_string_characters(js), wr_string_length(js));
                 wr_string_release(js);
             }
         }

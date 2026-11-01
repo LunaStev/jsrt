@@ -1,5 +1,18 @@
 # 다음 대화 시작점
 
+## 후속: 지연 조사·구조 정리 — 2026-11-02 (Asia/Seoul)
+
+승인된 계획의 1~4번을 실행했다. 우선 범위 질문에 사용자는
+"Wave JS 런타임인 건 아냐?"라고 답했다. Node 앱 종류로 범위를 정하지 말고 Wave 쪽 품질을 먼저 한다.
+
+- 지연 5514 ms는 회귀가 아니다(이전/현재 각 3회: 3296~3783 / 3089~3501 ms). IMPLEMENTATION.md 참조.
+- inspect.wave를 5개 모듈로 분할, 문자 코드 상수화, Proxy는 트랩 없이 `Proxy(<target unavailable>)`.
+- 하네스 `expect_within` 추가(TLS 통합만 60초). 기본 10초는 그대로다.
+- 전체 회귀 **1058/0/0**. 새 release는 만들지 않았다. 최신 archive 24dd2de3…는 이번 소스 변경 전의 것이다.
+- 남은 계획: 5번(target 정리)은 사용자 허락 후에만. 엔진 후보 10개·archive 7개가 1.8 GB를 차지한다.
+  Proxy 대상 출력은 엔진 패치(JSRTProxyTarget)와 엔진 재빌드가 필요하다.
+- process.chdir·querystring.stringify·timers/promises는 실제 필요가 생길 때 추가한다.
+
 ## 최신 코어 API 확장·git 초기화·새 release — 2026-11-02 (Asia/Seoul)
 
 사용자가 전체 검토를 요청했고, 이어서 검토에서 나온 1~5번(git, 기본 API, 빌드 안내/CI, HTTPS 업로드 취소,
