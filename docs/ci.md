@@ -53,3 +53,12 @@ Ubuntu의 uutils multicall과 PRoot 임시 실행 파일 이름이 충돌해 dis
 [Ubuntu coreutils provider 전환](https://ubuntu.com/server/docs/reference/other-tools/sudo-rs/),
 [Ubuntu Base 26.04 SHA-256](https://cdimage.ubuntu.com/ubuntu-base/releases/26.04/release/SHA256SUMS),
 [26.10 SHA-256](https://cdimage.ubuntu.com/ubuntu-base/releases/26.10/release/SHA256SUMS).
+
+## release 산출물 선택
+
+self-hosted runner의 `target/dist/`에는 이전 실행의 archive가 남을 수 있다. release.yml은
+`./bootstrap.sh release` 출력의 `Release artifact: <경로>` 줄에서 이번 실행의 archive를 고르고,
+그 파일과 `.sha256`만 `target/upload/`로 복사한다. 서명, artifact 업로드, 이후 Linux 검사는
+이 디렉터리의 파일 하나만 사용하며 여러 개이거나 없으면 실패한다. Linux 검사는
+`linux-check --archive`로 정확한 파일을 전달한다. 이 변경은 YAML 구문만 확인했고
+actionlint와 실제 원격 실행은 아직 하지 않았다.

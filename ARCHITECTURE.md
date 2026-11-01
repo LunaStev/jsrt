@@ -50,6 +50,9 @@ HTTP 연결 수명 관리가 맡고, 명시적 destroy와 오류는 기존 HTTP 
 | `runtime/abort_state.wave` | EventTarget·Abort API가 공유하는 컨텍스트별 취소 상태·구독; 상위 API를 import하지 않음 |
 | `runtime/web_stream_core.wave`, `web_readable.wave`, `web_writable.wave` | Web stream 상태·JSC Promise capability·default source/sink |
 | `runtime/web_transform.wave`, `web_composition.wave`, `web_stream_adapter.wave` | 변환 역압력·pipe/tee/반복·호스트 Readable 연결 |
+| `runtime/inspect.wave`, `format.wave` | Node식 inspect 알고리즘(UTF-16 출력 버퍼·캡처한 Reflect/내장 메서드)과 util.format 자리표시자; console이 공유 |
+| `runtime/process_extras.wave` | process.exit/hrtime/uptime/memoryUsage, global, performance.now, atob/btoa |
+| `runtime/callbacks.wave` | util.callbackify와 콜백 fs; 두 단계 설치(fs 정의 → nextTick 캡처) |
 | `runtime/json_source.wave` | wjson 검증 뒤 reviver의 원문 span·초기 값 대응 |
 | `runtime/package_workspaces.wave` | 프로젝트 descriptor 기반 workspace 발견·원본 무결성·관리 스냅샷 복사 |
 | `runtime/package_versions.wave` | 일반 범위와 공유 부모 범위의 peer 교집합 버전 선택 |

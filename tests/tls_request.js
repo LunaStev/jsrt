@@ -103,7 +103,7 @@ async function abortedUploads(url, caFile) {
     const blobAbort = new AbortController();
     const blobReason = Error('blob upload aborted');
     const blobMark = (await stats(url, caFile)).received;
-    const blobFetch = fetch(url + 'hold-upload', {method: 'POST', body: new Blob([new Uint8Array(4 * 1024 * 1024)]),
+    const blobFetch = fetch(url + 'hold-upload-slow', {method: 'POST', body: new Blob([new Uint8Array(4 * 1024 * 1024)]),
         signal: blobAbort.signal, caFile});
     check(await until(async () => (await stats(url, caFile)).received > blobMark + 65536));
     blobAbort.abort(blobReason);

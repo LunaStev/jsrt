@@ -43,9 +43,9 @@ ESM·Worker·structuredClone은 해당 엔진 ABI가 필요하며 실제 가능 
 | --- | --- |
 | 실행 | JavaScript, CommonJS, 내장 모듈의 node: 별칭, 명시적 파일 test 명령 |
 | ESM | 정적·동적 import, live binding·순환·캐시, top-level await, import.meta, 패키지 조건, CJS 기본 export·JSON·내장 모듈 연결 |
-| 기본 API | console, Buffer 부분 API, EventEmitter, 타이머·queueMicrotask, URL·URLSearchParams·Headers 부분 API |
+| 기본 API | Node식 console·util.inspect/format, Buffer 부분 API, EventEmitter, Timeout 객체(ref/unref)·setImmediate·queueMicrotask, util.callbackify·콜백 fs 일부, global·atob/btoa·performance.now, URL·URLSearchParams·Headers 부분 API |
 | Web 기반 | UTF-8 TextEncoder/Decoder, Event·EventTarget·DOMException 부분 API, 기본 Web Streams·pipe·tee·비동기 반복 |
-| process | argv·env·cwd·execPath·platform·arch·versions·exitCode, beforeExit·exit·SIGTERM/SIGINT, stdin·stdout·stderr, nextTick |
+| process | argv·env·cwd·execPath·platform·arch·versions·exitCode, exit()·hrtime·uptime·memoryUsage·pid, beforeExit·exit·SIGTERM/SIGINT, stdin·stdout·stderr, nextTick |
 | 파일 | 동기·Promise 파일 API, Dirent, FileHandle 부분 API, 파일 읽기·쓰기 스트림 |
 | 스트림 | Readable·Writable·Duplex·Transform·PassThrough, object mode, UTF-8 setEncoding, 역압력, cork/uncork·writev, 생성자 signal, finished·pipeline |
 | HTTP | libuv·llhttp 서버, keep-alive·스트리밍·I/O 기한, libcurl HTTP(S) 클라이언트·fetch·취소·스트리밍 업로드 |

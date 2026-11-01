@@ -78,6 +78,46 @@ exit 이벤트, stdout/stderr Writable을 추가했다. stdio는 동기 descript
 util.inherits와 기본 구분자 querystring.parse/decode를 추가했다. querystring은 기존 Wave form decoder를
 사용하며 입력 8191바이트/1024쌍 한도, 다른 구분자·options·stringify는 지원하지 않는다.
 
+## 코어 전역·유틸리티 (2026-11)
+
+**console / util.inspect / util.format.** console.log·info·debug는 stdout, error·warn은 stderr에 쓰며
+모두 Node의 formatWithOptions를 따르는 Wave 포매터(runtime/inspect.wave, format.wave)를 거친다.
+`%s %d %i %f %j %o %O %c %%`를 지원하고, 객체는 Node처럼 줄 폭 80·깊이 2·배열 100개 한도로 출력한다.
+숫자 배열 열 맞춤, 순환 `<ref *1>`/`[Circular *1]`, Map/Set/배열/typed array/ArrayBuffer/Buffer/Date/
+RegExp/Error(stack 줄을 `at` 형식으로 변환)/박싱 원시값/함수·클래스/null prototype/`Symbol.toStringTag`/
+`[util.inspect.custom]`을 처리한다. 접근자는 `[Getter]`·`[Setter]`로만 표시하며 호출하지 않는다.
+옵션은 depth·breakLength·maxArrayLength·maxStringLength만 읽고 나머지(colors, compact, sorted,
+showHidden 등)는 무시한다. 출력은 UTF-16 4Mi 단위, 중첩 256단계로 제한한다.
+알려진 차이: `%o`의 showHidden 출력(`[length]`)과 Promise 상태(`Promise { <unknown> }`), WeakMap/WeakSet
+내용, Proxy 감지(JSC C API로 식별할 수 없어 트랩이 관찰될 수 있음), `[Arguments]`, Buffer의
+`constructor.name`은 Uint8Array이므로 라벨을 고정 `<Buffer …>`로 표시한다.
+출력은 tests/core_globals.js의 선택 사례와 설치된 Node의 출력을 대조했으며 전체 적합성 검사는 아니다.
+
+**util.callbackify / 콜백 fs.** `util.callbackify`와 `fs.readFile·writeFile·stat·lstat·access·mkdir·unlink·
+rmdir·rename·readdir`의 콜백 형태를 제공한다. 마지막 인자가 함수가 아니면 `ERR_INVALID_ARG_TYPE`을
+동기적으로 던지고, 결과는 `process.nextTick`으로 전달한다. 거짓 거부 값은 `ERR_FALSY_VALUE_REJECTION`
+오류로 감싼다. 콜백 형태의 open/close/read/write/appendFile 등은 아직 없다.
+
+**타이머.** setTimeout·setInterval은 Timeout 객체를 반환하고 `ref`·`unref`·`hasRef`·`refresh`·`close`와
+`Symbol.toPrimitive`(숫자 id)를 제공한다. 숫자 id와 객체 모두 clearTimeout/clearInterval에 쓸 수 있다.
+`unref`된 타이머는 다른 작업이 남아 있으면 정상 실행하지만 그것만으로 이벤트 루프를 유지하지 않는다.
+setImmediate/clearImmediate는 지연 0의 같은 타이머 저장소를 쓰며 Node의 check 단계와 정확히 같은
+순서를 보장하지 않는다. 기존 1024개·인자 64개 한도를 공유한다.
+
+**process.** `exit([code])`, `hrtime([prev])`/`hrtime.bigint()`, `uptime()`, `memoryUsage()`/`.rss()`,
+`pid`, `ppid`를 추가했다. exit 코드는 exitCode와 같은 정수 0..255만 받는다(Node는 범위를 잘라 쓴다).
+exit는 'exit' 이벤트를 실행하고 소유한 자식 프로세스와 Worker를 회수한 뒤 종료한다. 이후 JS는
+실행되지 않지만 이미 열린 파일·소켓의 정리는 프로세스 종료에 맡긴다. Worker 안에서는 거부한다.
+memoryUsage는 JSC C API가 힙 통계를 주지 않아 rss만 /proc/self/statm에서 읽고 heapTotal·heapUsed·
+external·arrayBuffers는 0이다.
+
+**전역.** `global`(globalThis 별칭), `performance.now()`/`timeOrigin`(다른 Performance API 없음),
+`atob`/`btoa`(HTML 표준의 forgiving-base64, 실패 시 DOMException InvalidCharacterError)를 제공한다.
+
+아직 없는 것: `timers/promises`, `url.fileURLToPath`/`pathToFileURL`(URL이 file: 스킴을 표현하지 못함),
+`querystring.stringify`, `util.deprecate`/`promisify.custom`, `assert.deepStrictEqual`, `process.chdir`/`kill`,
+`net`/`tls`/`dns`/`zlib`/`readline`/`tty`/`async_hooks`/`perf_hooks`/`module`, `crypto.subtle`.
+
 ## 스트림·CLI 확장
 
 Readable/Writable/Duplex/Transform/PassThrough 생성자의 signal을 private 취소 알고리즘에 연결한다.

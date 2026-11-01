@@ -29,7 +29,9 @@ UTF-8 codec·EventTarget·기본 Web Streams·Readable adapter를 추가했다.
 - 2026-10-28에 새 API/CLI npm 앱과 Request·Blob·FormData·Web Stream의 HTTP 업로드,
   HTTP 응답의 Readable.toWeb 변환을 실제 TCP로 확인했다. 공개 npm HTTPS 검사도 통과했다.
   독립 TLS 상대에서 HTTPS 업로드·느린 읽기·활성 응답 취소·downgrade 거부·과대 헤더 실패의
-  자원 회수도 통과했다. 진행 중인 업로드의 중간 취소와 추가 동시성 조합은 남아 있다.
+  자원 회수도 통과했다. 2026-11-02에 진행 중인 업로드의 중간 취소(느린/빠른 스트림, 24회 반복으로 슬롯
+  회수, 완료·취소 동시 실행, Blob)를 상대 쪽 전송 중단 카운터로 확인했다. 그 밖의 전이 조합(redirect 중 취소,
+  취소와 서버 응답의 경합 등)은 남아 있다.
 - 저장소 URL·self-hosted runner를 연결한 뒤 준비된 CI를 실제 원격 VM에서 실행한다.
   CI 파일 구현·로컬 설정 검사·실제 원격 실행은 구분한다.
 - 2026-10-28 새 로컬 release는 일반/이동 배포용 후보 각각의 필수 TCP/npm·설치·복구·삭제와
@@ -48,11 +50,11 @@ UTF-8 codec·EventTarget·기본 Web Streams·Readable adapter를 추가했다.
 | Web Streams | byte/BYOB·transfer, 추가 queuing strategy·codec stream 클래스와 WPT 적합성 |
 | Web 본문 | 네트워크 Response clone, Request 스트리밍 생성자, File·multipart 파싱·추가 Body 메서드와 Fetch 옵션 |
 | 텍스트·이벤트 | UTF-8 이외 decoder, legacy Event 필드·전체 DOM dispatch 적합성 |
-| process | TTY·raw mode, stdio 배열, IPC, 자식 env/cwd·추가 spawn 옵션 |
-| 파일 | FileHandle 추가 overload·vectored I/O·스트림, callback fs·watch·권한 변경 등 |
+| process | TTY·raw mode, stdio 배열, IPC, 자식 env/cwd·추가 spawn 옵션, chdir·kill, 힙 통계 |
+| 파일 | FileHandle 추가 overload·vectored I/O·스트림, 콜백 형태의 open/close/read/write/appendFile 등, watch·권한 변경 등 |
 | 네트워크 | 독립 net/tls/dns, 서버 TLS, upgrade/WebSocket·압축·프록시, 추가 Fetch/HTTP 옵션과 실패 전이 |
 | 패키지 | 일반 glob·nested/개발 링크 workspaces, 그래프 backtracking·전역 hoisting·추가 optional/peer 풀이, 인증·bin/scripts |
-| 모듈·유틸리티 | require(ESM)·CJS named export 추론, file/기타 URL, querystring.stringify·추가 assert/util/crypto 등 |
+| 모듈·유틸리티 | require(ESM)·CJS named export 추론, file/기타 URL(fileURLToPath 포함), querystring.stringify, timers/promises, util.deprecate·promisify.custom, assert.deepStrictEqual, 추가 crypto 등 |
 | Worker·애드온 | MessageChannel·transfer·추가 clone 형식, 확장 Node-API·실제 SDK 패키지 사례 |
 | 개발 도구 | REPL·watch·source map·디버거·프로파일링·타입 선언 |
 

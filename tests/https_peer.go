@@ -17,7 +17,7 @@ import (
 const maxBodyBytes = 8 * 1024 * 1024
 
 // Upload counters let the client prove that an abort reached the transport.
-// received counts body bytes read by /hold-upload; aborted counts uploads whose
+// received counts body bytes read by the hold-upload endpoints; aborted counts uploads whose
 // body ended with a transport error instead of a clean EOF.
 var receivedBytes int64
 var abortedUploads int64
@@ -64,10 +64,17 @@ func main() {
             }
             w.Header().Set("X-Upload-Type", r.Header.Get("Content-Type"))
             _, _ = w.Write(body)
-        case "/hold-upload":
-            // Reads slowly and never replies, so the request stays in flight until
-            // the client aborts or the safety deadline passes.
-            chunk := make([]byte, 4096)
+        case "/hold-upload", "/hold-upload-slow":
+            // Never replies until the body ends, so the request stays in flight until
+            // the client aborts or the safety deadline passes. The slow variant
+            // reads 4 KiB per millisecond so a finite body cannot finish first.
+            size := 65536
+            pause := time.Duration(0)
+            if r.URL.Path == "/hold-upload-slow" {
+                size = 4096
+                pause = time.Millisecond
+            }
+            chunk := make([]byte, size)
             deadline := time.Now().Add(15 * time.Second)
             for time.Now().Before(deadline) {
                 n, readErr := r.Body.Read(chunk)
@@ -80,7 +87,9 @@ func main() {
                     atomic.AddInt64(&abortedUploads, 1)
                     return
                 }
-                time.Sleep(time.Millisecond)
+                if pause > 0 {
+                    time.Sleep(pause)
+                }
             }
         case "/stats":
             fmt.Fprintf(w, "%d %d", atomic.LoadInt64(&receivedBytes), atomic.LoadInt64(&abortedUploads))
