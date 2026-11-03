@@ -82,7 +82,9 @@ html {
   margin: 0 1rem 0 0.25rem;
   padding: 0;
   color: $jsrt-muted;
-  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  appearance: none;
   border: 1px solid $border-color;
   border-radius: 10px;
   cursor: pointer;
