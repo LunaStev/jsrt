@@ -4,8 +4,8 @@
 // Map, Date and friends by user code cannot change the comparison. The walk is
 // bounded (depth and step limits) and cycle-safe: a pair of objects already on the
 // current path is assumed equal, which is what makes recursive structures finite.
-// Symbol-keyed properties, property descriptors and WeakMap/WeakSet/Promise
-// contents are not compared; those values are equal only when identical.
+// Enumerable own symbol keys are compared like string keys. Property descriptors and
+// WeakMap/WeakSet/Promise contents are not compared; those values are equal only when identical.
 import("std::mem::alloc")::{mem_alloc_zeroed, mem_free};
 import("std::mem::cstr")::{mem_eq_cstr};
 import("./byte_codec")::{encode_utf8};
@@ -29,6 +29,7 @@ extern(c, "wr_construct") fun construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64,
 
 // JSType codes returned by wr_type, and error kinds understood by values.fail.
 const TYPE_OBJECT: i32 = 5;
+const TYPE_SYMBOL: i32 = 6;
 const ERROR_RANGE: i32 = 2;
 
 const DEEP_DEPTH_LIMIT: i64 = 64;
@@ -50,10 +51,13 @@ const FN_BOOLEAN_VALUE: i64 = 11;
 const FN_UINT8_ARRAY: i64 = 12;
 const FN_BIGINT_VALUE: i64 = 13;
 const FN_SYMBOL_VALUE: i64 = 14;
-const DEEP_FUNCTION_COUNT: i64 = 15;
+// Object.getOwnPropertySymbols and Reflect.get: symbol keys cannot go through wr_get.
+const FN_SYMBOLS: i64 = 15;
+const FN_REFLECT_GET: i64 = 16;
+const DEEP_FUNCTION_COUNT: i64 = 17;
 
 pub struct DeepIntrinsics {
-    functions: array<ptr<u8>, 15>;
+    functions: array<ptr<u8>, 17>;
 }
 
 // Per-comparison scratch: the active path for cycle detection and a step budget.
@@ -76,6 +80,8 @@ pub fun deep_install(ctx: ptr<u8>, table: ptr<DeepIntrinsics>, ex: ptr<ptr<u8>>)
     (deref table.functions)[FN_SAME] = capture(ctx, object_ctor, "is", ex);
     (deref table.functions)[FN_GET_PROTOTYPE] = capture(ctx, object_ctor, "getPrototypeOf", ex);
     (deref table.functions)[FN_KEYS] = capture(ctx, object_ctor, "keys", ex);
+    (deref table.functions)[FN_SYMBOLS] = capture(ctx, object_ctor, "getOwnPropertySymbols", ex);
+    (deref table.functions)[FN_REFLECT_GET] = capture(ctx, get(ctx, root, "Reflect", ex), "get", ex);
     (deref table.functions)[FN_TAG] = capture(ctx, object_proto, "toString", ex);
     (deref table.functions)[FN_HAS_OWN] = capture(ctx, object_proto, "hasOwnProperty", ex);
     (deref table.functions)[FN_IS_ENUMERABLE] = capture(ctx, object_proto, "propertyIsEnumerable", ex);
@@ -213,7 +219,16 @@ fun tag_code(ctx: ptr<u8>, tag: ptr<u8>, ex: ptr<ptr<u8>>) -> i64 {
 }
 
 // Reads a property through a key value produced by Object.keys.
-fun read_property(ctx: ptr<u8>, owner: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+fun read_property(ctx: ptr<u8>, run: ptr<DeepRun>, owner: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (kind(ctx, key) == TYPE_SYMBOL) {
+        // Converting a symbol to a string throws, so symbols are read through Reflect.get.
+        var pair: array<ptr<u8>, 2> = [owner, key];
+        var value: ptr<u8> = call(ctx, intrinsic(run, FN_REFLECT_GET), null, 2, &pair[0], ex);
+        if (value == null || deref ex != null) {
+            return undefined(ctx);
+        }
+        return value;
+    }
     var raw: ptr<u8> = to_string(ctx, key, ex);
     if (raw == null || deref ex != null) {
         return undefined(ctx);
@@ -229,12 +244,12 @@ fun read_property(ctx: ptr<u8>, owner: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) 
 // Getter results are temporaries, so they stay protected during the recursive walk.
 fun compare_property(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: ptr<u8>, key: ptr<u8>,
     ex: ptr<ptr<u8>>) -> bool {
-    var value_a: ptr<u8> = read_property(ctx, a, key, ex);
+    var value_a: ptr<u8> = read_property(ctx, run, a, key, ex);
     if (deref ex != null) {
         return false;
     }
     protect(ctx, value_a);
-    var value_b: ptr<u8> = read_property(ctx, b, key, ex);
+    var value_b: ptr<u8> = read_property(ctx, run, b, key, ex);
     var result: bool = false;
     if (deref ex == null) {
         protect(ctx, value_b);
@@ -255,6 +270,48 @@ fun has_enumerable(ctx: ptr<u8>, run: ptr<DeepRun>, owner: ptr<u8>, key: ptr<u8>
     }
     var enumerable: ptr<u8> = call(ctx, intrinsic(run, FN_IS_ENUMERABLE), owner, 1, &arguments[0], ex);
     return deref ex == null && truth(ctx, enumerable);
+}
+
+// Counts enumerable own symbols of owner. When other is not null, each one must also be an
+// enumerable own symbol of other with an equal value (checked in the a-to-b direction only;
+// equal counts then prove the two symbol sets match).
+fun scan_symbols(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, owner: ptr<u8>, other: ptr<u8>, matched: ptr<bool>,
+    ex: ptr<ptr<u8>>) -> i64 {
+    var symbols: ptr<u8> = unary(ctx, run, FN_SYMBOLS, owner, ex);
+    if (deref ex != null) {
+        return 0;
+    }
+    protect(ctx, symbols);
+    var total: i64 = length(ctx, symbols, ex);
+    var enumerable_count: i64 = 0;
+    for (var i: i64 = 0; deref ex == null && i < total; i++) {
+        var symbol: ptr<u8> = at(ctx, symbols, i, ex);
+        var counted: bool = deref ex == null && has_enumerable(ctx, run, owner, symbol, ex);
+        if (counted) {
+            enumerable_count += 1;
+        }
+        if (counted && other != null && deref matched) {
+            var present: bool = has_enumerable(ctx, run, other, symbol, ex);
+            if (deref ex == null && present) {
+                deref matched = compare_property(ctx, run, depth, owner, other, symbol, ex);
+            } else {
+                deref matched = false;
+            }
+        }
+    }
+    unprotect(ctx, symbols);
+    return enumerable_count;
+}
+
+fun compare_symbols(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var matched: bool = true;
+    var count_a: i64 = scan_symbols(ctx, run, depth, a, b, &matched, ex);
+    if (deref ex != null || !matched) {
+        return false;
+    }
+    var unused: bool = true;
+    var count_b: i64 = scan_symbols(ctx, run, depth, b, null, &unused, ex);
+    return deref ex == null && count_a == count_b;
 }
 
 fun compare_keys(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
@@ -279,6 +336,9 @@ fun compare_keys(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: ptr
         unprotect(ctx, keys_b);
     }
     unprotect(ctx, keys_a);
+    if (result && deref ex == null) {
+        result = compare_symbols(ctx, run, depth, a, b, ex);
+    }
     return result;
 }
 

@@ -123,11 +123,11 @@ external·arrayBuffers는 0이다.
 
 **2026-11-03 추가.** `querystring.stringify`/`encode`는 기본 구분자만 지원한다(공백은 `%20`, `!'()*~`는 유지,
 문자열·유한 숫자·bigint·boolean 외 값은 빈 문자열, 배열은 키 반복, 쌍 한도는 URLSearchParams와 같다).
-`process.chdir(path)`는 문자열만 받고 실패하면 현재 디렉터리를 유지하며 Worker 안에서는 거부한다.
+`process.chdir(path)`는 문자열만 받고 실패하면 현재 디렉터리를 유지하며 Worker 안에서는 거부한다. 실패 오류에는 파일 API와 같은 `code`·`errno`·`syscall`·`path`가 붙는다(ENOENT·ENOTDIR·EACCES 등).
 작업 디렉터리는 프로세스 전체가 공유하므로 이미 대기 중인 상대 경로 비동기 파일 작업이 바뀐 디렉터리에서
 실행될 수 있다. `assert.deepStrictEqual`/`notDeepStrictEqual`은 `Object.is`, 프로토타입, 태그, 열거 가능한 문자열 키,
 Date·RegExp·원시 래퍼·Error·Map·Set·ArrayBuffer·typed array를 구조 비교한다. 순환은 지원하고
-깊이 64·비교 200만 단계를 넘으면 RangeError다. Symbol 키·WeakMap/Promise 내용은 비교하지 않고 같은 객체일 때만 같다.
+깊이 64·비교 200만 단계를 넘으면 RangeError다. 열거 가능한 own Symbol 키는 문자열 키처럼 비교하고(열거 불가 Symbol은 무시), WeakMap/Promise 내용은 비교하지 않고 같은 객체일 때만 같다.
 `deepEqual`/`notDeepEqual`은 기존 `equal` 별칭처럼 엄격 비교와 같다(느슨한 비교가 아니다).
 `timers/promises`는 `setTimeout`/`setImmediate`/`scheduler.wait`/`scheduler.yield`를 제공하며 옵션(signal·ref)을
 주면 거부하고 setInterval 비동기 반복자는 없다. `timers`도 `setImmediate`/`clearImmediate`/`promises`를 노출한다.
