@@ -75,17 +75,7 @@ uses the timer store and does not guarantee Node.js's check-phase ordering.
 `process.nextTick` runs before Promise jobs on ordinary host entry returns.
 Ticks scheduled by a Promise job run after the current engine checkpoint.
 
-`events.once(emitter, name)` returns a Promise for the next `name` event, resolved
-with the array of event arguments, and rejects if an `'error'` event arrives first
-(waiting for `'error'` itself resolves with its arguments). Both pending listeners
-are removed either way. Bad arguments and the unsupported `signal` option reject
-instead of throwing. Event names must be strings or symbols. `events.listenerCount`
-is the legacy static form; `events.on` (the async iterator) is not implemented.
-
-An `'exit'` listener may change `process.exitCode`; the final exit status uses the
-new value, as in Node.
-
-`process` includes identification fields (`version`, `title`, `argv0`, `execArgv`, `release`), environment and arguments, `cwd`,
+`process` includes identification fields, environment and arguments, `cwd`,
 `chdir`, exit handling, `hrtime`, `uptime`, `memoryUsage`, and selected process
 events. `process.version` and `versions.jsrt` identify jsrt; `versions.node` is
 absent. `memoryUsage` reports RSS, with JavaScript heap and external-memory fields
@@ -109,33 +99,7 @@ custom environment or working directory, and IPC are not supported.
 Callback forms exist for `readFile`, `writeFile`, `stat`, `lstat`, `access`,
 `mkdir`, `unlink`, `rmdir`, `rename`, and `readdir`. Completion uses `nextTick`.
 Callback `open`, `close`, `read`, `write`, and `appendFile`, file watching,
-and further FileHandle overloads are missing.
-
-Synchronous path functions: `appendFileSync`, `copyFileSync`, `rmSync`,
-`mkdtempSync`, `chmodSync`, `truncateSync`, `symlinkSync`, `readlinkSync`,
-`realpathSync` (with `.native`), and `utimesSync`. Descriptor functions:
-`openSync`, `closeSync`, `readSync`, `writeSync`, `fstatSync`, `fsyncSync`,
-`fdatasyncSync`, and `ftruncateSync`. Errors carry `code`, `errno`, and `syscall`;
-descriptor errors have an empty `path`. `fs.constants` includes `COPYFILE_*`,
-`O_*`, and `S_IF*` values.
-
-`closeSync` only closes descriptors opened by `openSync` (at most 256, then
-`EMFILE`); descriptors left open are closed when the context shuts down. Descriptors
-0, 1, and 2 can be read, written, and stat'ed but never closed. All descriptors
-use `O_CLOEXEC`. Limits: appended and written data up to 4 MiB, `rmSync`
-recursion depth 32 with 4 KiB paths, UTF-8 only for `writeSync` strings, numeric
-modes only for `chmodSync`. `COPYFILE_FICLONE` falls back to a plain copy,
-`COPYFILE_FICLONE_FORCE` fails with `ENOTSUP`, and copying a file onto itself does
-nothing. Promise and callback forms of the descriptor functions, `opendir`, `watch`,
-`cp`, `glob`, `readv`/`writev`, the `Stats`, `ReadStream`, and `WriteStream` class
-exports, and `rmSync` retry options are not implemented.
-
-`chmod`, `truncate`, `symlink`, `readlink`, `realpath`, `mkdtemp`, `utimes`,
-`copyFile`, `appendFile`, and `rm` also exist in `fs.promises` and as callback
-forms. They run the synchronous implementation on the calling thread and then
-settle the Promise, so large copies or removals block the event loop; they are
-not backed by the file work queue. Argument errors reject instead of throwing,
-and callbacks are delivered with `process.nextTick`.
+permission-changing operations, and further FileHandle overloads are missing.
 
 Readable, Writable, Duplex, Transform, and PassThrough support bounded byte or
 object queues, cancellation signals, corking, `_writev`, and partial lifecycle
