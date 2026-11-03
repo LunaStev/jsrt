@@ -1,7 +1,6 @@
 name: Runtime and Linux release validation
 on:
-  push:
-    branches: [main, master]
+# push 트리거는 self-hosted runner(jsrt-wave-jsc)를 연결한 뒤에 다시 켠다. runner가 없으면 실행이 대기열에 쌓인다.
   workflow_dispatch:
 permissions:
   contents: read

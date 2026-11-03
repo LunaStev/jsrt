@@ -105,6 +105,12 @@ rmdir·rename·readdir`의 콜백 형태를 제공한다. 마지막 인자가 �
 `util.promisify.custom`은 `Symbol.for('nodejs.util.promisify.custom')`이며 `fn[custom]`이 함수면 `promisify`가
 그 함수를 그대로 돌려주고, 함수가 아닌 값이면 `TypeError`다. 회귀는 tests/core_modules.js(Node와 같은 결과).
 
+**util.isDeepStrictEqual / process 식별 필드.** `util.isDeepStrictEqual(a, b)`는 `assert.deepStrictEqual`과 같은 비교기를
+쓰며(순환 안전, 깊이 64·200만 단계 한도, 열거 가능한 Symbol 키 포함) 불리언을 돌려준다. 인자가 둘 미만이면 `TypeError`다.
+`process.version`은 jsrt 자신의 버전(`v0.1.0-dev`)이며 Node 버전이 아니다. `process.versions`에는 일부러 `node` 항목이 없다.
+`process.title`은 `jsrt`, `process.argv0`은 원래 `argv[0]`, `process.execArgv`는 빈 배열, `process.release`는 `{name: 'jsrt'}`다.
+회귀는 tests/core_modules.js(공통 형태는 Node와 같고 jsrt 고유 값은 jsrt에서만 검사).
+
 **타이머.** setTimeout·setInterval은 Timeout 객체를 반환하고 `ref`·`unref`·`hasRef`·`refresh`·`close`와
 `Symbol.toPrimitive`(숫자 id)를 제공한다. 숫자 id와 객체 모두 clearTimeout/clearInterval에 쓸 수 있다.
 `unref`된 타이머는 다른 작업이 남아 있으면 정상 실행하지만 그것만으로 이벤트 루프를 유지하지 않는다.
