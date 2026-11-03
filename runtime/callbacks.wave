@@ -251,9 +251,10 @@ pub fun install_callbacks(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     if (deref ex != null || kind(ctx, fs) != JS_OBJECT || kind(ctx, promises) != JS_OBJECT) {
         return false;
     }
-    var names: array<str, 10> = ["readFile", "writeFile", "stat", "lstat", "access", "mkdir", "unlink", "rmdir",
-        "rename", "readdir"];
-    for (var i: i64 = 0; i < 10 && deref ex == null; i++) {
+    var names: array<str, 20> = ["readFile", "writeFile", "stat", "lstat", "access", "mkdir", "unlink", "rmdir",
+        "rename", "readdir", "chmod", "truncate", "symlink", "readlink", "realpath", "mkdtemp", "utimes", "copyFile",
+        "appendFile", "rm"];
+    for (var i: i64 = 0; i < 20 && deref ex == null; i++) {
         var original: ptr<u8> = get(ctx, promises, names[i], ex);
         if (deref ex == null && kind(ctx, original) == JS_OBJECT && callable(ctx, original)) {
             define(ctx, fs, names[i], make_wrapper(ctx, original, names[i], ex), ex, true);

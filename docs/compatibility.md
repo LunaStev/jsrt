@@ -116,9 +116,16 @@ use `O_CLOEXEC`. Limits: appended and written data up to 4 MiB, `rmSync`
 recursion depth 32 with 4 KiB paths, UTF-8 only for `writeSync` strings, numeric
 modes only for `chmodSync`. `COPYFILE_FICLONE` falls back to a plain copy,
 `COPYFILE_FICLONE_FORCE` fails with `ENOTSUP`, and copying a file onto itself does
-nothing. `fs/promises` and callback forms of these functions, `opendir`, `watch`,
+nothing. Promise and callback forms of the descriptor functions, `opendir`, `watch`,
 `cp`, `glob`, `readv`/`writev`, the `Stats`, `ReadStream`, and `WriteStream` class
 exports, and `rmSync` retry options are not implemented.
+
+`chmod`, `truncate`, `symlink`, `readlink`, `realpath`, `mkdtemp`, `utimes`,
+`copyFile`, `appendFile`, and `rm` also exist in `fs.promises` and as callback
+forms. They run the synchronous implementation on the calling thread and then
+settle the Promise, so large copies or removals block the event loop; they are
+not backed by the file work queue. Argument errors reject instead of throwing,
+and callbacks are delivered with `process.nextTick`.
 
 Readable, Writable, Duplex, Transform, and PassThrough support bounded byte or
 object queues, cancellation signals, corking, `_writev`, and partial lifecycle

@@ -8,7 +8,7 @@ import("./timers")::{install_timers, shutdown_timers};
 import("./system")::{install_system, shutdown_system};
 import("./fs_sync")::{install_fs_sync, shutdown_fs_sync};
 import("./fs_directory")::{install_fs_directory, shutdown_fs_directory};
-import("./fs_sync_more")::{install_fs_sync_more, shutdown_fs_sync_more};
+import("./fs_sync_more")::{install_fs_sync_more, install_fs_promises_more, shutdown_fs_sync_more};
 import("./async_fs")::{install_async_fs, shutdown_async_fs};
 import("./file_handles")::{install_file_handles, shutdown_file_handles};
 import("./modules")::{install_modules, shutdown_modules};
@@ -82,7 +82,8 @@ pub fun install_host(context: ptr<u8>, source_index: i32, eval_mode: bool, path:
     } else if (!install_async_fs(context)) {
         write_text(2, "cannot install asynchronous file APIs\n");
         return false;
-    } else if (!install_file_handles(context, exception) || !install_file_streams(context, exception)) {
+    } else if (!install_file_handles(context, exception) || !install_file_streams(context, exception) ||
+        !install_fs_promises_more(context, exception)) {
         write_text(2, "cannot install file stream APIs\n");
         return false;
     } else if (!install_http(context, exception)) {
