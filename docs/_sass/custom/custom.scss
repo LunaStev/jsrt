@@ -1,20 +1,15 @@
-// Component styling shared by both color schemes. Scheme-specific values come
-// from the $jsrt-* variables defined in _sass/color_schemes.
+// Quiet, content-first styling. Colors come from the scheme variables; the
+// only decorations are 1px rules and 4px corners.
+
+$jsrt-radius: 4px;
 
 html {
-  scroll-behavior: smooth;
   -webkit-font-smoothing: antialiased;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  html { scroll-behavior: auto; }
-  * { transition: none !important; animation: none !important; }
 }
 
 :focus-visible {
   outline: 2px solid $jsrt-accent;
   outline-offset: 2px;
-  border-radius: 4px;
 }
 
 // ---- Sidebar -------------------------------------------------------------
@@ -23,80 +18,60 @@ html {
 }
 
 .site-title {
-  font-weight: 700;
-  letter-spacing: -0.02em;
+  font-weight: 600;
+  letter-spacing: -0.01em;
   color: $body-heading-color;
-
-  &::before {
-    content: "";
-    display: inline-block;
-    width: 0.7em;
-    height: 0.7em;
-    margin-right: 0.55em;
-    border-radius: 35% 65% 60% 40% / 55% 40% 60% 45%;
-    background: linear-gradient(135deg, #8b7bff, #6654f1);
-    box-shadow: 0 0 0 4px $jsrt-accent-soft;
-  }
 }
 
 .navigation-list-link {
-  border-radius: 8px;
-  transition: background 0.15s ease, color 0.15s ease;
+  color: $nav-child-link-color;
 
   &:hover {
-    background: $jsrt-accent-soft;
-    color: $jsrt-accent;
+    color: $body-heading-color;
+    background-image: none;
   }
 
   &.active {
-    background: $jsrt-accent-soft;
     color: $jsrt-accent;
     font-weight: 600;
   }
 }
 
-// ---- Header / search -----------------------------------------------------
+// ---- Header --------------------------------------------------------------
 .main-header {
   align-items: center;
   border-bottom: 1px solid $border-color;
 }
 
 .search-input {
-  border-radius: 10px;
   font-family: inherit;
 }
 
 .search-results {
-  border-radius: 12px;
-  box-shadow: $jsrt-shadow;
+  border: 1px solid $border-color;
+  border-radius: $jsrt-radius;
+  box-shadow: none;
 }
 
 .theme-toggle {
+  flex-shrink: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 2.25rem;
-  height: 2.25rem;
-  flex-shrink: 0;
-  align-self: center;
+  width: 2rem;
+  height: 2rem;
   margin: 0 1rem 0 0.25rem;
   padding: 0;
   color: $jsrt-muted;
-  background-color: transparent;
-  background-image: none;
+  background: transparent;
   appearance: none;
   border: 1px solid $border-color;
-  border-radius: 10px;
+  border-radius: $jsrt-radius;
   cursor: pointer;
-  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
 
-  &:hover {
-    color: $jsrt-accent;
-    border-color: $jsrt-accent;
-    background: $jsrt-accent-soft;
-  }
+  &:hover { color: $body-heading-color; }
 
-  svg { width: 1.1rem; height: 1.1rem; }
+  svg { width: 1rem; height: 1rem; }
   .icon-sun { display: none; }
 }
 
@@ -105,245 +80,111 @@ html[data-jsrt-theme="dark"] .theme-toggle {
   .icon-moon { display: none; }
 }
 
-// ---- Typography ----------------------------------------------------------
+// ---- Content -------------------------------------------------------------
 .main-content {
   h1, h2, h3, h4 {
-    letter-spacing: -0.02em;
+    color: $body-heading-color;
+    letter-spacing: -0.01em;
   }
 
-  h1 {
-    font-size: 2.1rem;
-    font-weight: 700;
+  h1 { font-size: 1.9rem; font-weight: 600; }
+  h2 { margin-top: 2em; font-size: 1.4rem; font-weight: 600; }
+  h3 { font-size: 1.15rem; font-weight: 600; }
+
+  a:not(.btn) {
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
   }
 
-  h2 {
-    margin-top: 2.4em;
-    padding-top: 0.9em;
-    border-top: 1px solid $border-color;
-    font-size: 1.45rem;
-    font-weight: 650;
-  }
-
-  a:not(.btn):not(.jsrt-card) {
-    text-decoration-color: rgba(102, 84, 241, 0.35);
-    text-underline-offset: 3px;
-
-    &:hover { text-decoration-color: currentColor; }
-  }
-
+  // Inline code stays neutral so links remain the only colored text.
   p code, li code, td code {
-    padding: 0.12em 0.4em;
-    font-size: 0.86em;
-    color: $jsrt-accent;
-    background: $jsrt-accent-soft;
-    border: 0;
-    border-radius: 6px;
+    padding: 0.1em 0.35em;
+    font-size: 0.875em;
+    color: inherit;
+    background: $code-background-color;
+    border: 1px solid $border-color;
+    border-radius: $jsrt-radius;
   }
 
   blockquote {
     margin-left: 0;
-    padding: 0.2rem 1.1rem;
-    border-left: 3px solid $jsrt-accent;
-    background: $jsrt-accent-soft;
-    border-radius: 0 10px 10px 0;
+    padding: 0 1rem;
+    color: $jsrt-muted;
+    border-left: 3px solid $border-color;
   }
+
+  hr { border-color: $border-color; }
 }
 
 // ---- Code blocks and tables ----------------------------------------------
 div.highlighter-rouge,
 div.listingblock > div.content,
 figure.highlight {
+  background: $code-background-color;
   border: 1px solid $border-color;
-  border-radius: 12px;
-  box-shadow: $jsrt-shadow;
-}
-
-.table-wrapper {
-  border: 1px solid $border-color;
-  border-radius: 12px;
+  border-radius: $jsrt-radius;
   box-shadow: none;
 }
 
+.table-wrapper {
+  box-shadow: none;
+}
+
+table {
+  border-collapse: collapse;
+}
+
+th, td {
+  background: transparent;
+  border-bottom: 1px solid $border-color;
+  border-left: 0;
+  border-right: 0;
+}
+
 th {
-  font-size: 0.78rem;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: $jsrt-muted;
-  background: $jsrt-accent-soft;
-}
-
-.btn {
-  border-radius: 10px;
   font-weight: 600;
+  color: $body-heading-color;
+  border-bottom-width: 2px;
 }
 
-// ---- Landing page --------------------------------------------------------
-.jsrt-hero {
-  position: relative;
-  margin: -0.5rem -1rem 2.5rem;
-  padding: 3rem 1.5rem 2.5rem;
+// ---- Buttons -------------------------------------------------------------
+.btn {
+  box-shadow: none;
+  border-radius: $jsrt-radius;
+  font-weight: 500;
+  background-image: none;
   border: 1px solid $border-color;
-  border-radius: 20px;
-  background: $jsrt-hero-glow, $jsrt-surface;
-  overflow: hidden;
+  color: $body-heading-color;
 
-  &__eyebrow {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.5rem;
-    margin: 0 0 1rem;
-    padding: 0.25rem 0.75rem;
-    font-size: 0.78rem;
-    font-weight: 600;
-    color: $jsrt-accent;
-    background: $jsrt-accent-soft;
-    border-radius: 999px;
+  &:hover { background-image: none; box-shadow: none; }
 
-    &::before {
-      content: "";
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: currentColor;
-    }
-  }
-
-  &__title {
-    margin: 0 0 0.75rem;
-    font-size: clamp(2.2rem, 5vw, 3.2rem);
-    line-height: 1.1;
-    font-weight: 750;
-    letter-spacing: -0.035em;
-  }
-
-  &__lead {
-    max-width: 36rem;
-    margin: 0 0 1.5rem;
-    font-size: 1.1rem;
-    color: $jsrt-muted;
-  }
-
-  &__actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.75rem;
-    margin-bottom: 2rem;
+  &.btn-primary {
+    color: #fff;
+    background-color: $btn-primary-color;
+    border-color: $btn-primary-color;
   }
 }
 
-.jsrt-terminal {
-  max-width: 34rem;
-  margin: 0;
-  border-radius: 12px;
-  background: $jsrt-terminal-bg;
-  box-shadow: $jsrt-shadow;
-  overflow: hidden;
+.jsrt-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 1.25rem 0 1.5rem;
 
-  &__bar {
-    display: flex;
-    gap: 6px;
-    padding: 0.65rem 0.9rem;
-    background: rgba(255, 255, 255, 0.05);
-
-    span {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: rgba(255, 255, 255, 0.22);
-    }
-  }
-
-  pre {
-    margin: 0;
-    padding: 1rem 1.1rem 1.2rem;
-    font-family: $mono-font-family;
-    font-size: 0.86rem;
-    line-height: 1.7;
-    color: #e6e6ff;
-    background: transparent;
-    overflow-x: auto;
-  }
-
-  .prompt { color: #8b7bff; user-select: none; }
-  .out { color: #7ee2a8; }
-  .dim { color: #7c7ca0; }
-}
-
-.jsrt-cards {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
-  gap: 1rem;
-  margin: 1.25rem 0 2rem;
-}
-
-.jsrt-card {
-  display: block;
-  padding: 1.25rem;
-  color: $body-text-color;
-  background: $jsrt-surface;
-  border: 1px solid $border-color;
-  border-radius: 14px;
-  text-decoration: none;
-  transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
-
-  &:hover {
-    transform: translateY(-2px);
-    border-color: $jsrt-accent;
-    box-shadow: $jsrt-shadow;
-  }
-
-  &__icon {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 2.25rem;
-    height: 2.25rem;
-    margin-bottom: 0.85rem;
-    color: $jsrt-accent;
-    background: $jsrt-accent-soft;
-    border-radius: 10px;
-
-    svg { width: 1.15rem; height: 1.15rem; }
-  }
-
-  &__title {
-    display: block;
-    margin-bottom: 0.25rem;
-    font-weight: 650;
-    color: $body-heading-color;
-  }
-
-  &__text {
-    display: block;
-    font-size: 0.88rem;
-    line-height: 1.55;
-    color: $jsrt-muted;
-  }
-}
-
-.jsrt-notice {
-  margin: 1.5rem 0;
-  padding: 1rem 1.25rem;
-  border: 1px solid $border-color;
-  border-left: 4px solid #e0a63a;
-  border-radius: 12px;
-  background: $jsrt-surface;
-
-  p { margin: 0; }
+  .btn { margin: 0; }
 }
 
 // ---- Footer --------------------------------------------------------------
 .jsrt-footer {
   margin-top: 3rem;
-  padding-top: 1.25rem;
-  font-size: 0.82rem;
+  padding-top: 1rem;
+  font-size: 0.8rem;
   color: $jsrt-muted;
   border-top: 1px solid $border-color;
-
-  a { color: inherit; text-decoration: underline; text-underline-offset: 3px; }
 }
 
 @media (max-width: 50rem) {
-  .jsrt-hero { margin: 0 0 2rem; padding: 2rem 1.1rem; border-radius: 16px; }
   .theme-toggle { margin: 0 0.5rem 0 0; }
+  .main-content h1 { font-size: 1.6rem; }
 }
