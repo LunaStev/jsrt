@@ -1,0 +1,424 @@
+
+
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=Edge">
+
+  <link rel="stylesheet" href="/jsrt/assets/css/just-the-docs-default.css">
+
+  <link rel="stylesheet" href="/jsrt/assets/css/just-the-docs-head-nav.css" id="jtd-head-nav-stylesheet">
+
+  <style id="jtd-nav-activation">
+  
+
+    
+    .site-nav > ul.nav-list:first-child > li:not(:nth-child(6)) > a,
+    .site-nav > ul.nav-list:first-child > li > ul > li a {
+      background-image: none;
+    }
+
+    .site-nav > ul.nav-list:not(:first-child) a,
+    .site-nav li.external a {
+      background-image: none;
+    }
+
+    .site-nav > ul.nav-list:first-child > li:nth-child(6) > a {
+      font-weight: 600;
+      text-decoration: none;
+    }.site-nav > ul.nav-list:first-child > li:nth-child(6) > button svg {
+      transform: rotate(-90deg);
+    }.site-nav > ul.nav-list:first-child > li.nav-list-item:nth-child(6) > ul.nav-list {
+      display: block;
+    }
+  </style>
+
+  
+
+  
+    <script src="/jsrt/assets/js/vendor/lunr.min.js"></script>
+  
+
+  <script src="/jsrt/assets/js/just-the-docs.js"></script>
+
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  
+
+
+
+  <!-- Begin Jekyll SEO tag v2.9.1 -->
+<title>Security | jsrt</title>
+<meta name="generator" content="Jekyll v4.4.1" />
+<meta property="og:title" content="Security" />
+<meta property="og:locale" content="en" />
+<meta name="description" content="Documentation for the Wave-powered JavaScript runtime." />
+<meta name="twitter:description" property="og:description" content="Documentation for the Wave-powered JavaScript runtime." />
+<link rel="canonical" href="https://lunastev.github.io/jsrt/security/" />
+<meta property="og:url" content="https://lunastev.github.io/jsrt/security/" />
+<meta property="og:site_name" content="jsrt" />
+<meta property="og:type" content="website" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="Security" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"WebPage","description":"Documentation for the Wave-powered JavaScript runtime.","headline":"Security","url":"https://lunastev.github.io/jsrt/security/"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+  
+
+</head>
+
+<body>
+  <a class="skip-to-main" href="#main-content">Skip to main content</a>
+  <svg xmlns="http://www.w3.org/2000/svg" class="d-none">
+  <symbol id="svg-link" viewBox="0 0 24 24">
+  <title>Link</title>
+  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-link">
+    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+  </svg>
+</symbol>
+
+  <symbol id="svg-menu" viewBox="0 0 24 24">
+  <title>Menu</title>
+  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-menu">
+    <line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line>
+  </svg>
+</symbol>
+
+  <symbol id="svg-arrow-right" viewBox="0 0 24 24">
+  <title>Expand</title>
+  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-chevron-right">
+    <polyline points="9 18 15 12 9 6"></polyline>
+  </svg>
+</symbol>
+
+  <!-- Feather. MIT License: https://github.com/feathericons/feather/blob/master/LICENSE -->
+<symbol id="svg-external-link" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-external-link">
+  <title id="svg-external-link-title">(external link)</title>
+  <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line>
+</symbol>
+
+  
+    <symbol id="svg-doc" viewBox="0 0 24 24">
+  <title>Document</title>
+  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-file">
+    <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path><polyline points="13 2 13 9 20 9"></polyline>
+  </svg>
+</symbol>
+
+    <symbol id="svg-search" viewBox="0 0 24 24">
+  <title>Search</title>
+  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-search">
+    <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+  </svg>
+</symbol>
+
+  
+  
+    <!-- Bootstrap Icons. MIT License: https://github.com/twbs/icons/blob/main/LICENSE.md -->
+<symbol id="svg-copy" viewBox="0 0 16 16">
+  <title>Copy</title>
+  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-clipboard" viewBox="0 0 16 16">
+    <path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/>
+    <path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/>
+  </svg>
+</symbol>
+<symbol id="svg-copied" viewBox="0 0 16 16">
+  <title>Copied</title>
+  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-clipboard-check-fill" viewBox="0 0 16 16">
+    <path d="M6.5 0A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3Zm3 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3Z"/>
+    <path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1A2.5 2.5 0 0 1 9.5 5h-3A2.5 2.5 0 0 1 4 2.5v-1Zm6.854 7.354-3 3a.5.5 0 0 1-.708 0l-1.5-1.5a.5.5 0 0 1 .708-.708L7.5 10.793l2.646-2.647a.5.5 0 0 1 .708.708Z"/>
+  </svg>
+</symbol>
+
+  
+</svg>
+
+  
+    <header class="side-bar">
+  <div class="site-header">
+    <a href="/jsrt/" class="site-title lh-tight">
+  jsrt
+
+</a>
+    <button id="menu-button" class="site-button btn-reset" aria-label="Menu" aria-expanded="false">
+      <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><use xlink:href="#svg-menu"></use></svg>
+    </button>
+  </div>
+
+  <nav aria-label="Main" id="site-nav" class="site-nav">
+  
+  
+    <ul class="nav-list"><li class="nav-list-item"><a href="/jsrt/" class="nav-list-link">Home</a></li><li class="nav-list-item"><a href="/jsrt/getting-started/" class="nav-list-link">Getting started</a></li><li class="nav-list-item"><a href="/jsrt/distribution/" class="nav-list-link">Installation</a></li><li class="nav-list-item"><a href="/jsrt/packages/" class="nav-list-link">Packages</a></li><li class="nav-list-item"><a href="/jsrt/compatibility/" class="nav-list-link">Compatibility</a></li><li class="nav-list-item"><a href="/jsrt/security/" class="nav-list-link">Security</a></li><li class="nav-list-item"><a href="/jsrt/architecture/" class="nav-list-link">Architecture</a></li><li class="nav-list-item"><a href="/jsrt/engine-source/" class="nav-list-link">Engine reference</a></li></ul>
+  
+</nav>
+
+
+<div class="d-md-block d-none site-footer">
+  
+  
+    This site uses <a href="https://github.com/just-the-docs/just-the-docs">Just the Docs</a>, a documentation theme for Jekyll.
+  
+  </div>
+</header>
+
+  
+  <div class="main" id="top">
+    <div id="main-header" class="main-header">
+  
+    
+
+<div class="search" role="search">
+  <div class="search-input-wrap">
+    <input type="text" id="search-input" class="search-input" tabindex="0" placeholder="Search jsrt" autocomplete="off">
+    <label for="search-input" class="search-label">
+      <span class="sr-only">Search jsrt</span>
+      <svg viewBox="0 0 24 24" class="search-icon" aria-hidden="true"><use xlink:href="#svg-search"></use></svg>
+    </label>
+  </div>
+  <div id="search-results" class="search-results"></div>
+</div>
+
+  
+  
+  
+    <nav aria-label="Auxiliary" class="aux-nav">
+  <ul class="aux-nav-list">
+    
+      <li class="aux-nav-list-item">
+        <a href="https://github.com/potatosl/jsrt" class="site-button"
+          
+        >
+          GitHub
+        </a>
+      </li>
+    
+      <li class="aux-nav-list-item">
+        <a href="https://github.com/potatosl/jsrt/blob/main/CONTRIBUTING.md" class="site-button"
+          
+        >
+          Contributing
+        </a>
+      </li>
+    
+  </ul>
+</nav>
+
+  
+</div>
+
+    <div class="main-content-wrap">
+      
+      <div id="main-content" class="main-content">
+        <main>
+          
+            <h1 id="security-and-execution-boundaries">
+  
+  
+    <a href="#security-and-execution-boundaries" class="anchor-heading" aria-labelledby="security-and-execution-boundaries"><svg viewBox="0 0 16 16" aria-hidden="true"><use xlink:href="#svg-link"></use></svg></a> Security and execution boundaries
+  
+  
+</h1>
+    
+
+<p>jsrt runs JavaScriptCore in the host process. Scripts, Workers, and native add-ons
+have the process’s filesystem, network, and process permissions. Use only code
+you trust, or provide isolation outside jsrt appropriate to your environment.</p>
+<h2 id="execution-and-memory">
+  
+  
+    <a href="#execution-and-memory" class="anchor-heading" aria-labelledby="execution-and-memory"><svg viewBox="0 0 16 16" aria-hidden="true"><use xlink:href="#svg-link"></use></svg></a> Execution and memory
+  
+  
+</h2>
+    
+
+<p>There is no JavaScript CPU watchdog or execution-time limit. A script that does
+not return can prevent the event loop from processing I/O deadlines.</p>
+
+<p><code class="language-plaintext highlighter-rouge">--memory-limit-mb</code> sets the POSIX address-space soft limit (<code class="language-plaintext highlighter-rouge">RLIMIT_AS</code>). It
+includes engine virtual reservations and does not measure RSS or JavaScript heap
+usage. jsrt does not raise inherited lower limits or the hard limit.</p>
+
+<p>Most host queues and byte buffers are bounded. These limits do not bound the
+entire process, the JavaScript heap, or the memory inside arbitrary queued objects.
+Use <code class="language-plaintext highlighter-rouge">jsrt --info</code> to inspect compiled limits.</p>
+
+<div class="table-wrapper"><table>
+  <thead>
+    <tr>
+      <th>Resource</th>
+      <th>Default compiled limit</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Source, ordinary file buffers, HTTP bodies, and binary buffers</td>
+      <td>4 MiB per bounded operation or object</td>
+    </tr>
+    <tr>
+      <td>Timers and pending nextTick callbacks</td>
+      <td>1,024 each</td>
+    </tr>
+    <tr>
+      <td>Modules</td>
+      <td>1,024</td>
+    </tr>
+    <tr>
+      <td>Asynchronous file jobs / file worker threads</td>
+      <td>16 / 2</td>
+    </tr>
+    <tr>
+      <td>FileHandles / file streams</td>
+      <td>32 each</td>
+    </tr>
+    <tr>
+      <td>Workers / queued messages per link</td>
+      <td>8 / 16</td>
+    </tr>
+    <tr>
+      <td>Child processes / HTTP clients</td>
+      <td>16 each</td>
+    </tr>
+    <tr>
+      <td>HTTP servers / connections</td>
+      <td>16 / 64</td>
+    </tr>
+    <tr>
+      <td>HTTP header bytes / rows</td>
+      <td>16 KiB / 64</td>
+    </tr>
+  </tbody>
+</table></div>
+<h2 id="files-processes-and-add-ons">
+  
+  
+    <a href="#files-processes-and-add-ons" class="anchor-heading" aria-labelledby="files-processes-and-add-ons"><svg viewBox="0 0 16 16" aria-hidden="true"><use xlink:href="#svg-link"></use></svg></a> Files, processes, and add-ons
+  
+  
+</h2>
+    
+
+<p>Ordinary file APIs and module loading can access any path permitted to the host
+process. Symlink resolution is not a filesystem permission boundary.</p>
+
+<p>Child processes require an absolute executable path and explicit inherited or
+piped stdio. Shell execution, PATH lookup, and custom child environment or working
+directory options are rejected. jsrt tracks and reaps the children it owns.</p>
+
+<p>Native add-ons are trusted native code. Node-API loading restrictions do not
+prevent memory corruption or access to external resources.</p>
+<h2 id="network-connections">
+  
+  
+    <a href="#network-connections" class="anchor-heading" aria-labelledby="network-connections"><svg viewBox="0 0 16 16" aria-hidden="true"><use xlink:href="#svg-link"></use></svg></a> Network connections
+  
+  
+</h2>
+    
+
+<p>The HTTP server listens on <code class="language-plaintext highlighter-rouge">127.0.0.1</code> by default. Its parser rejects ambiguous
+framing, invalid Host headers, folded headers, and CR/LF/NUL header injection.
+The default deadlines are 60 seconds for headers, 300 seconds for a request,
+30 seconds for idle I/O, and 5 seconds for keep-alive reuse.</p>
+
+<p>Clients require TLS and asynchronous DNS support in libcurl &gt;= 8.13.0. Requests
+are limited to HTTP(S); URL credentials and control characters are rejected.
+TLS certificate and hostname checks remain enabled, including when callers try
+<code class="language-plaintext highlighter-rouge">rejectUnauthorized: false</code>. Automatic environment proxies and HTTPS-to-HTTP
+redirects are not allowed. <code class="language-plaintext highlighter-rouge">caFile</code> selects an explicit CA file.
+Timeout options control I/O, not JavaScript execution.</p>
+<h2 id="packages-and-archives">
+  
+  
+    <a href="#packages-and-archives" class="anchor-heading" aria-labelledby="packages-and-archives"><svg viewBox="0 0 16 16" aria-hidden="true"><use xlink:href="#svg-link"></use></svg></a> Packages and archives
+  
+  
+</h2>
+    
+
+<p>The installer verifies HTTPS connections and SHA-512 integrity. Extraction rejects
+path traversal, symlinks, hard links, duplicate entries, and special files. Package
+scripts are not executed and <code class="language-plaintext highlighter-rouge">bin</code> links are not created.</p>
+
+<p>Installation and cache operations check ownership and managed-file identity,
+use private staging, and serialize cooperating installers with a project lock.
+They do not isolate the project from another malicious process using the same
+account. Integrity checks verify content, not publisher identity or code safety.</p>
+
+<p>The tree and lockfile are recoverable through a journal but are not crash-atomic
+together. See <a href="/jsrt/packages/">Packages</a> for replacement, cache, and workspace behavior.</p>
+<h2 id="release-bundles">
+  
+  
+    <a href="#release-bundles" class="anchor-heading" aria-labelledby="release-bundles"><svg viewBox="0 0 16 16" aria-hidden="true"><use xlink:href="#svg-link"></use></svg></a> Release bundles
+  
+  
+</h2>
+    
+
+<p>A checksum alone does not authenticate a release. Verify signatures with a public
+key obtained independently from the archive. The installer checks bundle contents
+and refuses unexpected files or ownership conflicts. See
+<a href="/jsrt/distribution/">Installation</a> for deployment and recovery commands.</p>
+<h2 id="engine-and-dependencies">
+  
+  
+    <a href="#engine-and-dependencies" class="anchor-heading" aria-labelledby="engine-and-dependencies"><svg viewBox="0 0 16 16" aria-hidden="true"><use xlink:href="#svg-link"></use></svg></a> Engine and dependencies
+  
+  
+</h2>
+    
+
+<p>jsrt checks its JavaScriptCore version and required ABI exports. The baseline is
+2.54.1 with project patches for modules, Workers, and cloning. Native dependencies
+retain their own licenses and security-update requirements; installed versions
+are reported by <code class="language-plaintext highlighter-rouge">jsrt --info</code>.</p>
+
+          
+
+          
+            
+          
+        </main>
+        
+<hr>
+<footer>
+  
+
+  
+
+  
+    <div class="d-flex mt-2">
+      
+      
+        <p class="text-small mb-0">
+          <a href="https://github.com/potatosl/jsrt/edit/main/docs/security.md" id="edit-this-page">Edit this page on GitHub</a>
+        </p>
+      
+    </div>
+  <div class="d-md-none mt-4 fs-2">
+    
+    
+      This site uses <a href="https://github.com/just-the-docs/just-the-docs">Just the Docs</a>, a documentation theme for Jekyll.
+    
+  </div>
+</footer>
+
+      </div>
+    </div>
+    
+      
+
+<div class="search-overlay"></div>
+
+    
+  </div>
+
+  
+</body>
+</html>
+

@@ -1,0 +1,359 @@
+{"0": {
+    "doc": "Architecture",
+    "title": "Architecture",
+    "content": "Wave owns the runtime’s host APIs, module resolution, event loop, resource policies, package installation, and build orchestration. JavaScriptCore owns JavaScript parsing, execution, garbage collection, JIT compilation, and Promise jobs. C and C++ connect native ABIs. ",
+    "url": "/jsrt/architecture/",
+    
+    "relUrl": "/architecture/"
+  },"1": {
+    "doc": "Architecture",
+    "title": "Execution flow",
+    "content": "runtime/main.wave calls app.wave, which handles the CLI and starts a session. session.wave creates a context, installs the host APIs, selects evaluation, CommonJS, or ES module execution, runs the event loop, reports errors, and shuts down the host. host.wave owns API installation and teardown order. event_loop.wave coordinates timers, filesystem completions, network activity, child processes, Workers, process signals, and engine checkpoints. ",
+    "url": "/jsrt/architecture/#execution-flow",
+    
+    "relUrl": "/architecture/#execution-flow"
+  },"2": {
+    "doc": "Architecture",
+    "title": "Module boundaries",
+    "content": "| Area | Main modules | . | CommonJS | modules, module_state, module_resolver, module_files, module_packages, module_compile | . | ES modules | esm, esm_interop, esm_files, and the matching JSC module bridge | . | JSON | json, json_parse, json_stringify, json_source, wjson_text | . | Node-style streams | streams, stream_state, stream_operations, readable/writable/lifecycle modules, and stream_utils | . | Web streams | web_stream_core, web_readable, web_writable, web_transform, and adapters | . | Files | system, fs_sync, async_fs, file jobs, FileHandles, and file streams | . | HTTP | Server, client, parser, header, response, connection, and deadline modules | . | Cancellation | abort, web_events, and shared abort_state | . | Workers | workers, worker_state, worker_run, and clone | . | Packages | Graph, version/semver selection, cache, workspace, transaction, and replacement modules | . ",
+    "url": "/jsrt/architecture/#module-boundaries",
+    
+    "relUrl": "/architecture/#module-boundaries"
+  },"3": {
+    "doc": "Architecture",
+    "title": "Ownership and threads",
+    "content": "Each JSC context has one owning thread. context_state.wave attaches separate host state to each global through private data. Delayed JavaScript values remain rooted for the lifetime of their operation; private object state uses captured engine-owned WeakMap/WeakSet graphs. File workers operate on native byte data and descriptors. They do not access JSC handles. The owner thread converts completed results and settles Promises. Shutdown joins workers before releasing resources that they might still use. Public Workers reconstruct cloned values in their receiving context. Shared links contain native graphs, not handles from another JavaScript context. The Worker owner releases the final VM reference and drains deferred engine RunLoop cleanup before the parent joins and frees the link. libuv and libcurl callbacks update native records. User callbacks are dispatched by Wave on the owner thread after native polling returns. ",
+    "url": "/jsrt/architecture/#ownership-and-threads",
+    
+    "relUrl": "/architecture/#ownership-and-threads"
+  },"4": {
+    "doc": "Architecture",
+    "title": "Lifecycle rules",
+    "content": ". | Reserve resource slots before invoking option getters, which may re-enter the host. | Preserve the first exception while cleaning up failed or cancelled operations. | Keep shared HTTP socket lifetime separate from request EOF and response finish. | Keep Promise scheduling in JSC and nextTick scheduling in the Wave host. | Release captured intrinsics and context slots after dependent resources close. | . The native contracts are documented in the engine ABI and Node-API subset. See the contributor guide for build and validation commands. ",
+    "url": "/jsrt/architecture/#lifecycle-rules",
+    
+    "relUrl": "/architecture/#lifecycle-rules"
+  },"5": {
+    "doc": "Compatibility",
+    "title": "Compatibility",
+    "content": "jsrt implements selected Node.js and Web APIs. API presence does not imply full Node.js, Bun, npm, or WHATWG compatibility. Check the behavior your application uses, particularly stream adapters, native add-ons, and package installation. ",
+    "url": "/jsrt/compatibility/",
+    
+    "relUrl": "/compatibility/"
+  },"6": {
+    "doc": "Compatibility",
+    "title": "Modules",
+    "content": "CommonJS supports relative and package resolution, require, caching, package main, and supported exports and imports mappings. ES modules use the JavaScriptCore module loader with Wave resolution and CommonJS, built-in, and JSON interop. Relative dynamic imports from CommonJS support paths containing spaces, percent signs, hashes, and Unicode. require(ESM) and inference of named exports from CommonJS are not supported. The public URL API supports HTTP(S); url.fileURLToPath and pathToFileURL are not available. ",
+    "url": "/jsrt/compatibility/#modules",
+    
+    "relUrl": "/compatibility/#modules"
+  },"7": {
+    "doc": "Compatibility",
+    "title": "Core APIs",
+    "content": "| Area | Available subset | . | Globals | console, Buffer, global, performance.now and timeOrigin, atob, btoa | . | Utilities | util.inspect, format, inherits, promisify, callbackify, deprecate, isDeepStrictEqual | . | Assertions | Strict equality and deep strict comparison, with negated forms | . | Modules | Selected events, path, os, url, and querystring APIs | . | Files | Synchronous, Promise, and callback operations; partial FileHandle and file streams | . | Cryptography | Hashes, HMAC, and operating-system random bytes | . | Networking | HTTP server/client APIs, HTTPS client, and fetch | . Utilities and assertions . util.inspect accepts depth, breakLength, maxArrayLength, and maxStringLength. Other options, including colors, sorting, and hidden fields, are ignored. Proxy targets, Promise state, and WeakMap/WeakSet contents are not exposed; proxies print as Proxy(&lt;target unavailable&gt;). util.deprecate warns once per wrapper to stderr. It does not provide process.emitWarning, warning events, code-level deduplication, or --no-deprecation; constructor wrapping with new is not specially handled. util.promisify.custom uses Symbol.for('nodejs.util.promisify.custom'). assert.deepStrictEqual and util.isDeepStrictEqual compare prototypes, enumerable own string and Symbol keys, and supported built-in structures. Cycles are supported. Comparison is bounded to depth 64 and two million steps. WeakMap and Promise contents are not inspected. assert.equal and deepEqual use strict semantics; they are not Node.js’s loose comparison variants. querystring.parse/decode and stringify/encode support the default separators. Custom separators and options are not supported. Parsing is limited to 8,191 input bytes and 1,024 pairs; serialization follows the URL pair budget. JSON . JSON.parse and JSON.stringify use wjson, including reviver, replacer, and toJSON handling. A reviver receives a fresh context object with source for unchanged primitive values; objects and values changed by callbacks have no source field. Host limits apply to input size, depth, and collection size. ",
+    "url": "/jsrt/compatibility/#core-apis",
+    
+    "relUrl": "/compatibility/#core-apis"
+  },"8": {
+    "doc": "Compatibility",
+    "title": "Timers and process",
+    "content": "Timeout objects support ref, unref, hasRef, refresh, close, and numeric conversion. Unreferenced timers do not keep the event loop alive. setImmediate uses the timer store and does not guarantee Node.js’s check-phase ordering. timers/promises provides setTimeout, setImmediate, scheduler.wait, and scheduler.yield. Options such as signal and ref are rejected; the setInterval async iterator is not implemented. process.nextTick runs before Promise jobs on ordinary host entry returns. Ticks scheduled by a Promise job run after the current engine checkpoint. process includes identification fields, environment and arguments, cwd, chdir, exit handling, hrtime, uptime, memoryUsage, and selected process events. process.version and versions.jsrt identify jsrt; versions.node is absent. memoryUsage reports RSS, with JavaScript heap and external-memory fields set to zero. Exit codes are integers from 0 through 255. SIGINT, SIGTERM, beforeExit, and exit have partial support. Signal subscriptions alone do not keep the process alive. Worker signal subscriptions, process.chdir, and process.exit are rejected. The working directory is shared by the process: changing it can affect already queued relative file operations. stdout and stderr are synchronous Writable streams. stdin is a host Readable using Linux procfs, with UTF-8 decoding. TTY/raw mode, Worker stdin, IPC, and process.kill are not implemented. child_process.spawn requires an absolute executable path and explicit stdio: 'inherit' or 'pipe'. Shell execution, PATH lookup, stdio arrays, custom environment or working directory, and IPC are not supported. ",
+    "url": "/jsrt/compatibility/#timers-and-process",
+    
+    "relUrl": "/compatibility/#timers-and-process"
+  },"9": {
+    "doc": "Compatibility",
+    "title": "Files and Node.js streams",
+    "content": "Callback forms exist for readFile, writeFile, stat, lstat, access, mkdir, unlink, rmdir, rename, and readdir. Completion uses nextTick. Callback open, close, read, write, and appendFile, file watching, permission-changing operations, and further FileHandle overloads are missing. Readable, Writable, Duplex, Transform, and PassThrough support bounded byte or object queues, cancellation signals, corking, _writev, and partial lifecycle options. setEncoding supports only UTF-8 in byte mode; string queue lengths and read(n) use UTF-16 code units. Node.js Readable.from, async iteration, iterable pipelines, and Writable Web adapters are not implemented. Readable.toWeb and Readable.fromWeb are explicit adapters. fromWeb supports encoding, high-water mark, object mode, and signal options. Avoid consuming a stream through both APIs at once. ",
+    "url": "/jsrt/compatibility/#files-and-nodejs-streams",
+    
+    "relUrl": "/compatibility/#files-and-nodejs-streams"
+  },"10": {
+    "doc": "Compatibility",
+    "title": "Web APIs",
+    "content": "TextEncoder supports UTF-8 encode and encodeInto. TextDecoder supports UTF-8, incremental input, byte views, BOM handling, fatal, and ignoreBOM. Other encodings and TextEncoderStream/TextDecoderStream are not implemented. Event, EventTarget, DOMException, AbortController, and AbortSignal provide a subset of Web event and cancellation behavior. There is no DOM tree or complete DOM event dispatch implementation. EventTarget listener errors are reported through the engine’s microtask error path. AbortSignal retains synchronous first exception propagation; private cancellation runs before user abort listeners. ReadableStream, WritableStream, and TransformStream provide default readers/writers/controllers, backpressure, cancellation, piping, teeing, and async iteration. They are also exposed through node:stream/web. Byte/BYOB mode, stream transfer, and additional queuing-strategy classes are not implemented. A tee branch that exceeds its queue limit errors both branches and cancels the source. Fetch and bodies . | API | Supported behavior and restrictions | . | Blob | Copies string, Blob, ArrayBuffer, and view inputs; supports size, type, text, arrayBuffer, bytes, and slice; no stream method | . | Request | HTTP(S) URL or Request input, method, headers, signal, and buffered body; rejects GET/HEAD bodies and unsupported methods; no streaming constructor body | . | Response | Buffered construction, text, json, arrayBuffer, and clone before consumption; status 200–599; rejects bodies for 204/205/304 and custom statusText | . | FormData | Field access, mutation, and live iteration; Blob values remain Blobs; no HTML form constructor, File class, or multipart parsing | . | Headers | Iterable pairs, live sorted iteration, and getSetCookie; network response headers are immutable | . | fetch | Request inputs and string, byte, Blob, FormData, or Web ReadableStream uploads; partial Fetch options | . A non-null Response.body is a Node-style host Readable. Convert explicitly with Readable.toWeb for Web consumption. Network Response cloning is not supported. Buffered bodies have a 4 MiB budget; FormData allows up to 1,024 fields. ",
+    "url": "/jsrt/compatibility/#web-apis",
+    
+    "relUrl": "/compatibility/#web-apis"
+  },"11": {
+    "doc": "Compatibility",
+    "title": "HTTP and networking",
+    "content": "HTTP response headers support lookup, removal, string arrays, and raw-array writeHead input. Header arrays are copied, unlike Node.js’s reference behavior. Numeric header values, custom reason phrases, and user-managed framing headers are not supported. STATUS_CODES contains a small subset of common codes. Client headers preserve repeated Set-Cookie rows, combine ordinary duplicates, and apply singleton rules. Fetch exposes separate cookies through Headers.getSetCookie(). Response headers share a 16 KiB and 64-row budget. HTTP(S) clients use system libcurl. TLS peer and hostname verification are always required. HTTPS-to-HTTP redirects, URL credentials, and automatic environment proxies are rejected. Server TLS, protocol upgrades, WebSocket, standalone net/tls/dns, and general proxy support are not implemented. ",
+    "url": "/jsrt/compatibility/#http-and-networking",
+    
+    "relUrl": "/compatibility/#http-and-networking"
+  },"12": {
+    "doc": "Compatibility",
+    "title": "Workers and native add-ons",
+    "content": "Workers use separate owning threads and contexts with bounded message cloning. MessageChannel, transferable objects, and additional structured-clone types are not supported. Native add-ons expose a synchronous Node-API v1 subset. This is not full v1 conformance or the Node.js SDK. See the Node-API reference for available calls and unsupported functionality. ",
+    "url": "/jsrt/compatibility/#workers-and-native-add-ons",
+    
+    "relUrl": "/compatibility/#workers-and-native-add-ons"
+  },"13": {
+    "doc": "Compatibility",
+    "title": "Other missing APIs and tools",
+    "content": "Missing modules include zlib, readline, tty, vm, async_hooks, perf_hooks, and module. crypto.subtle, a REPL, watch mode, source maps, a debugger, profiling tools, and type declarations are not provided. For installer-specific restrictions, see Packages. ",
+    "url": "/jsrt/compatibility/#other-missing-apis-and-tools",
+    
+    "relUrl": "/compatibility/#other-missing-apis-and-tools"
+  },"14": {
+    "doc": "Installation",
+    "title": "Install a Linux release bundle",
+    "content": "A jsrt release bundle contains the runtime, deployment tool, and a matching JavaScriptCore library. Installation targets Linux x86_64 and does not require the Wave compiler. ",
+    "url": "/jsrt/distribution/#install-a-linux-release-bundle",
+    
+    "relUrl": "/distribution/#install-a-linux-release-bundle"
+  },"15": {
+    "doc": "Installation",
+    "title": "Verify the archive",
+    "content": "Compare the archive’s SHA-256 with a value obtained from a trusted source before extracting it. A checksum delivered alongside an archive detects corruption; it does not authenticate the publisher. If the maintainer provides an Ed25519 signature, verify it before extracting or running code. Obtain the trusted public key through a separate trusted channel. The contributor guide describes the signing and verification commands. ",
+    "url": "/jsrt/distribution/#verify-the-archive",
+    
+    "relUrl": "/distribution/#verify-the-archive"
+  },"16": {
+    "doc": "Installation",
+    "title": "Install",
+    "content": "From the extracted bundle directory, run: ./bin/jsrt-deploy verify --bundle \"$PWD\" ./bin/jsrt-deploy install --bundle \"$PWD\" --prefix \"$HOME/jsrt\" \"$HOME/jsrt/bin/jsrt\" --info . The prefix’s parent directory must already exist. verify checks the bundle’s fixed file list and checksums. install also checks that the runtime and its required libraries execute on the host before activating the installation. Add the installed bin directory to your shell’s PATH to use jsrt directly: . export PATH=\"$HOME/jsrt/bin:$PATH\" . ",
+    "url": "/jsrt/distribution/#install",
+    
+    "relUrl": "/distribution/#install"
+  },"17": {
+    "doc": "Installation",
+    "title": "Update, roll back, or uninstall",
+    "content": "Install a new bundle with the same prefix to update. The deployment tool creates a complete release generation and switches current; the previous generation remains available through previous. \"$HOME/jsrt/bin/jsrt-deploy\" rollback --prefix \"$HOME/jsrt\" \"$HOME/jsrt/bin/jsrt-deploy\" recover --prefix \"$HOME/jsrt\" \"$HOME/jsrt/bin/jsrt-deploy\" uninstall --prefix \"$HOME/jsrt\" . The tool verifies management markers, ownership, file types, and checksums before changing an existing installation. Unexpected files or ownership conflicts cause it to refuse the operation. Recovery checks generation identity before removing staging data. install and rollback perform recovery first. Each active-link replacement is atomic, but changes to current and previous are not guaranteed to be atomic together across power loss. ",
+    "url": "/jsrt/distribution/#update-roll-back-or-uninstall",
+    
+    "relUrl": "/distribution/#update-roll-back-or-uninstall"
+  },"18": {
+    "doc": "Installation",
+    "title": "System dependencies",
+    "content": "The bundle includes JavaScriptCore in lib/ and uses a relative $ORIGIN/../lib runtime search path. Compatible system libraries are still needed: . | libcurl &gt;= 8.13.0 with TLS and asynchronous DNS support | OpenSSL 3 (libcrypto.so.3) and libarchive (libarchive.so.13) | libstdc++, glibc, and the ICU ABI required by the bundled engine | /usr/bin/sha256sum for the deployment tool | . Consult runtime-info.json for the bundle’s library versions and use jsrt --info to inspect the installed runtime. Bundles are dynamically linked; they are not portable to every Linux distribution. A build against ICU 78, for example, needs a compatible ICU 78 installation. ",
+    "url": "/jsrt/distribution/#system-dependencies",
+    
+    "relUrl": "/distribution/#system-dependencies"
+  },"19": {
+    "doc": "Installation",
+    "title": "Check a host",
+    "content": "The deployment tool can verify a bundle and exercise installation, reinstallation, runtime execution, and removal in a temporary prefix: ./bin/jsrt-deploy check --bundle \"$PWD\" . For source builds, release creation, and signing, see CONTRIBUTING.md. ",
+    "url": "/jsrt/distribution/#check-a-host",
+    
+    "relUrl": "/distribution/#check-a-host"
+  },"20": {
+    "doc": "Installation",
+    "title": "Installation",
+    "content": " ",
+    "url": "/jsrt/distribution/",
+    
+    "relUrl": "/distribution/"
+  },"21": {
+    "doc": "Engine reference",
+    "title": "JavaScriptCore source and patches",
+    "content": "jsrt’s engine baseline is WebKitGTK 2.54.1. The engine builder obtains the upstream archive and verifies it before extracting or patching it: . | Source: https://webkitgtk.org/releases/webkitgtk-2.54.1.tar.xz | SHA-256: ea0bbb02dbdbc596874a4e7ad35b66645b3e0a232bd0e4081de5ed92eb0a397d | Digest file: native/engine/webkitgtk-2.54.1.sha256 | . ",
+    "url": "/jsrt/engine-source/#javascriptcore-source-and-patches",
+    
+    "relUrl": "/engine-source/#javascriptcore-source-and-patches"
+  },"22": {
+    "doc": "Engine reference",
+    "title": "Build",
+    "content": "Run from the project root: ./bootstrap.sh engine-build . The tool builds JSCOnly with CMake and Ninja, then prints a candidate shared-library path. It preserves existing candidates and refuses unmarked or mismatched cached sources. The runtime and regression suite are built separately using the selected candidate. Setup and commands are in CONTRIBUTING.md. ",
+    "url": "/jsrt/engine-source/#build",
+    
+    "relUrl": "/engine-source/#build"
+  },"23": {
+    "doc": "Engine reference",
+    "title": "Project patches",
+    "content": "The builder applies these files from native/engine/ with --fuzz=0: . | Patch | Purpose | . | webkitgtk-2.54.1.patch | Connect the matching module, Worker, and clone host ABI | . | module-output.patch | Isolate engine module output | . | synthetic-modules.patch | Connect built-in, CommonJS, and JSON synthetic modules | . native/cpp/jsc_module_api.cpp and native/include/jsrt_modules.h are compiled with the matching WebKit source tree. System JSC libraries are not assumed to export this private boundary. ",
+    "url": "/jsrt/engine-source/#project-patches",
+    
+    "relUrl": "/engine-source/#project-patches"
+  },"24": {
+    "doc": "Engine reference",
+    "title": "ABI expectations",
+    "content": "The bridge connects synchronous Wave resolution, source, metadata, and value callbacks to engine-owned module graphs and Promise evaluation. It does not rewrite JavaScript import/export syntax. Runtime detection is reported by engine.moduleHostABI and engine.syntheticModuleHostABI in jsrt --info. Public Workers require Worker ABI v2 and clone ABI v1. Worker termination requests use a retained context group; the final VM reference and deferred RunLoop disposal are released on the owning Worker thread. JSRTDrainOwnerRunLoop performs that nonblocking cleanup. JSRTIsProxy checks engine object type without user traps. These bridges do not impose a JavaScript CPU deadline. The engine ABI reference describes handle ownership, public JSC calls, and private extensions. ",
+    "url": "/jsrt/engine-source/#abi-expectations",
+    
+    "relUrl": "/engine-source/#abi-expectations"
+  },"25": {
+    "doc": "Engine reference",
+    "title": "Distribution",
+    "content": "Release bundles retain the engine source information, patches, digest, and JavaScriptCore’s Source/JavaScriptCore/COPYING.LIB notice. JavaScriptCore and other dependencies retain their upstream licenses independently of jsrt’s MPL-2.0 license. Follow the source and license information shipped with the exact bundle when rebuilding its engine. ",
+    "url": "/jsrt/engine-source/#distribution",
+    
+    "relUrl": "/engine-source/#distribution"
+  },"26": {
+    "doc": "Engine reference",
+    "title": "Engine reference",
+    "content": " ",
+    "url": "/jsrt/engine-source/",
+    
+    "relUrl": "/engine-source/"
+  },"27": {
+    "doc": "Getting started",
+    "title": "Getting started",
+    "content": "jsrt currently targets Linux x86_64. There are no public release bundles yet. If a maintainer has supplied a bundle, follow Installation. Building from source is covered in the contributor guide; the standard build currently requires test sources omitted from the public tree. ",
+    "url": "/jsrt/getting-started/",
+    
+    "relUrl": "/getting-started/"
+  },"28": {
+    "doc": "Getting started",
+    "title": "Run JavaScript",
+    "content": "Save this as hello.js: . console.log('Hello from jsrt'); . Run the file, or evaluate a short expression directly: . jsrt hello.js jsrt -e \"console.log(1 + 1)\" . jsrt run hello.js is an alternative form of the file command. Arguments after the file name are passed to the script; -- can separate script arguments: . jsrt hello.js -- first second . ",
+    "url": "/jsrt/getting-started/#run-javascript",
+    
+    "relUrl": "/getting-started/#run-javascript"
+  },"29": {
+    "doc": "Getting started",
+    "title": "Modules",
+    "content": "CommonJS files can use require, module.exports, and supported Node.js built-in modules. Use .cjs to explicitly select CommonJS. Use .mjs, or .js in a package with \"type\": \"module\", for ES modules: . import path from 'node:path'; console.log(path.join('hello', 'world')); . The compatibility guide describes module-loading restrictions. Install project dependencies with the package installer. ",
+    "url": "/jsrt/getting-started/#modules",
+    
+    "relUrl": "/getting-started/#modules"
+  },"30": {
+    "doc": "Getting started",
+    "title": "CLI reference",
+    "content": "| Command | Purpose | . | jsrt app.js [--] [args...] | Execute a file | . | jsrt run app.js [--] [args...] | Execute a file using the explicit subcommand | . | jsrt -e '&lt;script&gt;' [--] [args...] | Evaluate a script | . | jsrt --check app.js | Check syntax without executing the module body | . | jsrt test [--] &lt;file.js&gt;... | Run explicit files sequentially in separate processes | . | jsrt --version | Print the runtime version | . | jsrt --info | Print engine, native-library, ABI, and compiled-limit information | . | jsrt --help | Print command help | . The test subcommand runs files you supply; it is separate from the runtime’s own regression suite. There is no interactive REPL. ",
+    "url": "/jsrt/getting-started/#cli-reference",
+    
+    "relUrl": "/getting-started/#cli-reference"
+  },"31": {
+    "doc": "Getting started",
+    "title": "Memory limits",
+    "content": "The optional prefix --memory-limit-mb sets the process address-space soft limit: . jsrt --memory-limit-mb 4096 app.js . This limit includes JavaScriptCore’s virtual address reservations. It is not an RSS or JavaScript heap limit, and a low value can prevent engine initialization. There is no JavaScript execution-time limit. See Security. ",
+    "url": "/jsrt/getting-started/#memory-limits",
+    
+    "relUrl": "/getting-started/#memory-limits"
+  },"32": {
+    "doc": "Home",
+    "title": "jsrt documentation",
+    "content": "jsrt is an experimental JavaScript runtime written in Wave and powered by JavaScriptCore. It includes CommonJS and ES modules, selected Node.js and Web APIs, and a package installer. ",
+    "url": "/jsrt/#jsrt-documentation",
+    
+    "relUrl": "/#jsrt-documentation"
+  },"33": {
+    "doc": "Home",
+    "title": "Start here",
+    "content": ". | Getting started: run scripts and use the CLI. | Installation: verify and install a Linux release bundle. | Packages: install dependencies and manage a project lockfile. | Compatibility: check supported APIs and behavior differences. | Security: understand execution permissions and resource limits. | . ",
+    "url": "/jsrt/#start-here",
+    
+    "relUrl": "/#start-here"
+  },"34": {
+    "doc": "Home",
+    "title": "Contribute",
+    "content": "See the contributor guide for source checks, build requirements, and pull requests. The architecture and engine reference describe how the host and JavaScriptCore fit together. jsrt is under active development. Applications need to be checked against its supported API subset. Scripts, Workers, and native add-ons run with the host process’s permissions. ",
+    "url": "/jsrt/#contribute",
+    
+    "relUrl": "/#contribute"
+  },"35": {
+    "doc": "Home",
+    "title": "Home",
+    "content": " ",
+    "url": "/jsrt/",
+    
+    "relUrl": "/"
+  },"36": {
+    "doc": "Packages",
+    "title": "Packages",
+    "content": "jsrt install reads a project’s package.json, installs dependencies into a managed node_modules tree, and records the resolved graph in jsrt.lock.wjson. ",
+    "url": "/jsrt/packages/",
+    
+    "relUrl": "/packages/"
+  },"37": {
+    "doc": "Packages",
+    "title": "Install dependencies",
+    "content": "Run from the project directory: . jsrt install . Use --project to select another directory. Production dependencies are installed by default; --include-dev also includes the root project’s development dependencies. jsrt install --project ./app --include-dev . The installer does not run lifecycle scripts or create package bin links. Packages that require either need additional setup outside the installer. ",
+    "url": "/jsrt/packages/#install-dependencies",
+    
+    "relUrl": "/packages/#install-dependencies"
+  },"38": {
+    "doc": "Packages",
+    "title": "Lockfiles and updates",
+    "content": "| Option | Behavior | . | --frozen-lockfile | Require an existing lockfile and reject manifest or integrity changes | . | --offline | Use a frozen lockfile and verified cached archives, locked local archives, or matching workspaces | . | --replace | Replace a previously managed dependency tree using its lockfile | . | --update | Resolve versions again and replace the managed tree and lockfile | . jsrt install --project ./app --frozen-lockfile jsrt install --project ./app --offline --replace jsrt install --project ./app --update . A normal install does not overwrite an existing node_modules directory. --replace and --update replace the whole managed tree, including local edits. --update cannot be combined with --offline or --frozen-lockfile. The lockfile records the root manifest integrity, the development-dependency mode, exact package versions and locations, source URLs, SHA-512 integrity, and omitted optional dependencies. The install mode must match the lockfile. Missing or corrupt offline inputs cause an error; there is no network fallback. The installer does not read or write npm lockfiles. ",
+    "url": "/jsrt/packages/#lockfiles-and-updates",
+    
+    "relUrl": "/packages/#lockfiles-and-updates"
+  },"39": {
+    "doc": "Packages",
+    "title": "Version resolution",
+    "content": "Supported requirements include exact versions, ^, ~, partial and wildcard versions, comparator intersections, OR groups, hyphen ranges, and explicit prerelease ranges. Resolution selects the highest matching stable version; prereleases require an explicit matching prerelease comparator. optionalDependencies take precedence over dependencies with the same name. Optional installation failures roll back their changes and record the omission; integrity failures in locked installed packages fail the installation. Peers are resolved from the requesting package’s parent scope. Missing required peers are selected from the intersection of requirements already recorded in that scope. An existing incompatible peer causes an error. Graph backtracking and global hoisting are not implemented. Dist-tags, Git dependencies, general file: dependency specifications, and private-registry authentication are not supported. ",
+    "url": "/jsrt/packages/#version-resolution",
+    
+    "relUrl": "/packages/#version-resolution"
+  },"40": {
+    "doc": "Packages",
+    "title": "Workspaces",
+    "content": "Use explicit relative paths or a final /* pattern in the root workspaces array: . { \"workspaces\": [\"packages/*\"] } . Workspace packages must have unique names and valid versions. Local dependencies can use workspace:*, workspace:^, workspace:~, a supported workspace: range, or a compatible ordinary SemVer range. A version conflict fails installation. Workspaces are copied as managed snapshots. They are not symlinks to development sources. The lockfile covers the manifest and source bytes; frozen and offline installs reject changed sources. Use --update to refresh a snapshot. Nested workspaces, general glob patterns, parent paths, symlinks, hard links, and special files are rejected.git, node_modules, .jsrt-cache, transaction state, and jsrt.lock.wjson are excluded from snapshots. Workspace development dependencies are not installed. ",
+    "url": "/jsrt/packages/#workspaces",
+    
+    "relUrl": "/packages/#workspaces"
+  },"41": {
+    "doc": "Packages",
+    "title": "Cache",
+    "content": "Verified archives are stored in the project’s .jsrt-cache. The default budget is 256 MiB and 1,024 entries, with older entries removed first. jsrt cache prune --project ./app jsrt cache prune --project ./app --max-mb 64 --max-entries 128 . Pruning preserves unrecognized files and does not remove the installed tree. The cache is bounded storage, so a later offline install can fail if a required archive has been evicted. ",
+    "url": "/jsrt/packages/#cache",
+    
+    "relUrl": "/packages/#cache"
+  },"42": {
+    "doc": "Packages",
+    "title": "Integrity and recovery",
+    "content": "Downloads require HTTPS verification and matching SHA-512 integrity. Extraction rejects path traversal, links, duplicate entries, and special files. Installation uses a project lock, private staging, and a recovery journal. Ownership or external replacement conflicts preserve the journal and backups and fail the operation. The dependency tree and lockfile are recoverable but are not published together as one crash-atomic operation. Filesystem checks do not isolate the installer from other processes running as the same user. Integrity checks verify bytes; they do not establish publisher trust or package-code safety. The installer limits package count to 256, graph depth to 32, archive size to 32 MiB, and combined extracted archive and workspace data to 256 MiB. See jsrt --info for compiled limits and Security for execution boundaries. ",
+    "url": "/jsrt/packages/#integrity-and-recovery",
+    
+    "relUrl": "/packages/#integrity-and-recovery"
+  },"43": {
+    "doc": "Security",
+    "title": "Security and execution boundaries",
+    "content": "jsrt runs JavaScriptCore in the host process. Scripts, Workers, and native add-ons have the process’s filesystem, network, and process permissions. Use only code you trust, or provide isolation outside jsrt appropriate to your environment. ",
+    "url": "/jsrt/security/#security-and-execution-boundaries",
+    
+    "relUrl": "/security/#security-and-execution-boundaries"
+  },"44": {
+    "doc": "Security",
+    "title": "Execution and memory",
+    "content": "There is no JavaScript CPU watchdog or execution-time limit. A script that does not return can prevent the event loop from processing I/O deadlines. --memory-limit-mb sets the POSIX address-space soft limit (RLIMIT_AS). It includes engine virtual reservations and does not measure RSS or JavaScript heap usage. jsrt does not raise inherited lower limits or the hard limit. Most host queues and byte buffers are bounded. These limits do not bound the entire process, the JavaScript heap, or the memory inside arbitrary queued objects. Use jsrt --info to inspect compiled limits. | Resource | Default compiled limit | . | Source, ordinary file buffers, HTTP bodies, and binary buffers | 4 MiB per bounded operation or object | . | Timers and pending nextTick callbacks | 1,024 each | . | Modules | 1,024 | . | Asynchronous file jobs / file worker threads | 16 / 2 | . | FileHandles / file streams | 32 each | . | Workers / queued messages per link | 8 / 16 | . | Child processes / HTTP clients | 16 each | . | HTTP servers / connections | 16 / 64 | . | HTTP header bytes / rows | 16 KiB / 64 | . ",
+    "url": "/jsrt/security/#execution-and-memory",
+    
+    "relUrl": "/security/#execution-and-memory"
+  },"45": {
+    "doc": "Security",
+    "title": "Files, processes, and add-ons",
+    "content": "Ordinary file APIs and module loading can access any path permitted to the host process. Symlink resolution is not a filesystem permission boundary. Child processes require an absolute executable path and explicit inherited or piped stdio. Shell execution, PATH lookup, and custom child environment or working directory options are rejected. jsrt tracks and reaps the children it owns. Native add-ons are trusted native code. Node-API loading restrictions do not prevent memory corruption or access to external resources. ",
+    "url": "/jsrt/security/#files-processes-and-add-ons",
+    
+    "relUrl": "/security/#files-processes-and-add-ons"
+  },"46": {
+    "doc": "Security",
+    "title": "Network connections",
+    "content": "The HTTP server listens on 127.0.0.1 by default. Its parser rejects ambiguous framing, invalid Host headers, folded headers, and CR/LF/NUL header injection. The default deadlines are 60 seconds for headers, 300 seconds for a request, 30 seconds for idle I/O, and 5 seconds for keep-alive reuse. Clients require TLS and asynchronous DNS support in libcurl &gt;= 8.13.0. Requests are limited to HTTP(S); URL credentials and control characters are rejected. TLS certificate and hostname checks remain enabled, including when callers try rejectUnauthorized: false. Automatic environment proxies and HTTPS-to-HTTP redirects are not allowed. caFile selects an explicit CA file. Timeout options control I/O, not JavaScript execution. ",
+    "url": "/jsrt/security/#network-connections",
+    
+    "relUrl": "/security/#network-connections"
+  },"47": {
+    "doc": "Security",
+    "title": "Packages and archives",
+    "content": "The installer verifies HTTPS connections and SHA-512 integrity. Extraction rejects path traversal, symlinks, hard links, duplicate entries, and special files. Package scripts are not executed and bin links are not created. Installation and cache operations check ownership and managed-file identity, use private staging, and serialize cooperating installers with a project lock. They do not isolate the project from another malicious process using the same account. Integrity checks verify content, not publisher identity or code safety. The tree and lockfile are recoverable through a journal but are not crash-atomic together. See Packages for replacement, cache, and workspace behavior. ",
+    "url": "/jsrt/security/#packages-and-archives",
+    
+    "relUrl": "/security/#packages-and-archives"
+  },"48": {
+    "doc": "Security",
+    "title": "Release bundles",
+    "content": "A checksum alone does not authenticate a release. Verify signatures with a public key obtained independently from the archive. The installer checks bundle contents and refuses unexpected files or ownership conflicts. See Installation for deployment and recovery commands. ",
+    "url": "/jsrt/security/#release-bundles",
+    
+    "relUrl": "/security/#release-bundles"
+  },"49": {
+    "doc": "Security",
+    "title": "Engine and dependencies",
+    "content": "jsrt checks its JavaScriptCore version and required ABI exports. The baseline is 2.54.1 with project patches for modules, Workers, and cloning. Native dependencies retain their own licenses and security-update requirements; installed versions are reported by jsrt --info. ",
+    "url": "/jsrt/security/#engine-and-dependencies",
+    
+    "relUrl": "/security/#engine-and-dependencies"
+  },"50": {
+    "doc": "Security",
+    "title": "Security",
+    "content": " ",
+    "url": "/jsrt/security/",
+    
+    "relUrl": "/security/"
+  }
+}
