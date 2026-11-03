@@ -4,7 +4,8 @@ import("std::mem::layout")::{size_of};
 import("std::time::clock")::{time_now_monotonic_ns};
 import("./context_state")::{context_slot, allocate_context_slot, release_context_slot, TIMERS_SLOT};
 import("./config")::{TIMER_LIMIT, ARGUMENT_LIMIT};
-import("./values")::{define, define_key};
+import("./values")::{define, define_key, plain, put, get};
+import("./collections")::{weak_map, weak_get, weak_set};
 
 extern(c, "wr_undefined") fun wr_undefined(context: ptr<u8>) -> ptr<u8>;
 extern(c, "wr_number") fun wr_number(context: ptr<u8>, value: f64) -> ptr<u8>;
@@ -16,6 +17,7 @@ extern(c, "wr_set_prototype") fun wr_set_prototype(context: ptr<u8>, object: ptr
 extern(c, "wr_string_value") fun wr_string_value(context: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
 extern(c, "wr_to_number") fun wr_to_number(context: ptr<u8>, value: ptr<u8>, exception: ptr<ptr<u8>>) -> f64;
 extern(c, "wr_is_object") fun wr_is_object(context: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_get_index") fun wr_get_index(context: ptr<u8>, value: ptr<u8>, index: u32, exception: ptr<ptr<u8>>) -> ptr<u8>;
 extern(c, "wr_protect") fun wr_protect(context: ptr<u8>, value: ptr<u8>);
 extern(c, "wr_unprotect") fun wr_unprotect(context: ptr<u8>, value: ptr<u8>);
 extern(c, "wr_callable") fun wr_callable(context: ptr<u8>, object: ptr<u8>) -> bool;
@@ -68,6 +70,10 @@ struct TimerState {
     rejection_failed: bool;
     timer_prototype: ptr<u8>;
     methods: array<ptr<u8>, 6>;
+    // setTimeout handle -> {callback, args, delay}. Kept by the handle itself (WeakMap), so a
+    // finished timeout can be refreshed without keeping every callback alive. Created lazily
+    // because timers install before the collection helpers.
+    records: ptr<u8>;
     to_primitive: ptr<u8>;
 }
 
@@ -180,6 +186,95 @@ fun timer_for_handle(context: ptr<u8>, handle: ptr<u8>) -> ptr<Timer> {
     return null;
 }
 
+
+// Remembers what a setTimeout needs to run again, keyed by its handle. Failures here only disable
+// refresh-after-completion for this handle; they never fail the setTimeout call itself.
+fun remember_timeout(context: ptr<u8>, handle: ptr<u8>, slot: ptr<Timer>) {
+    var s: ptr<TimerState> = timer_state(context);
+    var ignored: ptr<u8> = null;
+    if (deref s.records == null) {
+        deref s.records = weak_map(context, &ignored);
+        if (ignored != null || deref s.records == null) {
+            deref s.records = null;
+            return;
+        }
+        wr_protect(context, deref s.records);
+    }
+    var record: ptr<u8> = plain(context);
+    wr_protect(context, record);
+    put(context, record, "callback", deref slot.callback, &ignored);
+    put(context, record, "delay", wr_number(context, deref slot.delay as f64), &ignored);
+    var list: ptr<u8> = wr_array(context, deref slot.count, deref slot.args, &ignored);
+    if (ignored == null) {
+        put(context, record, "args", list, &ignored);
+    }
+    if (ignored == null) {
+        weak_set(context, deref s.records, handle, record, &ignored);
+    }
+    wr_unprotect(context, record);
+}
+
+// Reactivates a finished setTimeout from its record, keeping its identifier so clearTimeout and
+// the handle keep working. Returns false when there is no record or no free slot.
+fun revive_timeout(context: ptr<u8>, handle: ptr<u8>, id: i64, exception: ptr<ptr<u8>>) -> bool {
+    var s: ptr<TimerState> = timer_state(context);
+    if (deref s.records == null) {
+        return false;
+    }
+    var ignored: ptr<u8> = null;
+    var record: ptr<u8> = weak_get(context, deref s.records, handle, &ignored);
+    if (ignored != null || record == null || !wr_is_object(context, record)) {
+        return false;
+    }
+    var slot: ptr<Timer> = null;
+    for (var i: i64 = 0; i < TIMER_LIMIT; i++) {
+        var timer: ptr<Timer> = deref s.storage + i;
+        if (deref timer.id == 0) {
+            slot = timer;
+            break;
+        }
+    }
+    if (slot == null) {
+        throw_error(context, exception, "pending timer limit exceeded (1024)", true);
+        return false;
+    }
+    var callback: ptr<u8> = get(context, record, "callback", &ignored);
+    var delay: f64 = wr_to_number(context, get(context, record, "delay", &ignored), &ignored);
+    var list: ptr<u8> = get(context, record, "args", &ignored);
+    var count: i64 = 0;
+    if (ignored == null && wr_is_object(context, list)) {
+        count = wr_to_number(context, get(context, list, "length", &ignored), &ignored) as i64;
+    }
+    var now: i64 = time_now_monotonic_ns();
+    if (ignored != null || callback == null || count < 0 || count > ARGUMENT_LIMIT || now < 0 ||
+        now > 9223372036854775807 - (delay as i64)) {
+        return false;
+    }
+    var copy: ptr<ptr<u8>> = null;
+    if (count > 0) {
+        copy = mem_alloc(count * (size_of<ptr<u8>>() as i64)) as ptr<ptr<u8>>;
+        if (copy == null) {
+            throw_error(context, exception, "cannot allocate timer arguments", true);
+            return false;
+        }
+    }
+    for (var i: i64 = 0; i < count; i++) {
+        deref copy[i] = wr_get_index(context, list, i as u32, &ignored);
+        wr_protect(context, copy[i]);
+    }
+    wr_protect(context, callback);
+    deref slot.id = id;
+    deref slot.delay = delay as i64;
+    deref slot.deadline = now + (delay as i64);
+    deref slot.interval = 0;
+    deref slot.refed = true;
+    deref slot.callback = callback;
+    deref slot.args = copy;
+    deref slot.count = count;
+    deref slot.active = true;
+    deref slot.running = false;
+    return true;
+}
 // Shared native entry for the Timeout/Immediate prototype methods.
 export(c) fun jsrt_timer_method(context: ptr<u8>, function: ptr<u8>, this_object: ptr<u8>, count: i64,
     args: ptr<ptr<u8>>, exception: ptr<ptr<u8>>) -> ptr<u8> {
@@ -210,14 +305,27 @@ export(c) fun jsrt_timer_method(context: ptr<u8>, function: ptr<u8>, this_object
             deref timer.refed = false;
         } else if (wr_equal(context, function, (deref s.methods)[METHOD_REFRESH])) {
             var now: i64 = time_now_monotonic_ns();
-            if (now >= 0 && deref timer.active && now <= 9223372036854775807 - deref timer.delay) {
-                deref timer.deadline = now + deref timer.delay;
+            if (now >= 0 && now <= 9223372036854775807 - deref timer.delay) {
+                if (deref timer.active) {
+                    deref timer.deadline = now + deref timer.delay;
+                } else if (deref timer.running && deref timer.interval == 0) {
+                    // Refreshed from inside its own callback: run_due_timer keeps the slot.
+                    deref timer.active = true;
+                    deref timer.deadline = now + deref timer.delay;
+                }
             }
         } else if (wr_equal(context, function, (deref s.methods)[METHOD_CLOSE])) {
             deref timer.active = false;
             if (!deref timer.running) {
                 release_timer(context, timer);
             }
+        }
+    }
+    if (timer == null && wr_equal(context, function, (deref s.methods)[METHOD_REFRESH])) {
+        // A setTimeout that already ran is scheduled again from its record, as in Node.
+        var id: f64 = wr_to_number(context, id_value, &ignored);
+        if (ignored == null && id == id && id >= 1.0) {
+            revive_timeout(context, this_object, id as i64, exception);
         }
     }
     if (wr_equal(context, function, (deref s.methods)[METHOD_CLOSE])) {
@@ -309,6 +417,11 @@ fun schedule(context: ptr<u8>, count: i64, args: ptr<ptr<u8>>, exception: ptr<pt
         // The object could not be built, so the identifier is unreachable.
         release_timer(context, slot);
         return wr_undefined(context);
+    }
+    if (!repeating && !immediate) {
+        wr_protect(context, handle);
+        remember_timeout(context, handle, slot);
+        wr_unprotect(context, handle);
     }
     return handle;
 }
@@ -710,6 +823,8 @@ pub fun run_due_timer(context: ptr<u8>, now: i64, exception: ptr<ptr<u8>>) -> bo
             return false;
         }
         deref selected.deadline = now + deref selected.interval;
+    } else if (deref selected.active) {
+        // A timeout refreshed inside its own callback keeps the deadline refresh() set.
     } else {
         release_timer(context, selected);
     }
@@ -766,6 +881,10 @@ pub fun shutdown_timers(context: ptr<u8>) {
             wr_unprotect(context, (deref s.methods)[i]);
             (deref s.methods)[i] = null;
         }
+    }
+    if (deref s.records != null) {
+        wr_unprotect(context, deref s.records);
+        deref s.records = null;
     }
     deref s.timer_prototype = null;
     deref s.to_primitive = null;
