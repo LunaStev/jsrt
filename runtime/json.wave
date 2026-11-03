@@ -50,11 +50,14 @@ fun prototype_method(ctx: ptr<u8>, global: ptr<u8>, name: str, ex: ptr<ptr<u8>>)
     return capture(ctx, prototype, "valueOf", ex);
 }
 
+// Fourteen captured intrinsics; slot 13 is Math.max, used as a ToNumber that throws on BigInt.
+const JSON_STATE_BYTES: i64 = 112;
+
 pub fun install_json(ctx: ptr<u8>) -> bool {
     if (prepare_wjson() != 0) {
         return false;
     }
-    if (!allocate_context_slot(ctx, JSON_SLOT, 104)) {
+    if (!allocate_context_slot(ctx, JSON_SLOT, JSON_STATE_BYTES)) {
         return false;
     }
     var ex: ptr<u8> = null;
@@ -72,6 +75,7 @@ pub fun install_json(ctx: ptr<u8>) -> bool {
     deref intrinsic(ctx, 10) = prototype_method(ctx, global, "Boolean", &ex);
     deref intrinsic(ctx, 11) = prototype_method(ctx, global, "BigInt", &ex);
     deref intrinsic(ctx, 12) = capture(ctx, get(ctx, global, "Object", &ex), "is", &ex);
+    deref intrinsic(ctx, 13) = capture(ctx, get(ctx, global, "Math", &ex), "max", &ex);
     if (ex != null) {
         return false;
     }
@@ -114,11 +118,11 @@ pub fun shutdown_json(ctx: ptr<u8>) {
     if (context_slot(ctx, JSON_SLOT) == null) {
         return;
     }
-    var roots: array<ptr<u8>, 13> = [deref intrinsic(ctx, 0), deref intrinsic(ctx, 1), deref intrinsic(ctx,
+    var roots: array<ptr<u8>, 14> = [deref intrinsic(ctx, 0), deref intrinsic(ctx, 1), deref intrinsic(ctx,
         2), deref intrinsic(ctx, 3), deref intrinsic(ctx, 4), deref intrinsic(ctx, 5), deref intrinsic(ctx,
         6), deref intrinsic(ctx, 7), deref intrinsic(ctx, 8), deref intrinsic(ctx, 9), deref intrinsic(ctx,
-        10), deref intrinsic(ctx, 11), deref intrinsic(ctx, 12)];
-    for (var i: i64 = 0; i < 13; i++) {
+        10), deref intrinsic(ctx, 11), deref intrinsic(ctx, 12), deref intrinsic(ctx, 13)];
+    for (var i: i64 = 0; i < 14; i++) {
         if (roots[i] != null) {
             wr_unprotect(ctx, roots[i]);
         }
@@ -136,5 +140,6 @@ pub fun shutdown_json(ctx: ptr<u8>) {
     deref intrinsic(ctx, 10) = null;
     deref intrinsic(ctx, 11) = null;
     deref intrinsic(ctx, 12) = null;
-    release_context_slot(ctx, JSON_SLOT, 104);
+    deref intrinsic(ctx, 13) = null;
+    release_context_slot(ctx, JSON_SLOT, JSON_STATE_BYTES);
 }

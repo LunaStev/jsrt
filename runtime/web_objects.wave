@@ -1,7 +1,8 @@
 // Buffered Web bodies own snapshots in JSC WeakMaps. Network bodies stay streams.
 import("./context_state")::{owned_context_slot, release_context_slot};
 import("./values")::{get, put, plain, text, define, define_key, getter, capture, fail, coerce_number};
-import("./collections")::{weak_map, weak_get, weak_set, length, at, integer, set_integer, flag, set_flag};
+import("./collections")::{weak_map, weak_get, weak_set, length, at, integer, set_integer, flag, set_flag, list,
+    append};
 import("./buffer")::{copy_buffer_input, buffer_integer};
 import("./buffer_core")::{buffer_from_bytes, byte_view_length, copy_byte_view};
 import("./byte_codec")::{decode_bytes};
@@ -133,28 +134,25 @@ pub fun web_body_bytes(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8
     }
     return copy_buffer_input(ctx, value, undefined(ctx), ex);
 }
+// Blob construction follows Web IDL order: the parts are converted first (iteration, Blob bytes,
+// buffer views, string conversion), then the options are read, then the bytes are produced. The
+// converted parts are kept as a list so `endings` can be applied to the string parts only.
 fun blob_parts(ctx: ptr<u8>, parts: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
-    if (kind(ctx, parts) == 0) {
-        return buffer_from_bytes(ctx, null, 0, ex);
+    var converted: ptr<u8> = list(ctx, ex);
+    if (deref ex != null || kind(ctx, parts) == 0) {
+        return converted;
     }
+    protect(ctx, converted);
     parts = iterable_list(ctx, parts, BUFFER_PART_LIMIT, ex);
     if (deref ex != null) {
+        unprotect(ctx, converted);
         return undefined(ctx);
     }
     protect(ctx, parts);
     var n: i64 = length(ctx, parts, ex);
     if (n > BUFFER_PART_LIMIT) {
         fail(ctx, ex, 2, "Blob part count exceeded");
-        unprotect(ctx, parts);
-        return undefined(ctx);
     }
-    var bytes: ptr<u8> = mem_alloc(BUFFER_LIMIT + 1);
-    if (bytes == null) {
-        fail(ctx, ex, 2, "cannot allocate Blob bytes");
-        unprotect(ctx, parts);
-        return undefined(ctx);
-    }
-    var used: i64 = 0;
     for (var i: i64 = 0; i < n && deref ex == null; i++) {
         var part: ptr<u8> = at(ctx, parts, i, ex);
         if (deref ex != null) {
@@ -166,32 +164,74 @@ fun blob_parts(ctx: ptr<u8>, parts: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
         if (kind(ctx, r) == 5 && integer(ctx, r, "kind", ex) == BLOB) {
             part = get(ctx, r, "bytes", ex);
         }
-        var chunk: ptr<u8> = undefined(ctx);
+        var item: ptr<u8> = undefined(ctx);
         if (deref ex == null) {
-            chunk = source_bytes(ctx, part, ex);
-            if (chunk == null && deref ex == null) {
-                part = string_copy(ctx, part, ex);
-                if (deref ex == null) {
-                    chunk = copy_buffer_input(ctx, part, undefined(ctx), ex);
-                }
+            item = source_bytes(ctx, part, ex);
+            if (item == null && deref ex == null) {
+                item = string_copy(ctx, part, ex);
             }
+        }
+        if (deref ex == null) {
+            append(ctx, converted, item, ex);
+        }
+        unprotect(ctx, original);
+    }
+    unprotect(ctx, parts);
+    unprotect(ctx, converted);
+    return converted;
+}
+
+// "native" endings on Linux turn CRLF and lone CR into LF inside string parts.
+fun native_line_endings(bytes: ptr<u8>, length: i64) -> i64 {
+    var write: i64 = 0;
+    for (var read: i64 = 0; read < length; read++) {
+        var c: u8 = bytes[read];
+        if (c == 13) {
+            bytes[write] = 10;
+            write += 1;
+            if (read + 1 < length && bytes[read + 1] == 10) {
+                read += 1;
+            }
+        } else {
+            bytes[write] = c;
+            write += 1;
+        }
+    }
+    return write;
+}
+
+fun blob_bytes(ctx: ptr<u8>, converted: ptr<u8>, native: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var bytes: ptr<u8> = mem_alloc(BUFFER_LIMIT + 1);
+    if (bytes == null) {
+        fail(ctx, ex, 2, "cannot allocate Blob bytes");
+        return undefined(ctx);
+    }
+    var used: i64 = 0;
+    var n: i64 = length(ctx, converted, ex);
+    for (var i: i64 = 0; i < n && deref ex == null; i++) {
+        var item: ptr<u8> = at(ctx, converted, i, ex);
+        var from_string: bool = kind(ctx, item) == 4;
+        var chunk: ptr<u8> = item;
+        if (deref ex == null && from_string) {
+            chunk = copy_buffer_input(ctx, item, undefined(ctx), ex);
         }
         protect(ctx, chunk);
         if (deref ex == null) {
             var size: i64 = copy_byte_view(ctx, chunk, bytes + used, BUFFER_LIMIT - used, ex);
+            if (size >= 0 && from_string && native) {
+                size = native_line_endings(bytes + used, size);
+            }
             if (size >= 0) {
                 used += size;
             }
         }
         unprotect(ctx, chunk);
-        unprotect(ctx, original);
     }
     var result: ptr<u8> = undefined(ctx);
     if (deref ex == null) {
         result = buffer_from_bytes(ctx, bytes, used, ex);
     }
     mem_free(bytes, BUFFER_LIMIT + 1);
-    unprotect(ctx, parts);
     return result;
 }
 fun owner_with_record(ctx: ptr<u8>, ctor: ptr<u8>, r: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
@@ -243,9 +283,10 @@ export(c) fun jsrt_web_construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: 
         first = args[0];
     }
     if (category == BLOB) {
-        bytes = blob_parts(ctx, first, ex);
-        protect(ctx, bytes);
+        var converted: ptr<u8> = blob_parts(ctx, first, ex);
+        protect(ctx, converted);
         var mime: ptr<u8> = undefined(ctx);
+        var native: bool = false;
         if (kind(ctx, init) == 5) {
             mime = get(ctx, init, "type", ex);
             protect(ctx, mime);
@@ -254,7 +295,13 @@ export(c) fun jsrt_web_construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: 
                 !equal(ctx, endings, text(ctx, "native"))) {
                 fail(ctx, ex, 1, "invalid Blob endings");
             }
+            native = deref ex == null && equal(ctx, endings, text(ctx, "native"));
         }
+        if (deref ex == null) {
+            bytes = blob_bytes(ctx, converted, native, ex);
+        }
+        unprotect(ctx, converted);
+        protect(ctx, bytes);
         put(ctx, r, "type", content_type(ctx, mime, ex), ex);
         if (kind(ctx, init) == 5) {
             unprotect(ctx, mime);

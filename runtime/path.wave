@@ -379,7 +379,16 @@ export(c) fun jsrt_path_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count:
             if (size < 0) {
                 return undefined(ctx);
             }
-            if (size <= end - begin) {
+            // Node's boundary rules: a suffix equal to the whole path yields "", a suffix equal to
+            // the whole final name keeps the name, and only a shorter matching tail is removed.
+            var whole_path: bool = size == n;
+            for (var i: i64 = 0; whole_path && i < size; i++) {
+                whole_path = bytes[i] == suffix[i];
+            }
+            if (whole_path && size > 0) {
+                return text(ctx, "");
+            }
+            if (size > 0 && size < end - begin) {
                 var matches: bool = true;
                 for (var i: i64 = 0; i < size; i++) {
                     if (bytes[end - size + i] != suffix[i]) {

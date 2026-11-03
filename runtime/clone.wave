@@ -50,9 +50,11 @@ const RECORD: i32 = 5;
 const ARRAY: i32 = 8;
 const BYTES: i32 = 9;
 const DATE: i32 = 10;
-const ROOT_COUNT: i64 = 8;
+// roots[8] is Object.prototype.hasOwnProperty, used to skip keys an earlier getter deleted.
+const ROOT_HAS_OWN: i64 = 8;
+const ROOT_COUNT: i64 = 9;
 struct CloneState {
-    roots: array<ptr<u8>, 8>;
+    roots: array<ptr<u8>, 9>;
 }
 pub struct CloneNode {
     tag: i32;
@@ -61,6 +63,8 @@ pub struct CloneNode {
     size: i64;
     edges: ptr<i64>;
     count: i64;
+    // Allocated edge pairs; count can be smaller when deleted keys were skipped.
+    capacity: i64;
 }
 pub struct CloneGraph {
     nodes: ptr<CloneNode>;
@@ -99,7 +103,7 @@ pub fun free_clone(graph: ptr<CloneGraph>) {
                 mem_free(deref node.bytes, bytes + 2);
             }
             if (deref node.edges != null) {
-                mem_free(deref node.edges as ptr<u8>, deref node.count * 16);
+                mem_free(deref node.edges as ptr<u8>, deref node.capacity * 16);
             }
         }
         mem_free(deref graph.nodes as ptr<u8>, CLONE_NODE_LIMIT * (size_of<CloneNode>() as i64));
@@ -227,11 +231,23 @@ fun visit_object(ctx: ptr<u8>, walk: ptr<Walk>, node: ptr<CloneNode>, value: ptr
     } else if (count > 0 && deref ex == null) {
         deref node.count = count;
         deref node.edges = mem_alloc_zeroed(count * 16) as ptr<i64>;
+        deref node.capacity = count;
         if (deref node.edges == null) {
             clone_failure(ctx, ex, "cannot allocate clone properties");
         }
+        // Keys are snapshotted first; a key that an earlier getter deleted is skipped instead of being
+        // recreated as undefined, as in the HTML structured serialization steps.
+        var written: i64 = 0;
         for (var i: i64 = 0; i < count && deref ex == null; i++) {
             var key: ptr<u8> = at(ctx, keys, i, ex);
+            var own_argument: array<ptr<u8>, 1> = [key];
+            var owned: bool = truth(ctx, call(ctx, (deref state.roots)[ROOT_HAS_OWN], value, 1, &own_argument[0], ex));
+            if (deref ex != null) {
+                break;
+            }
+            if (!owned) {
+                continue;
+            }
             var key_index: i64 = visit(ctx, walk, key, depth + 1, ex);
             if (deref ex != null) {
                 break;
@@ -239,10 +255,12 @@ fun visit_object(ctx: ptr<u8>, walk: ptr<Walk>, node: ptr<CloneNode>, value: ptr
             var child: ptr<u8> = property(ctx, value, key, ex);
             var child_index: i64 = visit(ctx, walk, child, depth + 1, ex);
             if (deref ex == null) {
-                (deref node.edges)[i * 2] = key_index;
-                (deref node.edges)[i * 2 + 1] = child_index;
+                (deref node.edges)[written * 2] = key_index;
+                (deref node.edges)[written * 2 + 1] = child_index;
+                written += 1;
             }
         }
+        deref node.count = written;
     }
     unprotect(ctx, keys);
 }
@@ -379,6 +397,7 @@ pub fun install_clone(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     (deref state.roots)[5] = capture(ctx, global(ctx), "Date", ex);
     (deref state.roots)[7] = capture(ctx, (deref state.roots)[5], "prototype", ex);
     (deref state.roots)[6] = capture(ctx, (deref state.roots)[7], "getTime", ex);
+    (deref state.roots)[ROOT_HAS_OWN] = capture(ctx, (deref state.roots)[2], "hasOwnProperty", ex);
     var name: ptr<u8> = utf8("structuredClone");
     var fn: ptr<u8> = function(ctx, name, clone_callback());
     release(name);

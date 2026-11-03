@@ -7,6 +7,7 @@ import("./inspect")::{inspector_init, inspector_options, inspector_free, inspect
 import("./inspect_engine")::{is_proxy, inspect_failed, inspect_intrinsic, INSPECT_JSON_STRINGIFY, INSPECT_PARSE_INT,
     INSPECT_PARSE_FLOAT, INSPECT_STRING};
 import("./values")::{coerce_number, get};
+import("std::mem::cstr")::{mem_len_cstr};
 import("./output")::{write_units};
 
 extern(c, "wr_type") fun wr_type(ctx: ptr<u8>, value: ptr<u8>) -> i32;
@@ -79,24 +80,37 @@ fun string_placeholder(ins: ptr<Inspector>, value: ptr<u8>, dest: ptr<Text>) {
     }
 }
 
-// wjson reports cycles as "cyclic object cannot be serialized"; match the
-// stable "cycli" prefix so a wording tweak in the tail does not matter.
-const CYCLE_PREFIX: array<u16, 5> = [99, 121, 99, 108, 105];
+// Like Node's tryStringify, only the engine's own cycle error becomes [Circular]: its name must be
+// TypeError and its message must equal the wjson cycle message exactly. Any other error, including
+// a user error that merely mentions cycles, propagates.
+const CYCLE_MESSAGE: str = "cyclic object cannot be serialized by wjson";
 
-fun mentions_cycle(units: ptr<u16>, length: i64) -> bool {
-    var prefix_length: i64 = 5;
-    for (var start: i64 = 0; start + prefix_length <= length; start++) {
-        var matches: bool = true;
-        for (var offset: i64 = 0; offset < prefix_length; offset++) {
-            if (units[start + offset] != CYCLE_PREFIX[offset]) {
-                matches = false;
-            }
-        }
-        if (matches) {
-            return true;
-        }
+fun equals_ascii(ctx: ptr<u8>, value: ptr<u8>, expected: str, ex: ptr<ptr<u8>>) -> bool {
+    if (wr_type(ctx, value) != JS_STRING) {
+        return false;
     }
-    return false;
+    var js: ptr<u8> = wr_to_string(ctx, value, ex);
+    if (js == null) {
+        return false;
+    }
+    var units: ptr<u16> = wr_string_characters(js);
+    var length: i64 = wr_string_length(js);
+    var wanted: ptr<u8> = expected as ptr<u8>;
+    var same: bool = length == mem_len_cstr(expected);
+    for (var i: i64 = 0; same && i < length; i++) {
+        same = units[i] == wanted[i] as u16;
+    }
+    wr_string_release(js);
+    return same;
+}
+
+fun is_cycle_error(ctx: ptr<u8>, error: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var name: ptr<u8> = get(ctx, error, "name", ex);
+    if (deref ex != null || !equals_ascii(ctx, name, "TypeError", ex)) {
+        return false;
+    }
+    var message: ptr<u8> = get(ctx, error, "message", ex);
+    return deref ex == null && equals_ascii(ctx, message, CYCLE_MESSAGE, ex);
 }
 
 fun json_placeholder(ins: ptr<Inspector>, value: ptr<u8>, dest: ptr<Text>) {
@@ -106,15 +120,7 @@ fun json_placeholder(ins: ptr<Inspector>, value: ptr<u8>, dest: ptr<Text>) {
     var result: ptr<u8> = wr_call(ctx, inspect_intrinsic(ctx, INSPECT_JSON_STRINGIFY), null, 1, &args[0], &nested);
     if (nested != null) {
         // tryStringify: cycles print [Circular]; other errors propagate.
-        var message: ptr<u8> = get(ctx, nested, "message", deref ins.ex);
-        var cyclic: bool = false;
-        if (wr_type(ctx, message) == JS_STRING) {
-            var js: ptr<u8> = wr_to_string(ctx, message, deref ins.ex);
-            if (js != null) {
-                cyclic = mentions_cycle(wr_string_characters(js), wr_string_length(js));
-                wr_string_release(js);
-            }
-        }
+        var cyclic: bool = wr_type(ctx, nested) == JS_OBJECT && is_cycle_error(ctx, nested, deref ins.ex);
         if (cyclic) {
             text_add_ascii(ins, dest, "[Circular]");
         } else if (deref deref ins.ex == null) {

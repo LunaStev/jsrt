@@ -1,5 +1,5 @@
 // wjson serialization, replacer policy and cycle handling.
-import("./json_support")::{intrinsic, get, callable, error, call, is_array, length_of, own_keys, data_property,
+import("./json_support")::{intrinsic, get, callable, error, call, is_array, length_of, own_keys, data_property, strict_number,
     DEPTH_LIMIT, ITEM_LIMIT};
 import("./json_format")::{format_json};
 import("wjson")::{JsonDoc, JsonWriter, JSON_STRICT, json_parse_bytes, json_ok, json_root, json_free,
@@ -129,7 +129,7 @@ pub fun serialize(s: ptr<Serializer>, holder: ptr<u8>, key: ptr<u8>, member: boo
         var unboxed: ptr<u8> = null;
         var box: i32 = boxed_kind(ctx, value, &unboxed);
         if (box == 3) {
-            unboxed = wr_number(ctx, wr_to_number(ctx, value, ex));
+            unboxed = wr_number(ctx, strict_number(ctx, value, ex));
         } else if (box == 4) {
             var text: ptr<u8> = wr_to_string(ctx, value, ex);
             if (text != null) {
@@ -227,10 +227,12 @@ pub fun serialize_object(s: ptr<Serializer>, value: ptr<u8>) -> bool {
             if (text.data == null) {
                 return false;
             }
+            // The source is only validated here; it is written verbatim so escapes and number
+            // spellings survive, as JSON.rawJSON requires.
             var doc: JsonDoc = json_parse_bytes(text.data, text.len, DEPTH_LIMIT as i32, JSON_STRICT);
-            free_json_text(text);
-            var ok: bool = json_ok(doc) && json_write_value(&deref s.writer, json_root(doc));
+            var ok: bool = json_ok(doc) && json_write_raw_bytes(&deref s.writer, text.data, text.len);
             json_free(&doc);
+            free_json_text(text);
             return ok;
         }
     }
@@ -349,7 +351,7 @@ pub fun gap_string(ctx: ptr<u8>, space: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
     var units: array<u16, 10>;
     var count: i64 = 0;
     if (kind == 3) {
-        var n: f64 = wr_to_number(ctx, space, ex);
+        var n: f64 = strict_number(ctx, space, ex);
         if (n >= 10.0) {
             count = 10;
         } else if (n > 0.0) {

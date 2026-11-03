@@ -101,12 +101,23 @@ pub fun is_array(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     return deref ex == null && wr_to_boolean(ctx, result);
 }
 
+
+// ECMAScript ToNumber: throws TypeError for BigInt (the JSC C conversion silently accepts it).
+// Math.max with one argument performs exactly ToNumber and returns the value unchanged, -0 included.
+pub fun strict_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64 {
+    var args: array<ptr<u8>, 1> = [value];
+    var converted: ptr<u8> = call(ctx, deref intrinsic(ctx, 13), null, &args[0], 1, ex);
+    if (deref ex != null || converted == null) {
+        return 0.0;
+    }
+    return wr_to_number(ctx, converted, ex);
+}
 pub fun length_of(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64 {
     var n: ptr<u8> = get(ctx, value, "length", ex);
     if (deref ex != null) {
         return 0;
     }
-    var length: f64 = wr_to_number(ctx, n, ex);
+    var length: f64 = strict_number(ctx, n, ex);
     if (deref ex != null || length != length || length <= 0.0) {
         return 0;
     }
