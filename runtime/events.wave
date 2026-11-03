@@ -9,7 +9,7 @@ pub fun event_parent(ctx: ptr<u8>) -> ptr<u8> {
 
 // EventEmitter policy in Wave; WeakMap entries are collected with their owners.
 import("./values")::{get, put, text, plain, define, fail};
-import("./collections")::{weak_map, weak_get, weak_set, list, length, at, append, flag, set_flag};
+import("./collections")::{weak_map, weak_get, weak_set, list, length, at, append, flag, set_flag, bind_one};
 import("./config")::{EVENT_LISTENER_LIMIT};
 extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
 extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
@@ -29,6 +29,7 @@ extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex
 extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
     ex: ptr<ptr<u8>>) -> ptr<u8>;
 extern(c, "jsrt_event_callback") fun callback(code: i32) -> ptr<u8>;
+extern(c, "wr_promise") fun make_promise(ctx: ptr<u8>, resolve: ptr<ptr<u8>>, reject: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
 extern(c, "jsrt_event_constructor_callback") fun constructor_callback() -> ptr<u8>;
 pub fun event_state(ctx: ptr<u8>, receiver: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
     if (kind(ctx, receiver) != 5) {
@@ -319,8 +320,141 @@ export(c) fun jsrt_event_inspect(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, c
     return result;
 }
 
+// events.once(emitter, name): a Promise for the next `name` event, resolved with the array of event
+// arguments. An 'error' event before it rejects instead (unless name is 'error' itself). Either way
+// the pending listeners are removed. The unsupported `signal` option and bad arguments reject.
+const INTRINSIC_ONCE: i64 = 13;
+const INTRINSIC_SETTLE_VALUE: i64 = 14;
+const INTRINSIC_SETTLE_ERROR: i64 = 15;
+const INTRINSIC_STATIC_COUNT: i64 = 16;
+const INTRINSIC_LAST: i64 = 17;
+const EVENTS_STATE_BYTES: i64 = 144;
+const JS_OBJECT: i32 = 5;
+
+// Marks the record settled and removes both listeners. False when it already settled.
+fun finish_once(ctx: ptr<u8>, record: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (flag(ctx, record, "done", ex)) {
+        return false;
+    }
+    set_flag(ctx, record, "done", true, ex);
+    var emitter: ptr<u8> = get(ctx, record, "emitter", ex);
+    protect(ctx, emitter);
+    remove_listener(ctx, emitter, get(ctx, record, "name", ex), get(ctx, record, "listener", ex), null, ex);
+    var error_listener: ptr<u8> = get(ctx, record, "errorListener", ex);
+    if (kind(ctx, error_listener) == JS_OBJECT) {
+        remove_listener(ctx, emitter, text(ctx, "error"), error_listener, null, ex);
+    }
+    unprotect(ctx, emitter);
+    return deref ex == null;
+}
+
+// Bound as listener(record, ...eventArguments).
+export(c) fun jsrt_event_settle_value(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count < 1 || !finish_once(ctx, args[0], ex)) {
+        return undefined(ctx);
+    }
+    var values: ptr<u8> = array(ctx, count - 1, args + 1, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    protect(ctx, values);
+    var resolve: ptr<u8> = get(ctx, args[0], "resolve", ex);
+    var settled: array<ptr<u8>, 1> = [values];
+    call(ctx, resolve, null, 1, &settled[0], ex);
+    unprotect(ctx, values);
+    return undefined(ctx);
+}
+
+// Bound as errorListener(record, error).
+export(c) fun jsrt_event_settle_error(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count < 1 || !finish_once(ctx, args[0], ex)) {
+        return undefined(ctx);
+    }
+    var problem: array<ptr<u8>, 1> = [undefined(ctx)];
+    if (count > 1) {
+        problem[0] = args[1];
+    }
+    var reject: ptr<u8> = get(ctx, args[0], "reject", ex);
+    call(ctx, reject, null, 1, &problem[0], ex);
+    return undefined(ctx);
+}
+
+export(c) fun jsrt_event_once(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var resolve: ptr<u8> = null;
+    var reject: ptr<u8> = null;
+    var result: ptr<u8> = make_promise(ctx, &resolve, &reject, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    protect(ctx, result);
+    protect(ctx, resolve);
+    protect(ctx, reject);
+    var problem: ptr<u8> = null;
+    if (count < 2 || kind(ctx, args[0]) != JS_OBJECT) {
+        fail(ctx, &problem, 1, "events.once requires an emitter and an event name");
+    } else if (valid_name(ctx, args[1], &problem) && count > 2 && kind(ctx, args[2]) == JS_OBJECT &&
+        kind(ctx, get(ctx, args[2], "signal", &problem)) != 0) {
+        fail(ctx, &problem, 1, "events.once does not support the signal option");
+    }
+    if (problem == null) {
+        var record: ptr<u8> = plain(ctx);
+        protect(ctx, record);
+        put(ctx, record, "emitter", args[0], &problem);
+        put(ctx, record, "name", args[1], &problem);
+        put(ctx, record, "resolve", resolve, &problem);
+        put(ctx, record, "reject", reject, &problem);
+        var listener: ptr<u8> = bind_one(ctx, deref intrinsic(ctx, INTRINSIC_SETTLE_VALUE), null, record, &problem);
+        if (problem == null) {
+            protect(ctx, listener);
+            put(ctx, record, "listener", listener, &problem);
+            add_listener(ctx, args[0], args[1], listener, true, false, &problem);
+            unprotect(ctx, listener);
+        }
+        // Waiting for 'error' itself must not also install the rejecting listener.
+        var waits_for_error: bool = problem == null && equal(ctx, args[1], text(ctx, "error"));
+        if (problem == null && !waits_for_error) {
+            var error_listener: ptr<u8> = bind_one(ctx, deref intrinsic(ctx, INTRINSIC_SETTLE_ERROR), null, record,
+                &problem);
+            if (problem == null) {
+                protect(ctx, error_listener);
+                put(ctx, record, "errorListener", error_listener, &problem);
+                add_listener(ctx, args[0], text(ctx, "error"), error_listener, true, false, &problem);
+                unprotect(ctx, error_listener);
+            }
+        }
+        unprotect(ctx, record);
+    }
+    if (problem != null) {
+        var rejected: array<ptr<u8>, 1> = [problem];
+        call(ctx, reject, null, 1, &rejected[0], ex);
+    }
+    unprotect(ctx, reject);
+    unprotect(ctx, resolve);
+    unprotect(ctx, result);
+    return result;
+}
+
+// events.listenerCount(emitter, name): the legacy static form of emitter.listenerCount(name).
+export(c) fun jsrt_event_static_count(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count < 2 || kind(ctx, args[0]) != JS_OBJECT) {
+        fail(ctx, ex, 1, "listenerCount requires an emitter and an event name");
+        return undefined(ctx);
+    }
+    var method: ptr<u8> = get(ctx, args[0], "listenerCount", ex);
+    if (deref ex != null || !callable(ctx, method)) {
+        fail(ctx, ex, 1, "emitter does not implement listenerCount");
+        return undefined(ctx);
+    }
+    var name: array<ptr<u8>, 1> = [args[1]];
+    return call(ctx, method, args[0], 1, &name[0], ex);
+}
+
 pub fun install_events(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
-    if (!allocate_context_slot(ctx, EVENTS_SLOT, 104)) {
+    if (!allocate_context_slot(ctx, EVENTS_SLOT, EVENTS_STATE_BYTES)) {
         return false;
     }
     deref intrinsic(ctx, 0) = weak_map(ctx, ex);
@@ -343,6 +477,16 @@ pub fun install_events(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     }
     define(ctx, deref intrinsic(ctx, 2), "addListener", deref intrinsic(ctx, 3 + (0)), ex, false);
     define(ctx, deref intrinsic(ctx, 2), "removeListener", deref intrinsic(ctx, 3 + (5)), ex, false);
+    // Static helpers and the native listeners events.once binds. Codes 5-8 select the C callbacks.
+    var static_names: array<str, 4> = ["once", "settleValue", "settleError", "listenerCount"];
+    for (var i: i64 = 0; i < 4; i++) {
+        var static_name: ptr<u8> = utf8(static_names[i]);
+        deref intrinsic(ctx, INTRINSIC_ONCE + i) = function(ctx, static_name, callback(5 + i as i32));
+        release(static_name);
+        protect(ctx, deref intrinsic(ctx, INTRINSIC_ONCE + i));
+    }
+    define(ctx, deref intrinsic(ctx, 1), "once", deref intrinsic(ctx, INTRINSIC_ONCE), ex, true);
+    define(ctx, deref intrinsic(ctx, 1), "listenerCount", deref intrinsic(ctx, INTRINSIC_STATIC_COUNT), ex, true);
     return deref ex == null;
 }
 
@@ -360,6 +504,12 @@ pub fun shutdown_events(ctx: ptr<u8>) {
             deref intrinsic(ctx, 3 + (i)) = null;
         }
     }
+    for (var i: i64 = INTRINSIC_ONCE; i < INTRINSIC_LAST; i++) {
+        if (deref intrinsic(ctx, i) != null) {
+            unprotect(ctx, deref intrinsic(ctx, i));
+            deref intrinsic(ctx, i) = null;
+        }
+    }
     if (deref intrinsic(ctx, 2) != null) {
         unprotect(ctx, deref intrinsic(ctx, 2));
         deref intrinsic(ctx, 2) = null;
@@ -372,5 +522,5 @@ pub fun shutdown_events(ctx: ptr<u8>) {
         unprotect(ctx, deref intrinsic(ctx, 0));
         deref intrinsic(ctx, 0) = null;
     }
-    release_context_slot(ctx, EVENTS_SLOT, 104);
+    release_context_slot(ctx, EVENTS_SLOT, EVENTS_STATE_BYTES);
 }

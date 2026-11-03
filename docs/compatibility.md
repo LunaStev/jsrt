@@ -75,6 +75,16 @@ uses the timer store and does not guarantee Node.js's check-phase ordering.
 `process.nextTick` runs before Promise jobs on ordinary host entry returns.
 Ticks scheduled by a Promise job run after the current engine checkpoint.
 
+`events.once(emitter, name)` returns a Promise for the next `name` event, resolved
+with the array of event arguments, and rejects if an `'error'` event arrives first
+(waiting for `'error'` itself resolves with its arguments). Both pending listeners
+are removed either way. Bad arguments and the unsupported `signal` option reject
+instead of throwing. Event names must be strings or symbols. `events.listenerCount`
+is the legacy static form; `events.on` (the async iterator) is not implemented.
+
+An `'exit'` listener may change `process.exitCode`; the final exit status uses the
+new value, as in Node.
+
 `process` includes identification fields (`version`, `title`, `argv0`, `execArgv`, `release`), environment and arguments, `cwd`,
 `chdir`, exit handling, `hrtime`, `uptime`, `memoryUsage`, and selected process
 events. `process.version` and `versions.jsrt` identify jsrt; `versions.node` is

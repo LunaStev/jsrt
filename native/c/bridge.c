@@ -365,6 +365,10 @@ extern JSValue jsrt_event_emit(const void *, void *, void *, size_t, const JSVal
 extern JSValue jsrt_event_off(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 extern JSValue jsrt_event_clear(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 extern JSValue jsrt_event_inspect(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+extern JSValue jsrt_event_once(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+extern JSValue jsrt_event_settle_value(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+extern JSValue jsrt_event_settle_error(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+extern JSValue jsrt_event_static_count(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 JSCallback jsrt_event_callback(int32_t kind) {
     switch (kind) {
     case 0:
@@ -377,6 +381,14 @@ JSCallback jsrt_event_callback(int32_t kind) {
         return jsrt_event_clear;
     case 4:
         return jsrt_event_inspect;
+    case 5:
+        return jsrt_event_once;
+    case 6:
+        return jsrt_event_settle_value;
+    case 7:
+        return jsrt_event_settle_error;
+    case 8:
+        return jsrt_event_static_count;
     default:
         return NULL;
     }

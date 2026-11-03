@@ -97,9 +97,15 @@ pub fun execute(options: LaunchOptions) -> i32 {
             status = system_exit_status(context);
         }
         if (exception == null) {
+            // An 'exit' listener may change process.exitCode, and Node uses the final value. A status
+            // that came from a failure (for example a failed event loop) is only replaced when the
+            // listener actually changed the exit code.
+            var exit_code_before: i32 = system_exit_status(context);
             emit_process_exit(context, status, &exception);
             if (exception != null) {
                 status = 1;
+            } else if (system_exit_status(context) != exit_code_before) {
+                status = system_exit_status(context);
             }
         }
     }
