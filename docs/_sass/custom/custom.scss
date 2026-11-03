@@ -43,6 +43,19 @@ html {
   border-bottom: 1px solid $border-color;
 }
 
+// The stock theme animates the input padding when the layout switches
+// breakpoints, which shows up as the icon sliding over the placeholder on load.
+.search,
+.search-input-wrap,
+.search-input,
+.search-label {
+  transition: none;
+}
+
+.search-input-wrap {
+  box-shadow: none;
+}
+
 .search-input {
   font-family: inherit;
 }
