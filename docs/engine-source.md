@@ -1,20 +1,65 @@
-# 동봉 JavaScriptCore 소스와 패치
+---
+title: Engine reference
+nav_order: 8
+---
 
-원본: https://webkitgtk.org/releases/webkitgtk-2.54.1.tar.xz
+# JavaScriptCore source and patches
 
-SHA-256: ea0bbb02dbdbc596874a4e7ad35b66645b3e0a232bd0e4081de5ed92eb0a397d
+jsrt's engine baseline is WebKitGTK 2.54.1. The engine builder obtains the upstream
+archive and verifies it before extracting or patching it:
 
-engine-source의 webkitgtk-2.54.1.patch, module-output.patch, synthetic-modules.patch가
-엔진 내부 모듈/Worker/복제 ABI 연결에 사용된 프로젝트 패치다.
-원본 Source/JavaScriptCore/COPYING.LIB는 licenses에 포함한다.
+- Source: <https://webkitgtk.org/releases/webkitgtk-2.54.1.tar.xz>
+- SHA-256: `ea0bbb02dbdbc596874a4e7ad35b66645b3e0a232bd0e4081de5ed92eb0a397d`
+- Digest file: `native/engine/webkitgtk-2.54.1.sha256`
 
-프로젝트의 tools/engine_build.wave와 ./bootstrap.sh engine-build가 소스 검증·패치 확인·
-같은 소스 안의 C++ 어댑터 빌드를 수행한다. 재빌드는 프로젝트 소스의
-native/cpp/jsc_module_api.cpp와 native/include/jsrt_modules.h도 필요하다.
-빌드 의존성과 검증은 프로젝트 native/ENGINE_ABI.md와 docs/engine-validation.md를 따른다.
-시스템 JavaScriptCore에 이 private ABI가 있다고 가정하지 않는다.
+## Build
 
-Worker ABI v2는 JSRTDrainOwnerRunLoop를 추가한다. Wave는 Worker 종료 시 mutex 아래에서
-부모의 종료 요청용 VM 참조를 회수하고, 소유 스레드에서 마지막 VM 해제와 비차단 RunLoop
-정리 cycle을 수행한다. 이는 엔진 타이머 폐기 작업을 위한 ABI이며 JS bootstrap이나 별도 Promise 큐가 아니다.
-v1 엔진에는 새 Worker 기능을 켜지 않는다. 엔진 빌드는 기존 후보를 덮어쓰지 않는다.
+Run from the project root:
+
+```sh
+./bootstrap.sh engine-build
+```
+
+The tool builds JSCOnly with CMake and Ninja, then prints a candidate shared-library
+path. It preserves existing candidates and refuses unmarked or mismatched cached
+sources. The runtime and regression suite are built separately using the selected
+candidate. Setup and commands are in
+[CONTRIBUTING.md](https://github.com/potatosl/jsrt/blob/main/CONTRIBUTING.md).
+
+## Project patches
+
+The builder applies these files from `native/engine/` with `--fuzz=0`:
+
+| Patch | Purpose |
+| --- | --- |
+| `webkitgtk-2.54.1.patch` | Connect the matching module, Worker, and clone host ABI |
+| `module-output.patch` | Isolate engine module output |
+| `synthetic-modules.patch` | Connect built-in, CommonJS, and JSON synthetic modules |
+
+`native/cpp/jsc_module_api.cpp` and `native/include/jsrt_modules.h` are compiled
+with the matching WebKit source tree. System JSC libraries are not assumed to
+export this private boundary.
+
+## ABI expectations
+
+The bridge connects synchronous Wave resolution, source, metadata, and value
+callbacks to engine-owned module graphs and Promise evaluation. It does not
+rewrite JavaScript import/export syntax. Runtime detection is reported by
+`engine.moduleHostABI` and `engine.syntheticModuleHostABI` in `jsrt --info`.
+
+Public Workers require Worker ABI v2 and clone ABI v1. Worker termination requests
+use a retained context group; the final VM reference and deferred RunLoop disposal
+are released on the owning Worker thread. `JSRTDrainOwnerRunLoop` performs that
+nonblocking cleanup. `JSRTIsProxy` checks engine object type without user traps.
+These bridges do not impose a JavaScript CPU deadline.
+
+The [engine ABI reference](https://github.com/potatosl/jsrt/blob/main/native/ENGINE_ABI.md)
+describes handle ownership, public JSC calls, and private extensions.
+
+## Distribution
+
+Release bundles retain the engine source information, patches, digest, and
+JavaScriptCore's `Source/JavaScriptCore/COPYING.LIB` notice. JavaScriptCore and
+other dependencies retain their upstream licenses independently of jsrt's MPL-2.0
+license. Follow the source and license information shipped with the exact bundle
+when rebuilding its engine.

@@ -1,6 +1,13 @@
 # Build outputs, engine sources/candidates and release archives stay local.
 /target/
 
+# Documentation build outputs and local Bundler state.
+/docs/_site/
+/docs/.jekyll-cache/
+/docs/.jekyll-metadata
+/docs/.bundle/
+/docs/vendor/
+
 # Personal editor and agent tooling state.
 /.vscode/
 /.idea/

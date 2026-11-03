@@ -19,9 +19,12 @@ jsrt --info
 
 ## Documentation
 
+- [Documentation home](docs/index.md)
 - [API compatibility](docs/compatibility.md)
-- [Package installation](INSTALLER.md)
-- [Security and execution boundaries](SECURITY.md)
+- [Getting started](docs/getting-started.md)
+- [Installation](docs/distribution.md)
+- [Package installation](docs/packages.md)
+- [Security and execution boundaries](docs/security.md)
 
 ## Contributing
 

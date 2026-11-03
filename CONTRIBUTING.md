@@ -82,8 +82,59 @@ See [engine source and patches](docs/engine-source.md) for engine details and
 | `native/` | JavaScriptCore and native library ABI adapters and engine patches |
 | `vendor/` | Third-party sources with their upstream notices and licenses |
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for module boundaries. Use the existing
+See [Architecture](docs/architecture.md) for module boundaries. Use the existing
 code style and [`.clang-format`](.clang-format) for C and C++ changes.
+
+## Documentation
+
+The English Markdown files in `docs/` are the site source. The site uses Jekyll
+with the Just the Docs theme; no runtime toolchain is needed to edit or build it.
+With Ruby 3.4 and Bundler installed:
+
+```sh
+cd docs
+bundle install
+bundle exec jekyll serve
+```
+
+Open `http://localhost:4000/jsrt/`. Use `bundle exec jekyll build` for a static
+build in `docs/_site/`. Keep instructions about current behavior in the guide;
+record change discussions and validation results in issues and pull requests.
+
+The documentation workflow builds pull requests on a GitHub-hosted runner and
+deploys the default branch to Pages. For the first deployment, a repository
+maintainer must select **Settings > Pages > Source > GitHub Actions**. The site
+uses `/jsrt` as its base path. Update `docs/_config.yml` if the repository name
+or the canonical Pages URL changes.
+
+`docs/distribution.md` and `docs/engine-source.md` are also included in release
+bundles. Preserve these paths when reorganizing the site.
+
+## Releases and runtime CI
+
+Release tooling requires the test sources and selected engine described above.
+The `Release artifact:` line identifies the archive produced by that invocation;
+use that path for signing and host checks rather than picking an older archive
+from `target/dist/`.
+
+```sh
+./bootstrap.sh release
+./bootstrap.sh linux-check --archive /path/to/release.tar.gz --image 26.04
+./bootstrap.sh sign-release --archive /path/to/release.tar.gz --key /path/to/private.pem --output /path/to/new-signatures
+./bootstrap.sh verify-release --archive /path/to/release.tar.gz --public-key /path/to/trusted-public.pem --signature-directory /path/to/new-signatures
+```
+
+Signing uses Ed25519 over the archive's SHA-256 followed by a newline. Keep the
+private key outside the checkout and supply the trusted verification key
+independently of the archive. Host checks are described in
+[Installation](docs/distribution.md).
+
+The runtime's release, compatibility, and stability workflows are manual and
+require a prepared self-hosted runner labeled `linux`, `x64`, and `jsrt-wave-jsc`,
+including the test suite. Configure `JSRT_JSC_LIBRARY` for release/stability,
+`JSRT_BASELINE_JSC_LIBRARY` and `JSRT_CANDIDATE_JSC_LIBRARY` for the compatibility
+matrix, and optionally `JSRT_WAVEC` for the compiler. The release workflow can use
+`JSRT_RELEASE_SIGNING_KEY_PATH` to select a separately managed signing key.
 
 ## Pull requests
 
