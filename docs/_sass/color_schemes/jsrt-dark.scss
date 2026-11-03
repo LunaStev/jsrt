@@ -1,0 +1,26 @@
+$color-scheme: dark;
+$body-background-color: #0e0e1a;
+$body-heading-color: #f3f2ff;
+$body-text-color: #c3c2dc;
+$link-color: #a99cff;
+$nav-child-link-color: #9a99bb;
+$sidebar-color: #12121f;
+$base-button-color: #1b1b2e;
+$btn-primary-color: #6654f1;
+$code-background-color: #15152a;
+$code-linenumber-color: #e6edf3;
+$feedback-color: #0b0b15;
+$table-background-color: #15152a;
+$search-background-color: #181830;
+$search-result-preview-color: #9a99bb;
+$border-color: #26263f;
+
+$jsrt-accent: #8b7bff;
+$jsrt-accent-soft: rgba(139, 123, 255, 0.14);
+$jsrt-surface: #15152a;
+$jsrt-muted: #8d8cae;
+$jsrt-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.35);
+$jsrt-hero-glow: radial-gradient(60% 80% at 15% 0%, rgba(102, 84, 241, 0.28), transparent 70%);
+$jsrt-terminal-bg: #090912;
+
+@import "./vendor/accessible-pygments/github-dark";
