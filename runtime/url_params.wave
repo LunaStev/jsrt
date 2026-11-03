@@ -1,3 +1,4 @@
+import("std::mem::ops")::{mem_copy};
 import("./context_state")::{owned_context_slot, active_context};
 import("std::mem::layout")::{size_of};
 struct UrlParamsState {
@@ -73,12 +74,18 @@ fun hex(c: u8) -> i64 {
 }
 
 fun unescape(ctx: ptr<u8>, bytes: ptr<u8>, n: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return unescape_with(ctx, bytes, n, true, ex);
+}
+
+// plus_is_space selects form decoding (URLSearchParams, querystring.parse) over the plain percent
+// decoding of querystring.unescape, which keeps "+" as it is.
+fun unescape_with(ctx: ptr<u8>, bytes: ptr<u8>, n: i64, plus_is_space: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
     var result: array<u8, 8192>;
     var used: i64 = 0;
     var i: i64 = 0;
     while (i < n) {
         var c: u8 = bytes[i];
-        if (c == 43) {
+        if (c == 43 && plus_is_space) {
             c = 32;
         } else if (c == 37 && i + 2 < n) {
             var a: i64 = hex(bytes[i + 1]);
@@ -95,7 +102,29 @@ fun unescape(ctx: ptr<u8>, bytes: ptr<u8>, n: i64, ex: ptr<ptr<u8>>) -> ptr<u8> 
     return decode_bytes(ctx, &result[0], used, 0, ex);
 }
 
+// True when `delimiter` (length bytes) occurs in `bytes` at `position`, bounded by `limit`.
+fun delimiter_at(bytes: ptr<u8>, position: i64, limit: i64, delimiter: ptr<u8>, length: i64) -> bool {
+    if (position + length > limit) {
+        return false;
+    }
+    for (var i: i64 = 0; i < length; i++) {
+        if (bytes[position + i] != delimiter[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 pub fun parse_pairs(ctx: ptr<u8>, source: ptr<u8>, strip_question: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var pair_separator: array<u8, 1> = [38];
+    var equals: array<u8, 1> = [61];
+    return parse_pairs_with(ctx, source, strip_question, &pair_separator[0], 1, &equals[0], 1, ex);
+}
+
+// Splits on the given separator and key/value delimiter byte strings (both non-empty). Used by
+// querystring.parse(str, sep, eq); URLSearchParams uses the default "&" and "=" through parse_pairs.
+pub fun parse_pairs_with(ctx: ptr<u8>, source: ptr<u8>, strip_question: bool, sep: ptr<u8>, sep_length: i64,
+    eq: ptr<u8>, eq_length: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
     var bytes: array<u8, 8192>;
     var n: i64 = encode_utf8(ctx, source, &bytes[0], URL_CAP, false, ex);
     if (n < 0) {
@@ -109,11 +138,11 @@ pub fun parse_pairs(ctx: ptr<u8>, source: ptr<u8>, strip_question: bool, ex: ptr
     }
     while (cursor < n && deref ex == null) {
         var first: i64 = cursor;
-        while (cursor < n && bytes[cursor] != 38) {
+        while (cursor < n && !delimiter_at(&bytes[0], cursor, n, sep, sep_length)) {
             cursor += 1;
         }
         var last: i64 = cursor;
-        cursor += 1;
+        cursor += sep_length;
         if (first == last) {
             continue;
         }
@@ -122,14 +151,14 @@ pub fun parse_pairs(ctx: ptr<u8>, source: ptr<u8>, strip_question: bool, ex: ptr
             break;
         }
         var separator: i64 = first;
-        while (separator < last && bytes[separator] != 61) {
+        while (separator < last && !delimiter_at(&bytes[0], separator, last, eq, eq_length)) {
             separator += 1;
         }
         var name: ptr<u8> = unescape(ctx, &bytes[first], separator - first, ex);
         protect(ctx, name);
         var start: i64 = separator;
         if (start < last) {
-            start += 1;
+            start += eq_length;
         }
         var value: ptr<u8> = unescape(ctx, &bytes[start], last - start, ex);
         protect(ctx, value);
@@ -179,15 +208,47 @@ fun encoded_field(ctx: ptr<u8>, value: ptr<u8>, bytes: ptr<u8>, used: i64, query
     return cursor;
 }
 
+
+// querystring.unescape(string): percent-decoding only, "+" stays a plus, malformed escapes stay.
+pub fun unescape_query_text(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var bytes: array<u8, 8192>;
+    var n: i64 = encode_utf8(ctx, value, &bytes[0], URL_CAP, false, ex);
+    if (n < 0) {
+        return undefined(ctx);
+    }
+    return unescape_with(ctx, &bytes[0], n, false, ex);
+}
+
+// querystring.escape(string): the query escaping rules without any pair delimiters.
+pub fun escape_query_text(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var bytes: array<u8, 8192>;
+    var used: i64 = encoded_field(ctx, value, &bytes[0], 0, true, ex);
+    if (used < 0 || deref ex != null) {
+        return undefined(ctx);
+    }
+    bytes[used] = 0;
+    return text(ctx, &bytes[0] as str);
+}
 pub fun serialize_pairs(ctx: ptr<u8>, entries: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
-    return serialize_styled(ctx, entries, false, ex);
+    var pair_separator: array<u8, 1> = [38];
+    var equals: array<u8, 1> = [61];
+    return serialize_styled(ctx, entries, false, &pair_separator[0], 1, &equals[0], 1, ex);
 }
 
 pub fun serialize_query_pairs(ctx: ptr<u8>, entries: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
-    return serialize_styled(ctx, entries, true, ex);
+    var pair_separator: array<u8, 1> = [38];
+    var equals: array<u8, 1> = [61];
+    return serialize_styled(ctx, entries, true, &pair_separator[0], 1, &equals[0], 1, ex);
 }
 
-fun serialize_styled(ctx: ptr<u8>, entries: ptr<u8>, query: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+// querystring.stringify(obj, sep, eq): the same escaping with caller-chosen delimiters.
+pub fun serialize_query_pairs_with(ctx: ptr<u8>, entries: ptr<u8>, sep: ptr<u8>, sep_length: i64, eq: ptr<u8>,
+    eq_length: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return serialize_styled(ctx, entries, true, sep, sep_length, eq, eq_length, ex);
+}
+
+fun serialize_styled(ctx: ptr<u8>, entries: ptr<u8>, query: bool, sep: ptr<u8>, sep_length: i64, eq: ptr<u8>,
+    eq_length: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
     var bytes: array<u8, 8192>;
     var used: i64 = 0;
     for (var i: i64 = 0; i < length(ctx, entries, ex) && deref ex == null; i++) {
@@ -196,8 +257,12 @@ fun serialize_styled(ctx: ptr<u8>, entries: ptr<u8>, query: bool, ex: ptr<ptr<u8
             break;
         }
         if (i > 0) {
-            bytes[used] = 38;
-            used += 1;
+            if (used + sep_length >= (URL_CAP - 1)) {
+                fail(ctx, ex, 2, "URLSearchParams serialized byte limit exceeded");
+                break;
+            }
+            mem_copy(&bytes[used], sep, sep_length);
+            used += sep_length;
         }
         var entry: ptr<u8> = at(ctx, entries, i, ex);
         used = encoded_field(ctx, at(ctx, entry, 0, ex), &bytes[0], used, query, ex);
@@ -208,8 +273,12 @@ fun serialize_styled(ctx: ptr<u8>, entries: ptr<u8>, query: bool, ex: ptr<ptr<u8
             fail(ctx, ex, 2, "URLSearchParams serialized byte limit exceeded");
             break;
         }
-        bytes[used] = 61;
-        used += 1;
+        if (used + eq_length >= (URL_CAP - 1)) {
+            fail(ctx, ex, 2, "URLSearchParams serialized byte limit exceeded");
+            break;
+        }
+        mem_copy(&bytes[used], eq, eq_length);
+        used += eq_length;
         used = encoded_field(ctx, at(ctx, entry, 1, ex), &bytes[0], used, query, ex);
         if (used < 0) {
             break;

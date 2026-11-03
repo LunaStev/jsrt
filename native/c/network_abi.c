@@ -118,6 +118,8 @@ extern Value jsrt_http_remove_header(const void *, void *, void *, size_t, const
 extern Value jsrt_http_write_head(const void *, void *, void *, size_t, const Value *, Value *);
 extern Value jsrt_query_parse(const void *, void *, void *, size_t, const Value *, Value *);
 extern Value jsrt_query_stringify(const void *, void *, void *, size_t, const Value *, Value *);
+extern Value jsrt_query_escape(const void *, void *, void *, size_t, const Value *, Value *);
+extern Value jsrt_query_unescape(const void *, void *, void *, size_t, const Value *, Value *);
 extern Value jsrt_process_signal_add(const void *, void *, void *, size_t, const Value *, Value *);
 extern Value jsrt_process_stdio_write(const void *, void *, void *, size_t, const Value *, Value *);
 extern Value jsrt_process_io_read(const void *, void *, void *, size_t, const Value *, Value *);
@@ -179,6 +181,10 @@ Callback jsrt_http_callback(int32_t kind) {
         return jsrt_process_next_tick;
     case 25:
         return jsrt_query_stringify;
+    case 26:
+        return jsrt_query_escape;
+    case 27:
+        return jsrt_query_unescape;
     default:
         return NULL;
     }

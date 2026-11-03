@@ -1,5 +1,6 @@
 // Bounded default querystring.parse policy, sharing Wave's form decoder.
-import("./url_params")::{parse_pairs, pair, serialize_query_pairs};
+import("./url_params")::{parse_pairs_with, pair, serialize_query_pairs_with, escape_query_text, unescape_query_text};
+import("./byte_codec")::{encode_utf8};
 import("./values")::{plain, text, define_key, define, fail};
 import("./collections")::{length, at, list, append};
 import("./config")::{URL_PAIR_LIMIT};
@@ -25,18 +26,52 @@ const TYPE_STRING: i32 = 4;
 const TYPE_OBJECT: i32 = 5;
 const TYPE_BIGINT: i32 = 7;
 
+
+// querystring separators: a missing or undefined sep/eq means the default; otherwise it must be a
+// non-empty string (Node uses the default for an empty one as well). Delimiters longer than this
+// are rejected so the fixed byte buffers stay bounded.
+const DELIMITER_CAPACITY: i64 = 64;
+
+fun delimiter_argument(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, index: i64, fallback: u8, buffer: ptr<u8>,
+    ex: ptr<ptr<u8>>) -> i64 {
+    buffer[0] = fallback;
+    if (count <= index || kind(ctx, args[index]) == 0 || kind(ctx, args[index]) == 1) {
+        return 1;
+    }
+    if (kind(ctx, args[index]) != TYPE_STRING) {
+        // Node coerces other values to a string; only strings are supported here.
+        fail(ctx, ex, 1, "querystring separators must be strings");
+        return 0;
+    }
+    var length: i64 = encode_utf8(ctx, args[index], buffer, DELIMITER_CAPACITY, false, ex);
+    if (deref ex != null || length < 0) {
+        return 0;
+    }
+    if (length == 0) {
+        buffer[0] = fallback;
+        return 1;
+    }
+    return length;
+}
 export(c) fun jsrt_query_parse(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64,
     args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
     var result: ptr<u8> = plain(ctx);
     if (count == 0 || kind(ctx, args[0]) != 4) {
         return result;
     }
-    if (count > 1) {
-        fail(ctx, ex, 1, "querystring.parse supports the default separators and bounded decoding only");
+    var separator: array<u8, 64>;
+    var equals: array<u8, 64>;
+    var separator_length: i64 = delimiter_argument(ctx, count, args, 1, 38, &separator[0], ex);
+    var equals_length: i64 = 0;
+    if (deref ex == null) {
+        equals_length = delimiter_argument(ctx, count, args, 2, 61, &equals[0], ex);
+    }
+    if (deref ex != null) {
         return undefined(ctx);
     }
     protect(ctx, result);
-    var pairs: ptr<u8> = parse_pairs(ctx, args[0], false, ex);
+    var pairs: ptr<u8> = parse_pairs_with(ctx, args[0], false, &separator[0], separator_length, &equals[0],
+        equals_length, ex);
     protect(ctx, pairs);
     for (var i: i64 = 0; i < length(ctx, pairs, ex) && deref ex == null; i++) {
         var pair: ptr<u8> = at(ctx, pairs, i, ex);
@@ -100,8 +135,14 @@ export(c) fun jsrt_query_stringify(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, co
     if (count == 0 || kind(ctx, args[0]) != TYPE_OBJECT) {
         return text(ctx, "");
     }
-    if (count > 1) {
-        fail(ctx, ex, 1, "querystring.stringify supports the default separators only");
+    var separator: array<u8, 64>;
+    var equals: array<u8, 64>;
+    var separator_length: i64 = delimiter_argument(ctx, count, args, 1, 38, &separator[0], ex);
+    var equals_length: i64 = 0;
+    if (deref ex == null) {
+        equals_length = delimiter_argument(ctx, count, args, 2, 61, &equals[0], ex);
+    }
+    if (deref ex != null) {
         return undefined(ctx);
     }
     var source: ptr<u8> = args[0];
@@ -131,7 +172,7 @@ export(c) fun jsrt_query_stringify(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, co
     }
     var result: ptr<u8> = undefined(ctx);
     if (deref ex == null) {
-        result = serialize_query_pairs(ctx, entries, ex);
+        result = serialize_query_pairs_with(ctx, entries, &separator[0], separator_length, &equals[0], equals_length, ex);
     }
     unprotect(ctx, keys);
     unprotect(ctx, entries);
@@ -145,6 +186,42 @@ pub fun querystring_module(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
     define(ctx, result, "decode", http_native(ctx, "decode", 17), ex, true);
     define(ctx, result, "stringify", http_native(ctx, "stringify", 25), ex, true);
     define(ctx, result, "encode", http_native(ctx, "encode", 25), ex, true);
+    define(ctx, result, "escape", http_native(ctx, "escape", 26), ex, true);
+    define(ctx, result, "unescape", http_native(ctx, "unescape", 27), ex, true);
     unprotect(ctx, result);
+    return result;
+}
+
+export(c) fun jsrt_query_escape(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0) {
+        return text(ctx, "");
+    }
+    var raw: ptr<u8> = to_string(ctx, args[0], ex);
+    if (raw == null || deref ex != null) {
+        return undefined(ctx);
+    }
+    var converted: ptr<u8> = string_value(ctx, raw);
+    release_string(raw);
+    protect(ctx, converted);
+    var result: ptr<u8> = escape_query_text(ctx, converted, ex);
+    unprotect(ctx, converted);
+    return result;
+}
+
+export(c) fun jsrt_query_unescape(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0) {
+        return text(ctx, "");
+    }
+    var raw: ptr<u8> = to_string(ctx, args[0], ex);
+    if (raw == null || deref ex != null) {
+        return undefined(ctx);
+    }
+    var converted: ptr<u8> = string_value(ctx, raw);
+    release_string(raw);
+    protect(ctx, converted);
+    var result: ptr<u8> = unescape_query_text(ctx, converted, ex);
+    unprotect(ctx, converted);
     return result;
 }
