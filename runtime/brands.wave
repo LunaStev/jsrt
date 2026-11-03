@@ -27,10 +27,16 @@ const CHECK_WEAK_SET: i64 = 3;
 const CHECK_REGEXP: i64 = 4;
 const CHECK_PROMISE: i64 = 5;
 const CHECK_ERROR: i64 = 6;
-const CHECK_COUNT: i64 = 7;
+// valueOf of each wrapper prototype: it throws a TypeError for anything that is not a real wrapper.
+const CHECK_NUMBER_OBJECT: i64 = 7;
+const CHECK_STRING_OBJECT: i64 = 8;
+const CHECK_BOOLEAN_OBJECT: i64 = 9;
+const CHECK_BIGINT_OBJECT: i64 = 10;
+const CHECK_SYMBOL_OBJECT: i64 = 11;
+const CHECK_COUNT: i64 = 12;
 
 struct BrandState {
-    checks: array<ptr<u8>, 7>;
+    checks: array<ptr<u8>, 12>;
 }
 
 fun storage(ctx: ptr<u8>) -> ptr<BrandState> {
@@ -101,6 +107,26 @@ pub fun is_native_error(ctx: ptr<u8>, value: ptr<u8>) -> bool {
     return discarded == null && answer != null && truth(ctx, answer);
 }
 
+pub fun is_number_object(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    return passes(ctx, CHECK_NUMBER_OBJECT, value, false);
+}
+
+pub fun is_string_object(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    return passes(ctx, CHECK_STRING_OBJECT, value, false);
+}
+
+pub fun is_boolean_object(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    return passes(ctx, CHECK_BOOLEAN_OBJECT, value, false);
+}
+
+pub fun is_bigint_object(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    return passes(ctx, CHECK_BIGINT_OBJECT, value, false);
+}
+
+pub fun is_symbol_object(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    return passes(ctx, CHECK_SYMBOL_OBJECT, value, false);
+}
+
 pub fun install_brands(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     var state: ptr<BrandState> = storage(ctx);
     var root: ptr<u8> = global(ctx);
@@ -111,6 +137,11 @@ pub fun install_brands(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     (deref state.checks)[CHECK_WEAK_SET] = capture(ctx, get(ctx, get(ctx, root, "WeakSet", ex), "prototype", ex), "has", ex);
     (deref state.checks)[CHECK_PROMISE] = capture(ctx, get(ctx, get(ctx, root, "Promise", ex), "prototype", ex), "then", ex);
     (deref state.checks)[CHECK_ERROR] = capture(ctx, get(ctx, root, "Error", ex), "isError", ex);
+    var wrapper_names: array<str, 5> = ["Number", "String", "Boolean", "BigInt", "Symbol"];
+    for (var i: i64 = 0; i < 5; i++) {
+        (deref state.checks)[CHECK_NUMBER_OBJECT + i] = capture(ctx, get(ctx, get(ctx, root, wrapper_names[i], ex), "prototype", ex),
+            "valueOf", ex);
+    }
     for (var i: i64 = 0; i < CHECK_COUNT; i++) {
         if ((deref state.checks)[i] != null) {
             protect(ctx, (deref state.checks)[i]);

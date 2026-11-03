@@ -40,6 +40,8 @@ import("./output")::{write_text, print_value};
 import("./assert_deep")::{DeepIntrinsics, deep_install, deep_release, deep_equal};
 import("./buffer_core")::{is_byte_view};
 import("./byte_codec")::{encode_bytes};
+import("./brands")::{is_map, is_set, is_weak_map, is_weak_set, is_regexp, is_promise, is_native_error, is_number_object,
+    is_string_object, is_boolean_object, is_bigint_object, is_symbol_object};
 import("./config")::{ARGUMENT_LIMIT};
 import("./format")::{format_to_value, inspect_to_value};
 import("./inspect_engine")::{set_inspect_function, inspect_intrinsic, INSPECT_CUSTOM};
@@ -60,6 +62,8 @@ extern(c, "wr_promise") fun promise(ctx: ptr<u8>, resolve: ptr<ptr<u8>>, reject:
 extern(c, "jsrt_util_callback") fun callback() -> ptr<u8>;
 extern(c, "jsrt_util_type_callback") fun type_callback() -> ptr<u8>;
 extern(c, "wr_typed_type") fun typed_type(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i32;
+extern(c, "wr_is_date") fun is_date(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "jsrt_clone_proxy_status") fun proxy_status(ctx: ptr<u8>, value: ptr<u8>) -> i32;
 extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
 
 fun format_result(ctx: ptr<u8>, value: ptr<u8>) -> ptr<u8> {
@@ -364,6 +368,54 @@ export(c) fun jsrt_util_type_check(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>,
     if (deref ex != null) {
         return boolean(ctx, false);
     }
+    // Brand checks that do not involve typed arrays (brands.wave plus the engine's date check).
+    if (same_name(name, "isProxy")) {
+        // 1 for a Proxy, 0 for anything else, -1 when the engine lacks the clone ABI (reported as false).
+        return boolean(ctx, proxy_status(ctx, args[0]) == 1);
+    }
+    if (same_name(name, "isDate")) {
+        return boolean(ctx, is_date(ctx, args[0]));
+    }
+    if (same_name(name, "isRegExp")) {
+        return boolean(ctx, is_regexp(ctx, args[0]));
+    }
+    if (same_name(name, "isMap")) {
+        return boolean(ctx, is_map(ctx, args[0]));
+    }
+    if (same_name(name, "isSet")) {
+        return boolean(ctx, is_set(ctx, args[0]));
+    }
+    if (same_name(name, "isWeakMap")) {
+        return boolean(ctx, is_weak_map(ctx, args[0]));
+    }
+    if (same_name(name, "isWeakSet")) {
+        return boolean(ctx, is_weak_set(ctx, args[0]));
+    }
+    if (same_name(name, "isPromise")) {
+        return boolean(ctx, is_promise(ctx, args[0]));
+    }
+    if (same_name(name, "isNativeError")) {
+        return boolean(ctx, is_native_error(ctx, args[0]));
+    }
+    if (same_name(name, "isNumberObject")) {
+        return boolean(ctx, is_number_object(ctx, args[0]));
+    }
+    if (same_name(name, "isStringObject")) {
+        return boolean(ctx, is_string_object(ctx, args[0]));
+    }
+    if (same_name(name, "isBooleanObject")) {
+        return boolean(ctx, is_boolean_object(ctx, args[0]));
+    }
+    if (same_name(name, "isBigIntObject")) {
+        return boolean(ctx, is_bigint_object(ctx, args[0]));
+    }
+    if (same_name(name, "isSymbolObject")) {
+        return boolean(ctx, is_symbol_object(ctx, args[0]));
+    }
+    if (same_name(name, "isBoxedPrimitive")) {
+        return boolean(ctx, is_number_object(ctx, args[0]) || is_string_object(ctx, args[0]) ||
+            is_boolean_object(ctx, args[0]) || is_bigint_object(ctx, args[0]) || is_symbol_object(ctx, args[0]));
+    }
     if (same_name(name, "isTypedArray")) {
         return boolean(ctx, actual != TYPED_ARRAY_NONE && actual != TYPED_ARRAY_BUFFER);
     }
@@ -418,10 +470,12 @@ pub fun install_util(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     protect(ctx, types);
     define(ctx, types, "isUint8Array", (deref host_state.methods)[3], ex, false);
     // The remaining brand-based checks share one native callback and are told apart by name.
-    var check_names: array<str, 13> = ["isTypedArray", "isArrayBuffer", "isAnyArrayBuffer", "isInt8Array",
+    var check_names: array<str, 28> = ["isProxy", "isTypedArray", "isArrayBuffer", "isAnyArrayBuffer", "isInt8Array",
         "isInt16Array", "isInt32Array", "isUint8ClampedArray", "isUint16Array", "isUint32Array",
-        "isFloat32Array", "isFloat64Array", "isBigInt64Array", "isBigUint64Array"];
-    for (var i: i64 = 0; i < 13; i++) {
+        "isFloat32Array", "isFloat64Array", "isBigInt64Array", "isBigUint64Array", "isDate", "isRegExp", "isMap",
+        "isSet", "isWeakMap", "isWeakSet", "isPromise", "isNativeError", "isNumberObject", "isStringObject",
+        "isBooleanObject", "isBigIntObject", "isSymbolObject", "isBoxedPrimitive"];
+    for (var i: i64 = 0; i < 28; i++) {
         var check_name: ptr<u8> = utf8(check_names[i]);
         define(ctx, types, check_names[i], function(ctx, check_name, type_callback()), ex, false);
         release(check_name);
