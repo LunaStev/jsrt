@@ -605,6 +605,19 @@ pub fun append_node_response_header(ctx: ptr<u8>, headers: ptr<u8>, name: str, v
     }
 }
 
+// Fetch defines redirect statuses as exactly 301, 302, 303, 307 and 308; other 3xx responses such as
+// 300 and 304 are ordinary responses.
+fun is_redirect_status(status: i64) -> bool {
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+}
+
+// Fetch's "null body status" and HEAD responses expose body === null (no stream). 101 and 103 are
+// interim responses handled by curl itself, so only the final statuses matter here.
+fun response_has_no_body(c: ptr<Client>) -> bool {
+    var status: i64 = deref c.status;
+    return mem_eq_cstr(deref c.verb as str, "HEAD") || status == 204 || status == 205 || status == 304;
+}
+
 fun response_headers(ctx: ptr<u8>, c: ptr<Client>, ex: ptr<ptr<u8>>) -> ptr<u8> {
     var result: ptr<u8> = plain(ctx);
     protect(ctx, result);
@@ -692,7 +705,13 @@ fun make_response(ctx: ptr<u8>, c: ptr<Client>, ex: ptr<ptr<u8>>) {
         var response: ptr<u8> = plain(ctx);
         protect(ctx, response);
         brand_response(ctx, response);
-        attach_body(ctx, response, deref c.body, ex);
+        // A null-body response still gets text()/json()/arrayBuffer(), reading as empty and never
+        // becoming "used", like a local new Response(null).
+        var exposed_body: ptr<u8> = deref c.body;
+        if (response_has_no_body(c)) {
+            exposed_body = js_null(ctx);
+        }
+        attach_body(ctx, response, exposed_body, ex);
         define(ctx, response, "status", number(ctx, deref c.status as f64), ex, true);
         define(ctx, response, "ok", boolean(ctx, deref c.status >= 200 && deref c.status < 300), ex,
             true);
@@ -1041,13 +1060,18 @@ pub fun poll_clients(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> i32 {
         if (deref c.done && deref c.streaming && !deref c.upload_eof && deref c.result == 0) {
             deref c.result = 26;
         }
-        if (deref c.redirect_error && deref c.status >= 300 && deref c.status < 400 && deref c.ready) {
+        if (deref c.redirect_error && is_redirect_status(deref c.status) && deref c.ready) {
             deref c.done = true;
             deref c.result = 47;
         }
         if (deref c.done && deref c.result != 0) {
             var problem: ptr<u8> = null;
-            fail(ctx, &problem, 0, curl_error(deref c.result));
+            // fetch() reports a network or policy failure (including redirect: "error") as a TypeError.
+            var failure_kind: i32 = 0;
+            if (deref c.resolve != null) {
+                failure_kind = 1;
+            }
+            fail(ctx, &problem, failure_kind, curl_error(deref c.result));
             protect(ctx, problem);
             var code: str = "ERR_HTTP_CLIENT";
             if (deref c.result == 28) {
