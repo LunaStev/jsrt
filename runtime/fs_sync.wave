@@ -378,9 +378,13 @@ pub fun install_fs_sync(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     }
     var constants: ptr<u8> = plain(ctx);
     protect(ctx, constants);
-    var keys: array<str, 4> = ["F_OK", "R_OK", "W_OK", "X_OK"];
-    var modes: array<f64, 4> = [0.0, 4.0, 2.0, 1.0];
-    for (var i: i64 = 0; i < 4; i++) {
+    // Access modes, copyFile flags, open flags and file-type masks (Linux values).
+    var keys: array<str, 19> = ["F_OK", "R_OK", "W_OK", "X_OK", "COPYFILE_EXCL", "COPYFILE_FICLONE",
+        "COPYFILE_FICLONE_FORCE", "O_RDONLY", "O_WRONLY", "O_RDWR", "O_CREAT", "O_EXCL", "O_TRUNC", "O_APPEND",
+        "S_IFMT", "S_IFREG", "S_IFDIR", "S_IFLNK", "UV_FS_COPYFILE_EXCL"];
+    var modes: array<f64, 19> = [0.0, 4.0, 2.0, 1.0, 1.0, 2.0, 4.0, 0.0, 1.0, 2.0, 64.0, 128.0, 512.0, 1024.0,
+        61440.0, 32768.0, 16384.0, 40960.0, 1.0];
+    for (var i: i64 = 0; i < 19; i++) {
         define(ctx, constants, keys[i], number(ctx, modes[i]), ex, true);
     }
     define(ctx, fs, "constants", constants, ex, true);

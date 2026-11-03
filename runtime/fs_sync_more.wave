@@ -1,0 +1,1021 @@
+// Additional synchronous fs functions: path operations (chmod, truncate, symlink, readlink,
+// realpath, mkdtemp, utimes, copyFile, appendFile, rm) and descriptor operations (open, close,
+// read, write, fstat, fsync, fdatasync, ftruncate).
+//
+// Ownership: descriptors returned by openSync are recorded in this context's table. closeSync only
+// closes recorded descriptors, and every recorded descriptor still open at shutdown is closed. The
+// standard streams 0, 1 and 2 may be read, written and stat'ed but never closed. All file work runs
+// on the calling thread; nothing here touches JavaScript from another thread.
+import("./context_state")::{owned_context_slot, release_context_slot};
+import("./system")::{copy_host_path, encode_host_text, io_failure};
+import("./config")::{FILE_LIMIT};
+import("./values")::{get, define, fail, text};
+import("./buffer_core")::{is_byte_view, byte_view_length, copy_byte_view, write_byte_view};
+import("./fs_sync")::{file_stats};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::mem::cstr")::{mem_len_cstr};
+import("std::mem::ops")::{mem_copy};
+import("std::sys::fs")::{open, close, fstat, ftruncate, fsync, unlink, rmdir, Stat, FS_O_RDONLY, FS_O_WRONLY, FS_O_RDWR,
+    FS_O_CREAT, FS_O_EXCL, FS_O_TRUNC, FS_O_APPEND};
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
+extern(c, "wr_to_number") fun numeric(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "jsrt_fs_more_callback") fun callback() -> ptr<u8>;
+extern(c, "jsrt_directory_next") fun next_entry(directory: ptr<u8>, name: ptr<u8>, size: i64) -> i32;
+extern(c, "jsrt_directory_mode") fun entry_mode(directory: ptr<u8>, name: str, mode: ptr<i64>) -> i32;
+extern(c, "opendir") fun open_directory(path: str) -> ptr<u8>;
+extern(c, "closedir") fun close_directory(directory: ptr<u8>) -> i32;
+extern(c, "lstat") fun link_stat(path: str, info: ptr<Stat>) -> i32;
+extern(c, "chmod") fun libc_chmod(path: str, mode: u32) -> i32;
+extern(c, "truncate") fun libc_truncate(path: str, length: i64) -> i32;
+extern(c, "symlink") fun libc_symlink(target: str, path: str) -> i32;
+extern(c, "readlink") fun libc_readlink(path: str, buffer: ptr<u8>, size: i64) -> i64;
+extern(c, "realpath") fun libc_realpath(path: str, resolved: ptr<u8>) -> ptr<u8>;
+extern(c, "mkdtemp") fun libc_mkdtemp(template: ptr<u8>) -> ptr<u8>;
+extern(c, "utimensat") fun libc_utimensat(directory: i32, path: str, times: ptr<i64>, flags: i32) -> i32;
+extern(c, "fdatasync") fun libc_fdatasync(fd: i32) -> i32;
+extern(c, "read") fun libc_read(fd: i32, buffer: ptr<u8>, size: i64) -> i64;
+extern(c, "pread") fun libc_pread(fd: i32, buffer: ptr<u8>, size: i64, position: i64) -> i64;
+extern(c, "write") fun libc_write(fd: i32, buffer: ptr<u8>, size: i64) -> i64;
+extern(c, "pwrite") fun libc_pwrite(fd: i32, buffer: ptr<u8>, size: i64, position: i64) -> i64;
+extern(c, "__errno_location") fun errno_location() -> ptr<i32>;
+
+const SLOT: i64 = 49;
+const PATH_CAP: i64 = 16385;
+const LINK_CAP: i64 = 4096;
+const TREE_PATH_CAP: i64 = 4096;
+const TREE_DEPTH_LIMIT: i64 = 32;
+const COPY_CHUNK: i64 = 65536;
+const MAX_OWNED_FDS: i64 = 256;
+const AT_FDCWD: i32 = -100;
+// O_CLOEXEC keeps descriptors out of children started by child_process.
+const OPEN_CLOEXEC: i32 = 524288;
+const DEFAULT_FILE_MODE: i64 = 438;
+const MODE_LIMIT: i64 = 4095;
+const COPYFILE_EXCL: i64 = 1;
+const FILE_KIND_MASK: i32 = 61440;
+const DIRECTORY_KIND: i32 = 16384;
+const REGULAR_KIND: i32 = 32768;
+const EISDIR: i64 = -21;
+const ENOENT: i64 = -2;
+const EBADF: i64 = -9;
+const EMFILE: i64 = -24;
+const EINVAL: i64 = -22;
+const ENOTSUP: i64 = -95;
+const STDERR_FD: i64 = 2;
+const TYPE_UNDEFINED: i32 = 0;
+const TYPE_NUMBER: i32 = 3;
+const TYPE_STRING: i32 = 4;
+const TYPE_OBJECT: i32 = 5;
+const ERROR_TYPE: i32 = 1;
+const ERROR_RANGE: i32 = 2;
+
+const OP_CHMOD: i64 = 0;
+const OP_TRUNCATE: i64 = 1;
+const OP_SYMLINK: i64 = 2;
+const OP_READLINK: i64 = 3;
+const OP_REALPATH: i64 = 4;
+const OP_MKDTEMP: i64 = 5;
+const OP_UTIMES: i64 = 6;
+const OP_COPY_FILE: i64 = 7;
+const OP_APPEND_FILE: i64 = 8;
+const OP_RM: i64 = 9;
+const OP_OPEN: i64 = 10;
+const OP_CLOSE: i64 = 11;
+const OP_READ: i64 = 12;
+const OP_WRITE: i64 = 13;
+const OP_FSTAT: i64 = 14;
+const OP_FSYNC: i64 = 15;
+const OP_FDATASYNC: i64 = 16;
+const OP_FTRUNCATE: i64 = 17;
+const OP_COUNT: i64 = 18;
+
+struct MoreState {
+    methods: array<ptr<u8>, 18>;
+    owned: array<i32, 256>;
+    owned_count: i64;
+}
+
+fun storage(ctx: ptr<u8>) -> ptr<MoreState> {
+    return owned_context_slot(ctx, SLOT, size_of<MoreState>() as i64) as ptr<MoreState>;
+}
+
+fun operation_index(ctx: ptr<u8>, state: ptr<MoreState>, fn: ptr<u8>) -> i64 {
+    for (var i: i64 = 0; i < OP_COUNT; i++) {
+        if (equal(ctx, fn, (deref state.methods)[i])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+fun current_errno() -> i64 {
+    var number: i64 = deref errno_location() as i64;
+    if (number == 0) {
+        return -5;
+    }
+    return -number;
+}
+
+// Descriptor failures have no path; the message and code still come from the shared helper.
+fun descriptor_failure(ctx: ptr<u8>, ex: ptr<ptr<u8>>, operation: str, status: i64) {
+    io_failure(ctx, ex, operation, "", status);
+}
+
+// ---- argument helpers (validation only; no filesystem work) ----
+
+// Reads a finite integer in [low, high]. Anything else is a TypeError or RangeError.
+fun integer_argument(ctx: ptr<u8>, value: ptr<u8>, low: i64, high: i64, label: str, ex: ptr<ptr<u8>>) -> i64 {
+    if (kind(ctx, value) != TYPE_NUMBER) {
+        fail(ctx, ex, ERROR_TYPE, "numeric argument must be a number");
+        return 0;
+    }
+    var n: f64 = numeric(ctx, value, ex);
+    if (deref ex != null) {
+        return 0;
+    }
+    if (n != n || n < low as f64 || n > high as f64 || (n as i64) as f64 != n) {
+        fail(ctx, ex, ERROR_RANGE, label);
+        return 0;
+    }
+    return n as i64;
+}
+
+fun has_argument(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, index: i64) -> bool {
+    return count > index && kind(ctx, args[index]) != TYPE_UNDEFINED;
+}
+
+fun path_argument(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, index: i64, buffer: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (count <= index || kind(ctx, args[index]) != TYPE_STRING) {
+        fail(ctx, ex, ERROR_TYPE, "path must be a string");
+        return false;
+    }
+    copy_host_path(ctx, args[index], buffer, PATH_CAP, ex);
+    return deref ex == null;
+}
+
+fun descriptor_argument(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> i64 {
+    if (count == 0) {
+        fail(ctx, ex, ERROR_TYPE, "file descriptor is required");
+        return -1;
+    }
+    return integer_argument(ctx, args[0], 0, 2147483647, "file descriptor is out of range", ex);
+}
+
+// ---- descriptor ownership ----
+
+fun is_owned(state: ptr<MoreState>, fd: i64) -> bool {
+    for (var i: i64 = 0; i < deref state.owned_count; i++) {
+        if ((deref state.owned)[i] as i64 == fd) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fun record_owned(state: ptr<MoreState>, fd: i64) {
+    (deref state.owned)[deref state.owned_count] = fd as i32;
+    deref state.owned_count = deref state.owned_count + 1;
+}
+
+fun forget_owned(state: ptr<MoreState>, fd: i64) {
+    for (var i: i64 = 0; i < deref state.owned_count; i++) {
+        if ((deref state.owned)[i] as i64 == fd) {
+            deref state.owned_count = deref state.owned_count - 1;
+            (deref state.owned)[i] = (deref state.owned)[deref state.owned_count];
+            return;
+        }
+    }
+}
+
+// Standard streams are usable for I/O but are never closed by closeSync.
+fun is_usable(state: ptr<MoreState>, fd: i64) -> bool {
+    return fd <= STDERR_FD || is_owned(state, fd);
+}
+
+// ---- open flags ----
+
+// Maps "r", "r+", "w", "wx", "w+", "wx+", "a", "ax", "a+", "ax+" to open(2) flags. Returns -1
+// for an unknown string.
+fun flags_from_text(value: str) -> i64 {
+    var names: array<str, 10> = ["r", "r+", "w", "wx", "w+", "wx+", "a", "ax", "a+", "ax+"];
+    var flags: array<i64, 10> = [FS_O_RDONLY as i64, FS_O_RDWR as i64,
+        (FS_O_WRONLY | FS_O_CREAT | FS_O_TRUNC) as i64,
+        (FS_O_WRONLY | FS_O_CREAT | FS_O_TRUNC | FS_O_EXCL) as i64,
+        (FS_O_RDWR | FS_O_CREAT | FS_O_TRUNC) as i64,
+        (FS_O_RDWR | FS_O_CREAT | FS_O_TRUNC | FS_O_EXCL) as i64,
+        (FS_O_WRONLY | FS_O_CREAT | FS_O_APPEND) as i64,
+        (FS_O_WRONLY | FS_O_CREAT | FS_O_APPEND | FS_O_EXCL) as i64,
+        (FS_O_RDWR | FS_O_CREAT | FS_O_APPEND) as i64,
+        (FS_O_RDWR | FS_O_CREAT | FS_O_APPEND | FS_O_EXCL) as i64];
+    for (var i: i64 = 0; i < 10; i++) {
+        if (mem_len_cstr(value) == mem_len_cstr(names[i]) && same_text(value, names[i])) {
+            return flags[i];
+        }
+    }
+    return -1;
+}
+
+fun same_text(a: str, b: str) -> bool {
+    var length: i64 = mem_len_cstr(a);
+    var left: ptr<u8> = a as ptr<u8>;
+    var right: ptr<u8> = b as ptr<u8>;
+    for (var i: i64 = 0; i < length; i++) {
+        if (left[i] != right[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ---- path operations ----
+
+fun do_chmod(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var path: array<u8, 16385>;
+    if (!path_argument(ctx, count, args, 0, &path[0], ex)) {
+        return undefined(ctx);
+    }
+    if (count < 2) {
+        fail(ctx, ex, ERROR_TYPE, "chmodSync requires a numeric mode");
+        return undefined(ctx);
+    }
+    var mode: i64 = integer_argument(ctx, args[1], 0, MODE_LIMIT, "mode is out of range", ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (libc_chmod(&path[0] as str, mode as u32) < 0) {
+        io_failure(ctx, ex, "chmod", &path[0] as str, current_errno());
+    }
+    return undefined(ctx);
+}
+
+fun do_truncate(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var path: array<u8, 16385>;
+    if (!path_argument(ctx, count, args, 0, &path[0], ex)) {
+        return undefined(ctx);
+    }
+    var length: i64 = 0;
+    if (has_argument(ctx, count, args, 1)) {
+        length = integer_argument(ctx, args[1], 0, FILE_LIMIT * 1024, "length is out of range", ex);
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (libc_truncate(&path[0] as str, length) < 0) {
+        io_failure(ctx, ex, "truncate", &path[0] as str, current_errno());
+    }
+    return undefined(ctx);
+}
+
+fun do_symlink(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var target: array<u8, 16385>;
+    var path: array<u8, 16385>;
+    if (!path_argument(ctx, count, args, 0, &target[0], ex) || !path_argument(ctx, count, args, 1, &path[0], ex)) {
+        return undefined(ctx);
+    }
+    if (libc_symlink(&target[0] as str, &path[0] as str) < 0) {
+        io_failure(ctx, ex, "symlink", &path[0] as str, current_errno());
+    }
+    return undefined(ctx);
+}
+
+fun do_readlink(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var path: array<u8, 16385>;
+    if (!path_argument(ctx, count, args, 0, &path[0], ex)) {
+        return undefined(ctx);
+    }
+    var buffer: array<u8, 4097>;
+    var length: i64 = libc_readlink(&path[0] as str, &buffer[0], LINK_CAP);
+    if (length < 0) {
+        io_failure(ctx, ex, "readlink", &path[0] as str, current_errno());
+        return undefined(ctx);
+    }
+    buffer[length] = 0;
+    return text(ctx, &buffer[0] as str);
+}
+
+fun do_realpath(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var path: array<u8, 16385>;
+    if (!path_argument(ctx, count, args, 0, &path[0], ex)) {
+        return undefined(ctx);
+    }
+    var resolved: array<u8, 4097>;
+    if (libc_realpath(&path[0] as str, &resolved[0]) == null) {
+        io_failure(ctx, ex, "realpath", &path[0] as str, current_errno());
+        return undefined(ctx);
+    }
+    return text(ctx, &resolved[0] as str);
+}
+
+fun do_mkdtemp(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var template: array<u8, 16385>;
+    if (!path_argument(ctx, count, args, 0, &template[0], ex)) {
+        return undefined(ctx);
+    }
+    var length: i64 = mem_len_cstr(&template[0] as str);
+    if (length + 7 > PATH_CAP) {
+        fail(ctx, ex, ERROR_RANGE, "mkdtemp prefix is too long");
+        return undefined(ctx);
+    }
+    var suffix: str = "XXXXXX";
+    mem_copy(&template[length], suffix as ptr<u8>, 7);
+    if (libc_mkdtemp(&template[0]) == null) {
+        io_failure(ctx, ex, "mkdtemp", &template[0] as str, current_errno());
+        return undefined(ctx);
+    }
+    return text(ctx, &template[0] as str);
+}
+
+// Seconds for numbers and milliseconds for Date objects, as in Node.
+fun time_seconds(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64 {
+    if (kind(ctx, value) == TYPE_OBJECT) {
+        return numeric(ctx, value, ex) / 1000.0;
+    }
+    if (kind(ctx, value) != TYPE_NUMBER) {
+        fail(ctx, ex, ERROR_TYPE, "times must be numbers or Dates");
+        return 0.0;
+    }
+    return numeric(ctx, value, ex);
+}
+
+fun fill_timespec(times: ptr<i64>, index: i64, seconds: f64) {
+    var whole: i64 = seconds as i64;
+    var fraction: f64 = seconds - whole as f64;
+    if (fraction < 0.0) {
+        whole -= 1;
+        fraction += 1.0;
+    }
+    times[index * 2] = whole;
+    times[index * 2 + 1] = (fraction * 1000000000.0) as i64;
+}
+
+fun do_utimes(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var path: array<u8, 16385>;
+    if (!path_argument(ctx, count, args, 0, &path[0], ex)) {
+        return undefined(ctx);
+    }
+    if (count < 3) {
+        fail(ctx, ex, ERROR_TYPE, "utimesSync requires atime and mtime");
+        return undefined(ctx);
+    }
+    var accessed: f64 = time_seconds(ctx, args[1], ex);
+    var modified: f64 = 0.0;
+    if (deref ex == null) {
+        modified = time_seconds(ctx, args[2], ex);
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var times: array<i64, 4>;
+    fill_timespec(&times[0], 0, accessed);
+    fill_timespec(&times[0], 1, modified);
+    if (libc_utimensat(AT_FDCWD, &path[0] as str, &times[0], 0) < 0) {
+        io_failure(ctx, ex, "utime", &path[0] as str, current_errno());
+    }
+    return undefined(ctx);
+}
+
+// Copies every byte of source_fd into dest_fd. Returns 0 or a negative errno.
+fun copy_descriptor(source_fd: i64, dest_fd: i64) -> i64 {
+    var chunk: ptr<u8> = mem_alloc(COPY_CHUNK);
+    if (chunk == null) {
+        return -12;
+    }
+    var status: i64 = 0;
+    while (status == 0) {
+        var got: i64 = libc_read(source_fd as i32, chunk, COPY_CHUNK);
+        if (got < 0) {
+            status = current_errno();
+        } else if (got == 0) {
+            break;
+        } else {
+            var done: i64 = 0;
+            while (done < got && status == 0) {
+                var put: i64 = libc_write(dest_fd as i32, chunk + done, got - done);
+                if (put < 0) {
+                    status = current_errno();
+                } else {
+                    done += put;
+                }
+            }
+        }
+    }
+    mem_free(chunk, COPY_CHUNK);
+    return status;
+}
+
+fun do_copy_file(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var source: array<u8, 16385>;
+    var dest: array<u8, 16385>;
+    if (!path_argument(ctx, count, args, 0, &source[0], ex) || !path_argument(ctx, count, args, 1, &dest[0], ex)) {
+        return undefined(ctx);
+    }
+    var mode: i64 = 0;
+    if (has_argument(ctx, count, args, 2)) {
+        mode = integer_argument(ctx, args[2], 0, 7, "copy mode is out of range", ex);
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    // COPYFILE_FICLONE is best effort (a plain copy is a valid result); FICLONE_FORCE cannot be honored.
+    if ((mode & 4) != 0) {
+        io_failure(ctx, ex, "copyfile", &dest[0] as str, ENOTSUP);
+        return undefined(ctx);
+    }
+    var source_fd: i64 = open(&source[0] as str, FS_O_RDONLY | OPEN_CLOEXEC, 0);
+    if (source_fd < 0) {
+        io_failure(ctx, ex, "copyfile", &source[0] as str, source_fd);
+        return undefined(ctx);
+    }
+    var source_info: Stat;
+    var status: i64 = fstat(source_fd, &source_info);
+    if (status == 0 && ((source_info.mode & FILE_KIND_MASK) != REGULAR_KIND)) {
+        status = EISDIR;
+    }
+    var dest_flags: i32 = FS_O_WRONLY | FS_O_CREAT | OPEN_CLOEXEC;
+    if ((mode & COPYFILE_EXCL) != 0) {
+        dest_flags = dest_flags | FS_O_EXCL;
+    }
+    var dest_fd: i64 = -1;
+    if (status == 0) {
+        // Opened without O_TRUNC so a copy onto the same file cannot destroy the data.
+        dest_fd = open(&dest[0] as str, dest_flags, (source_info.mode & 511) as i32);
+        if (dest_fd < 0) {
+            status = dest_fd;
+        }
+    }
+    var dest_info: Stat;
+    var failed_path: str = &source[0] as str;
+    if (status == 0) {
+        failed_path = &dest[0] as str;
+        status = fstat(dest_fd, &dest_info);
+    }
+    if (status == 0 && !(source_info.dev == dest_info.dev && source_info.ino == dest_info.ino)) {
+        status = ftruncate(dest_fd, 0);
+        if (status == 0) {
+            status = copy_descriptor(source_fd, dest_fd);
+        }
+    }
+    if (dest_fd >= 0) {
+        close(dest_fd);
+    }
+    close(source_fd);
+    if (status < 0) {
+        io_failure(ctx, ex, "copyfile", failed_path, status);
+    }
+    return undefined(ctx);
+}
+
+// Converts a string or byte view into bytes. Returns the length, or -1 with ex set.
+fun data_bytes(ctx: ptr<u8>, value: ptr<u8>, bytes: ptr<u8>, ex: ptr<ptr<u8>>) -> i64 {
+    if (kind(ctx, value) == TYPE_STRING) {
+        return encode_host_text(ctx, value, bytes, FILE_LIMIT, ex);
+    }
+    if (is_byte_view(ctx, value, ex)) {
+        return copy_byte_view(ctx, value, bytes, FILE_LIMIT, ex);
+    }
+    if (deref ex == null) {
+        fail(ctx, ex, ERROR_TYPE, "data must be a string, Buffer or Uint8Array");
+    }
+    return -1;
+}
+
+fun write_all(fd: i64, bytes: ptr<u8>, length: i64) -> i64 {
+    var done: i64 = 0;
+    while (done < length) {
+        var put: i64 = libc_write(fd as i32, bytes + done, length - done);
+        if (put < 0) {
+            return current_errno();
+        }
+        done += put;
+    }
+    return 0;
+}
+
+fun do_append_file(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var path: array<u8, 16385>;
+    if (!path_argument(ctx, count, args, 0, &path[0], ex)) {
+        return undefined(ctx);
+    }
+    if (count < 2) {
+        fail(ctx, ex, ERROR_TYPE, "appendFileSync requires data");
+        return undefined(ctx);
+    }
+    var bytes: ptr<u8> = mem_alloc(FILE_LIMIT + 1);
+    if (bytes == null) {
+        fail(ctx, ex, ERROR_RANGE, "cannot allocate append buffer");
+        return undefined(ctx);
+    }
+    // All argument conversion finishes before the file is opened, so a failed conversion never
+    // creates or touches the target.
+    var length: i64 = data_bytes(ctx, args[1], bytes, ex);
+    if (length >= 0 && deref ex == null) {
+        var fd: i64 = open(&path[0] as str, FS_O_WRONLY | FS_O_CREAT | FS_O_APPEND | OPEN_CLOEXEC, DEFAULT_FILE_MODE as i32);
+        if (fd < 0) {
+            io_failure(ctx, ex, "open", &path[0] as str, fd);
+        } else {
+            var status: i64 = write_all(fd, bytes, length);
+            var closed: i64 = close(fd);
+            if (status < 0) {
+                io_failure(ctx, ex, "write", &path[0] as str, status);
+            } else if (closed < 0) {
+                io_failure(ctx, ex, "close", &path[0] as str, closed);
+            }
+        }
+    }
+    mem_free(bytes, FILE_LIMIT + 1);
+    return undefined(ctx);
+}
+
+// Removes path and, for directories, everything below it. Depth is bounded so a pathological
+// tree cannot exhaust the stack. Returns 0 or a negative errno.
+fun remove_tree(path: str, depth: i64) -> i64 {
+    var info: Stat;
+    if (link_stat(path, &info) < 0) {
+        return current_errno();
+    }
+    if ((info.mode & FILE_KIND_MASK) != DIRECTORY_KIND) {
+        return unlink(path);
+    }
+    if (depth >= TREE_DEPTH_LIMIT) {
+        return -36;
+    }
+    var directory: ptr<u8> = open_directory(path);
+    if (directory == null) {
+        return current_errno();
+    }
+    var status: i64 = 0;
+    var name: array<u8, 256>;
+    var child: array<u8, 4096>;
+    var parent_length: i64 = mem_len_cstr(path);
+    while (status == 0) {
+        var next: i32 = next_entry(directory, &name[0], 256);
+        if (next == 0) {
+            break;
+        }
+        if (next < 0) {
+            status = current_errno();
+            break;
+        }
+        var entry_length: i64 = mem_len_cstr(&name[0] as str);
+        var dot: bool = entry_length == 1 && name[0] == 46;
+        var dots: bool = entry_length == 2 && name[0] == 46 && name[1] == 46;
+        if (dot || dots) {
+            continue;
+        }
+        if (parent_length + 1 + entry_length >= TREE_PATH_CAP) {
+            status = -36;
+            break;
+        }
+        mem_copy(&child[0], path as ptr<u8>, parent_length);
+        child[parent_length] = 47;
+        mem_copy(&child[parent_length + 1], &name[0], entry_length + 1);
+        status = remove_tree(&child[0] as str, depth + 1);
+    }
+    close_directory(directory);
+    if (status == 0) {
+        status = rmdir(path);
+    }
+    return status;
+}
+
+fun do_rm(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var path: array<u8, 16385>;
+    if (!path_argument(ctx, count, args, 0, &path[0], ex)) {
+        return undefined(ctx);
+    }
+    var recursive: bool = false;
+    var force: bool = false;
+    if (has_argument(ctx, count, args, 1)) {
+        if (kind(ctx, args[1]) != TYPE_OBJECT) {
+            fail(ctx, ex, ERROR_TYPE, "rmSync options must be an object");
+            return undefined(ctx);
+        }
+        recursive = flag_option(ctx, args[1], "recursive", ex);
+        force = flag_option(ctx, args[1], "force", ex);
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var info: Stat;
+    if (link_stat(&path[0] as str, &info) < 0) {
+        var missing: i64 = current_errno();
+        if (missing == ENOENT && force) {
+            return undefined(ctx);
+        }
+        io_failure(ctx, ex, "rm", &path[0] as str, missing);
+        return undefined(ctx);
+    }
+    if ((info.mode & FILE_KIND_MASK) == DIRECTORY_KIND && !recursive) {
+        io_failure(ctx, ex, "rm", &path[0] as str, EISDIR);
+        return undefined(ctx);
+    }
+    var status: i64 = remove_tree(&path[0] as str, 0);
+    if (status < 0) {
+        io_failure(ctx, ex, "rm", &path[0] as str, status);
+    }
+    return undefined(ctx);
+}
+
+fun flag_option(ctx: ptr<u8>, options: ptr<u8>, name: str, ex: ptr<ptr<u8>>) -> bool {
+    var value: ptr<u8> = get(ctx, options, name, ex);
+    if (deref ex != null || kind(ctx, value) == TYPE_UNDEFINED) {
+        return false;
+    }
+    return numeric(ctx, value, ex) != 0.0;
+}
+
+// ---- descriptor operations ----
+
+fun do_open(ctx: ptr<u8>, state: ptr<MoreState>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var path: array<u8, 16385>;
+    if (!path_argument(ctx, count, args, 0, &path[0], ex)) {
+        return undefined(ctx);
+    }
+    var flags: i64 = FS_O_RDONLY as i64;
+    if (has_argument(ctx, count, args, 1)) {
+        if (kind(ctx, args[1]) == TYPE_STRING) {
+            var name: array<u8, 8>;
+            var size: i64 = copy_host_path(ctx, args[1], &name[0], 8, ex);
+            if (deref ex != null) {
+                return undefined(ctx);
+            }
+            flags = flags_from_text(&name[0] as str);
+            if (flags < 0) {
+                fail(ctx, ex, ERROR_TYPE, "unknown file open flags");
+                return undefined(ctx);
+            }
+        } else {
+            flags = integer_argument(ctx, args[1], 0, 2147483647, "open flags are out of range", ex);
+        }
+    }
+    var mode: i64 = DEFAULT_FILE_MODE;
+    if (deref ex == null && has_argument(ctx, count, args, 2)) {
+        mode = integer_argument(ctx, args[2], 0, MODE_LIMIT, "mode is out of range", ex);
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (deref state.owned_count >= MAX_OWNED_FDS) {
+        io_failure(ctx, ex, "open", &path[0] as str, EMFILE);
+        return undefined(ctx);
+    }
+    var fd: i64 = open(&path[0] as str, (flags as i32) | OPEN_CLOEXEC, mode as i32);
+    if (fd < 0) {
+        io_failure(ctx, ex, "open", &path[0] as str, fd);
+        return undefined(ctx);
+    }
+    record_owned(state, fd);
+    return number(ctx, fd as f64);
+}
+
+fun do_close(ctx: ptr<u8>, state: ptr<MoreState>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var fd: i64 = descriptor_argument(ctx, count, args, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    // Only descriptors opened here are closed, so host-owned descriptors cannot be closed by mistake.
+    if (!is_owned(state, fd)) {
+        descriptor_failure(ctx, ex, "close", EBADF);
+        return undefined(ctx);
+    }
+    forget_owned(state, fd);
+    var status: i64 = close(fd);
+    if (status < 0) {
+        descriptor_failure(ctx, ex, "close", status);
+    }
+    return undefined(ctx);
+}
+
+// Reads the optional position: null/undefined/-1 mean "current position".
+fun position_argument(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64 {
+    if (kind(ctx, value) == TYPE_UNDEFINED || kind(ctx, value) == 1) {
+        return -1;
+    }
+    var n: f64 = 0.0;
+    if (kind(ctx, value) == TYPE_NUMBER) {
+        n = numeric(ctx, value, ex);
+    } else {
+        fail(ctx, ex, ERROR_TYPE, "position must be a number or null");
+        return -1;
+    }
+    if (n < 0.0) {
+        return -1;
+    }
+    return integer_argument(ctx, value, 0, 9007199254740991, "position is out of range", ex);
+}
+
+fun do_read(ctx: ptr<u8>, state: ptr<MoreState>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var fd: i64 = descriptor_argument(ctx, count, args, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (count < 2 || !is_byte_view(ctx, args[1], ex)) {
+        if (deref ex == null) {
+            fail(ctx, ex, ERROR_TYPE, "readSync requires a Buffer or Uint8Array");
+        }
+        return undefined(ctx);
+    }
+    var view_length: i64 = byte_view_length(ctx, args[1], ex);
+    var offset: i64 = 0;
+    var wanted: i64 = view_length;
+    var position: i64 = -1;
+    if (deref ex == null && count > 2 && kind(ctx, args[2]) == TYPE_OBJECT) {
+        // readSync(fd, buffer, { offset, length, position })
+        var options: ptr<u8> = args[2];
+        var value: ptr<u8> = get(ctx, options, "offset", ex);
+        if (deref ex == null && kind(ctx, value) != TYPE_UNDEFINED) {
+            offset = integer_argument(ctx, value, 0, view_length, "offset is out of range", ex);
+        }
+        wanted = view_length - offset;
+        value = get(ctx, options, "length", ex);
+        if (deref ex == null && kind(ctx, value) != TYPE_UNDEFINED) {
+            wanted = integer_argument(ctx, value, 0, view_length - offset, "length is out of range", ex);
+        }
+        value = get(ctx, options, "position", ex);
+        if (deref ex == null) {
+            position = position_argument(ctx, value, ex);
+        }
+    } else if (deref ex == null) {
+        if (has_argument(ctx, count, args, 2)) {
+            offset = integer_argument(ctx, args[2], 0, view_length, "offset is out of range", ex);
+        }
+        wanted = view_length - offset;
+        if (deref ex == null && has_argument(ctx, count, args, 3)) {
+            wanted = integer_argument(ctx, args[3], 0, view_length - offset, "length is out of range", ex);
+        }
+        if (deref ex == null && count > 4) {
+            position = position_argument(ctx, args[4], ex);
+        }
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (!is_usable(state, fd)) {
+        descriptor_failure(ctx, ex, "read", EBADF);
+        return undefined(ctx);
+    }
+    if (wanted == 0) {
+        return number(ctx, 0.0);
+    }
+    if (wanted > FILE_LIMIT) {
+        wanted = FILE_LIMIT;
+    }
+    // Bytes land in a bounce buffer first so the engine buffer is only written after the read succeeded.
+    var bytes: ptr<u8> = mem_alloc(wanted);
+    if (bytes == null) {
+        fail(ctx, ex, ERROR_RANGE, "cannot allocate read buffer");
+        return undefined(ctx);
+    }
+    var got: i64 = 0;
+    if (position >= 0) {
+        got = libc_pread(fd as i32, bytes, wanted, position);
+    } else {
+        got = libc_read(fd as i32, bytes, wanted);
+    }
+    var failure: i64 = 0;
+    if (got < 0) {
+        failure = current_errno();
+    } else if (got > 0) {
+        write_byte_view(ctx, args[1], offset, bytes, got, ex);
+    }
+    mem_free(bytes, wanted);
+    if (failure < 0) {
+        descriptor_failure(ctx, ex, "read", failure);
+        return undefined(ctx);
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    return number(ctx, got as f64);
+}
+
+fun do_write(ctx: ptr<u8>, state: ptr<MoreState>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var fd: i64 = descriptor_argument(ctx, count, args, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (count < 2) {
+        fail(ctx, ex, ERROR_TYPE, "writeSync requires data");
+        return undefined(ctx);
+    }
+    var bytes: ptr<u8> = mem_alloc(FILE_LIMIT + 1);
+    if (bytes == null) {
+        fail(ctx, ex, ERROR_RANGE, "cannot allocate write buffer");
+        return undefined(ctx);
+    }
+    var length: i64 = data_bytes(ctx, args[1], bytes, ex);
+    var start: i64 = 0;
+    var position: i64 = -1;
+    if (deref ex == null && kind(ctx, args[1]) == TYPE_STRING) {
+        // writeSync(fd, string[, position[, encoding]]); only UTF-8 is supported.
+        if (count > 2) {
+            position = position_argument(ctx, args[2], ex);
+        }
+        if (deref ex == null && count > 3 && kind(ctx, args[3]) != TYPE_UNDEFINED) {
+            check_utf8_encoding(ctx, args[3], ex);
+        }
+    } else if (deref ex == null) {
+        // writeSync(fd, buffer[, offset[, length[, position]]])
+        if (has_argument(ctx, count, args, 2)) {
+            start = integer_argument(ctx, args[2], 0, length, "offset is out of range", ex);
+        }
+        if (deref ex == null) {
+            length = length - start;
+        }
+        if (deref ex == null && has_argument(ctx, count, args, 3)) {
+            length = integer_argument(ctx, args[3], 0, length, "length is out of range", ex);
+        }
+        if (deref ex == null && count > 4) {
+            position = position_argument(ctx, args[4], ex);
+        }
+    }
+    var written: i64 = 0;
+    if (deref ex == null && !is_usable(state, fd)) {
+        descriptor_failure(ctx, ex, "write", EBADF);
+    } else if (deref ex == null && length > 0) {
+        if (position >= 0) {
+            written = libc_pwrite(fd as i32, bytes + start, length, position);
+        } else {
+            written = libc_write(fd as i32, bytes + start, length);
+        }
+        if (written < 0) {
+            descriptor_failure(ctx, ex, "write", current_errno());
+        }
+    }
+    mem_free(bytes, FILE_LIMIT + 1);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    return number(ctx, written as f64);
+}
+
+fun check_utf8_encoding(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var name: array<u8, 16>;
+    if (kind(ctx, value) != TYPE_STRING) {
+        fail(ctx, ex, ERROR_TYPE, "encoding must be a string");
+        return;
+    }
+    copy_host_path(ctx, value, &name[0], 16, ex);
+    if (deref ex != null) {
+        return;
+    }
+    if (!same_text(&name[0] as str, "utf8") && !same_text(&name[0] as str, "utf-8")) {
+        fail(ctx, ex, ERROR_TYPE, "only utf8 is supported for writeSync");
+    }
+}
+
+fun do_fstat(ctx: ptr<u8>, state: ptr<MoreState>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var fd: i64 = descriptor_argument(ctx, count, args, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (!is_usable(state, fd)) {
+        descriptor_failure(ctx, ex, "fstat", EBADF);
+        return undefined(ctx);
+    }
+    var info: Stat;
+    var status: i64 = fstat(fd, &info);
+    if (status < 0) {
+        descriptor_failure(ctx, ex, "fstat", status);
+        return undefined(ctx);
+    }
+    return file_stats(ctx, &info, ex);
+}
+
+fun do_sync(ctx: ptr<u8>, state: ptr<MoreState>, op: i64, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var fd: i64 = descriptor_argument(ctx, count, args, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (!is_usable(state, fd)) {
+        descriptor_failure(ctx, ex, "fsync", EBADF);
+        return undefined(ctx);
+    }
+    var status: i64 = 0;
+    var operation: str = "fsync";
+    if (op == OP_FSYNC) {
+        status = fsync(fd);
+    } else if (op == OP_FDATASYNC) {
+        operation = "fdatasync";
+        if (libc_fdatasync(fd as i32) < 0) {
+            status = current_errno();
+        }
+    } else {
+        operation = "ftruncate";
+        var length: i64 = 0;
+        if (has_argument(ctx, count, args, 1)) {
+            length = integer_argument(ctx, args[1], 0, FILE_LIMIT * 1024, "length is out of range", ex);
+        }
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        status = ftruncate(fd, length);
+    }
+    if (status < 0) {
+        descriptor_failure(ctx, ex, operation, status);
+    }
+    return undefined(ctx);
+}
+
+export(c) fun jsrt_fs_more(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<MoreState> = storage(ctx);
+    var op: i64 = operation_index(ctx, state, fn);
+    if (op == OP_CHMOD) {
+        return do_chmod(ctx, count, args, ex);
+    }
+    if (op == OP_TRUNCATE) {
+        return do_truncate(ctx, count, args, ex);
+    }
+    if (op == OP_SYMLINK) {
+        return do_symlink(ctx, count, args, ex);
+    }
+    if (op == OP_READLINK) {
+        return do_readlink(ctx, count, args, ex);
+    }
+    if (op == OP_REALPATH) {
+        return do_realpath(ctx, count, args, ex);
+    }
+    if (op == OP_MKDTEMP) {
+        return do_mkdtemp(ctx, count, args, ex);
+    }
+    if (op == OP_UTIMES) {
+        return do_utimes(ctx, count, args, ex);
+    }
+    if (op == OP_COPY_FILE) {
+        return do_copy_file(ctx, count, args, ex);
+    }
+    if (op == OP_APPEND_FILE) {
+        return do_append_file(ctx, count, args, ex);
+    }
+    if (op == OP_RM) {
+        return do_rm(ctx, count, args, ex);
+    }
+    if (op == OP_OPEN) {
+        return do_open(ctx, state, count, args, ex);
+    }
+    if (op == OP_CLOSE) {
+        return do_close(ctx, state, count, args, ex);
+    }
+    if (op == OP_READ) {
+        return do_read(ctx, state, count, args, ex);
+    }
+    if (op == OP_WRITE) {
+        return do_write(ctx, state, count, args, ex);
+    }
+    if (op == OP_FSTAT) {
+        return do_fstat(ctx, state, count, args, ex);
+    }
+    if (op == OP_FSYNC || op == OP_FDATASYNC || op == OP_FTRUNCATE) {
+        return do_sync(ctx, state, op, count, args, ex);
+    }
+    fail(ctx, ex, ERROR_TYPE, "unknown filesystem operation");
+    return undefined(ctx);
+}
+
+pub fun install_fs_sync_more(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var state: ptr<MoreState> = storage(ctx);
+    var fs: ptr<u8> = get(ctx, global(ctx), "fs", ex);
+    var names: array<str, 18> = ["chmodSync", "truncateSync", "symlinkSync", "readlinkSync", "realpathSync",
+        "mkdtempSync", "utimesSync", "copyFileSync", "appendFileSync", "rmSync", "openSync", "closeSync", "readSync",
+        "writeSync", "fstatSync", "fsyncSync", "fdatasyncSync", "ftruncateSync"];
+    for (var i: i64 = 0; i < OP_COUNT; i++) {
+        var name: ptr<u8> = utf8(names[i]);
+        (deref state.methods)[i] = function(ctx, name, callback());
+        release(name);
+        protect(ctx, (deref state.methods)[i]);
+        define(ctx, fs, names[i], (deref state.methods)[i], ex, true);
+    }
+    // realpathSync.native is the same implementation.
+    define(ctx, (deref state.methods)[OP_REALPATH], "native", (deref state.methods)[OP_REALPATH], ex, false);
+    return deref ex == null;
+}
+
+// Closes every descriptor opened through openSync that the script left open.
+pub fun shutdown_fs_sync_more(ctx: ptr<u8>) {
+    var state: ptr<MoreState> = storage(ctx);
+    if (state == null) {
+        return;
+    }
+    for (var i: i64 = 0; i < deref state.owned_count; i++) {
+        close((deref state.owned)[i] as i64);
+    }
+    deref state.owned_count = 0;
+    for (var i: i64 = 0; i < OP_COUNT; i++) {
+        if ((deref state.methods)[i] != null) {
+            unprotect(ctx, (deref state.methods)[i]);
+            (deref state.methods)[i] = null;
+        }
+    }
+    release_context_slot(ctx, SLOT, size_of<MoreState>() as i64);
+}

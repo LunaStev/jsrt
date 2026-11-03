@@ -207,6 +207,12 @@ pub fun io_failure(ctx: ptr<u8>, ex: ptr<ptr<u8>>, operation: str, path: str, nu
         code = "EPERM";
     } else if (number == -27) {
         code = "EFBIG";
+    } else if (number == -9) {
+        code = "EBADF";
+    } else if (number == -95) {
+        code = "ENOTSUP";
+    } else if (number == -12) {
+        code = "ENOMEM";
     } else if (number != -5) {
         code = "UNKNOWN";
     }

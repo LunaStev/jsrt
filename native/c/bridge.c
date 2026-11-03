@@ -175,6 +175,10 @@ extern JSValue jsrt_fs_sync(const void *, void *, void *, size_t, const JSValue 
 void *jsrt_fs_sync_callback(void) {
     return (void *)jsrt_fs_sync;
 }
+extern JSValue jsrt_fs_more(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+void *jsrt_fs_more_callback(void) {
+    return (void *)jsrt_fs_more;
+}
 extern JSValue jsrt_buffer_numeric(const void *, void *, void *, size_t, const JSValue *,
                                    JSValue *);
 void *jsrt_buffer_numeric_callback(void) {
