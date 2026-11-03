@@ -1,32 +1,33 @@
-<p align="center"><img src="wave.svg" width="280" alt="Wave 로고"></p>
-
 # jsrt
 
-Wave로 구현하고 JavaScriptCore를 내장한 JavaScript 런타임.
+A JavaScript runtime written in Wave and powered by JavaScriptCore.
 
-> 개발 중입니다. Node.js·Bun·npm 전체 호환이 아니며 샌드박스도 아닙니다. `jsrt`는 임시 이름입니다.
+jsrt provides CommonJS and ES modules, selected Node.js and Web APIs,
+and a package installer.
 
-- **엔진**: JavaScriptCore 2.54.1 (JS 실행·GC·JIT)
-- **호스트**: Wave (모듈, 이벤트 루프, 타이머, 파일·네트워크·Worker, 패키지 설치)
-- **JSON**: wjson
-- **네트워크**: libuv · llhttp · libcurl
+**Experimental.** API coverage is incomplete. Check the
+[compatibility guide](docs/compatibility.md) before running existing applications.
+JavaScript runs with the permissions of the host process.
 
-## 빌드와 실행
-
-Wave 컴파일러, C/C++ 컴파일러, `cmake`, `ninja`, libcurl 8.13+ 가 필요합니다. 순서는 [docs/building.md](docs/building.md).
+## Usage
 
 ```sh
-./bootstrap.sh engine-build
-./bootstrap.sh build --engine-library <libJavaScriptCore.so 경로>
-
 jsrt app.js
-jsrt -e "console.log(1 + 1)"
+jsrt -e "console.log('Hello from jsrt')"
+jsrt --info
 ```
 
-## 한계
+## Documentation
 
-`net`/`tls`/`dns`/`zlib`/`readline`/`vm`, WebSocket, `MessageChannel`, `require(ESM)`, REPL은 없고, `fs`·`events`·`assert`·`child_process`는 일부만 지원합니다.
-지원 범위는 [docs/compatibility.md](docs/compatibility.md), 남은 작업은 [ROADMAP.md](ROADMAP.md)를 보세요.
-이 저장소에는 테스트 소스가 없습니다.
+- [API compatibility](docs/compatibility.md)
+- [Package installation](INSTALLER.md)
+- [Security and execution boundaries](SECURITY.md)
 
-[Mozilla Public License 2.0](LICENSE)
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, source builds,
+testing, and pull requests.
+
+## License
+
+[MPL-2.0](LICENSE). Third-party dependencies retain their own licenses.
