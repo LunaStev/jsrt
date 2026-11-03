@@ -611,6 +611,68 @@ export(c) fun jsrt_buffer_write(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, co
     return number(ctx, written as f64);
 }
 
+// buf.swap16() / swap32() / swap64(): reverses the byte order of each 2-, 4- or 8-byte group in
+// place and returns the buffer. The width follows from which function object was called.
+export(c) fun jsrt_buffer_swap(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (!is_byte_view(ctx, receiver, ex)) {
+        if (deref ex == null) {
+            fail(ctx, ex, 1, "swap requires a Buffer receiver");
+        }
+        return undefined(ctx);
+    }
+    var width: i64 = 2;
+    var name: ptr<u8> = get(ctx, fn, "name", ex);
+    var label: array<u8, 16>;
+    var written: i64 = 0;
+    if (deref ex == null && kind(ctx, name) == 4) {
+        written = encode_bytes(ctx, name, 0, &label[0], 15, ex);
+    }
+    if (written == 6 && label[4] == 51) {
+        width = 4;
+    } else if (written == 6 && label[4] == 54) {
+        width = 8;
+    }
+    var length: i64 = byte_view_length(ctx, receiver, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (length % width != 0) {
+        var problem: ptr<u8> = null;
+        fail(ctx, &problem, 2, "Buffer size must be a multiple of the swap width");
+        if (problem != null) {
+            var ignored: ptr<u8> = null;
+            define(ctx, problem, "code", text(ctx, "ERR_INVALID_BUFFER_SIZE"), &ignored, true);
+            deref ex = problem;
+        }
+        return undefined(ctx);
+    }
+    if (length == 0) {
+        return receiver;
+    }
+    var bytes: ptr<u8> = mem_alloc(length);
+    if (bytes == null) {
+        fail(ctx, ex, 2, "cannot allocate swap buffer");
+        return undefined(ctx);
+    }
+    var copied: i64 = copy_byte_view(ctx, receiver, bytes, length, ex);
+    if (copied == length && deref ex == null) {
+        for (var group: i64 = 0; group < length; group += width) {
+            for (var i: i64 = 0; i < width / 2; i++) {
+                var low: u8 = bytes[group + i];
+                bytes[group + i] = bytes[group + width - 1 - i];
+                bytes[group + width - 1 - i] = low;
+            }
+        }
+        write_byte_view(ctx, receiver, 0, bytes, length, ex);
+    }
+    mem_free(bytes, length);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    return receiver;
+}
+
 pub fun install_buffer(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     if (!initialize_buffer_brand(ctx, ex)) {
         return false;
@@ -633,10 +695,10 @@ pub fun install_buffer(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
         define(ctx, deref buffer_root(ctx, 1), statics[i], native(ctx, statics[i], static_codes[i]),
             ex, false);
     }
-    var methods: array<str, 9> = ["toString", "subarray", "slice", "fill", "copy", "equals", "compare",
-        "toJSON", "write"];
-    var codes: array<i32, 9> = [6, 7, 7, 8, 9, 10, 11, 12, 14];
-    for (var i: i64 = 0; i < 9; i++) {
+    var methods: array<str, 12> = ["toString", "subarray", "slice", "fill", "copy", "equals", "compare",
+        "toJSON", "write", "swap16", "swap32", "swap64"];
+    var codes: array<i32, 12> = [6, 7, 7, 8, 9, 10, 11, 12, 14, 15, 15, 15];
+    for (var i: i64 = 0; i < 12; i++) {
         define(ctx, deref buffer_root(ctx, 0), methods[i], native(ctx, methods[i], codes[i]), ex, false);
     }
     deref buffer_root(ctx, 2) = plain(ctx);

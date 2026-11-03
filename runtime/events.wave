@@ -8,7 +8,7 @@ pub fun event_parent(ctx: ptr<u8>) -> ptr<u8> {
 }
 
 // EventEmitter policy in Wave; WeakMap entries are collected with their owners.
-import("./values")::{get, put, text, plain, define, fail};
+import("./values")::{get, put, text, plain, define, fail, fail_coded};
 import("./collections")::{weak_map, weak_get, weak_set, list, length, at, append, flag, set_flag, bind_one};
 import("./config")::{EVENT_LISTENER_LIMIT};
 extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
@@ -196,7 +196,7 @@ pub fun emit_event(ctx: ptr<u8>, receiver: ptr<u8>, name: ptr<u8>, count: i64, a
         if (count > 0 && kind(ctx, args[0]) == 5) {
             deref ex = args[0];
         } else {
-            fail(ctx, ex, 0, "Unhandled 'error' event");
+            fail_coded(ctx, ex, 0, "ERR_UNHANDLED_ERROR", "Unhandled 'error' event");
         }
     }
     unprotect(ctx, snapshot);

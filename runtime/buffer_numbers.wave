@@ -1,6 +1,6 @@
 // Wave owns Buffer numeric overloads and bounds. JSC DataView owns IEEE-754/BigInt conversion.
 import("./context_state")::{context_slot, allocate_context_slot, release_context_slot};
-import("./values")::{get, capture, define, fail, coerce_number};
+import("./values")::{get, capture, define, fail, coerce_number, text};
 import("./buffer_core")::{byte_view_length};
 import("std::mem::layout")::{size_of};
 extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
@@ -44,6 +44,15 @@ fun storage(ctx: ptr<u8>) -> ptr<NumericState> {
     return context_slot(ctx, SLOT) as ptr<NumericState>;
 }
 
+// RangeError with Node's error code (ERR_OUT_OF_RANGE or ERR_BUFFER_OUT_OF_BOUNDS).
+fun coded_range(ctx: ptr<u8>, ex: ptr<ptr<u8>>, code: str, message: str) {
+    fail(ctx, ex, 2, message);
+    if (deref ex != null) {
+        var ignored: ptr<u8> = null;
+        define(ctx, deref ex, "code", text(ctx, code), &ignored, true);
+    }
+}
+
 fun arg(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, at: i64) -> ptr<u8> {
     if (count > at) {
         return args[at];
@@ -58,7 +67,7 @@ fun integer(ctx: ptr<u8>, value: ptr<u8>, maximum: i64, ex: ptr<ptr<u8>>) -> i64
     }
     var n: f64 = numeric(ctx, value, ex);
     if (!(n >= 0.0 && n <= maximum as f64) || n != (n as i64) as f64) {
-        fail(ctx, ex, 2, "numeric Buffer offset or width is out of range");
+        coded_range(ctx, ex, "ERR_OUT_OF_RANGE", "numeric Buffer offset or width is out of range");
         return 0;
     }
     return n as i64;
@@ -103,7 +112,7 @@ fun bigint_range(ctx: ptr<u8>, value: ptr<u8>, signed: bool, ex: ptr<ptr<u8>>) {
     }
     release(string);
     if (invalid) {
-        fail(ctx, ex, 2, "bigint Buffer value is out of range");
+        coded_range(ctx, ex, "ERR_OUT_OF_RANGE", "bigint Buffer value is out of range");
     }
 }
 
@@ -124,7 +133,7 @@ fun integer_value(ctx: ptr<u8>, value: ptr<u8>, width: i64, signed: bool, ex: pt
         maximum = (bound / 2 - 1) as f64;
     }
     if (n == n && (n < minimum || n > maximum)) {
-        fail(ctx, ex, 2, "numeric Buffer value is out of range");
+        coded_range(ctx, ex, "ERR_OUT_OF_RANGE", "numeric Buffer value is out of range");
     }
     if (n != n) {
         return 0.0;
@@ -166,7 +175,7 @@ export(c) fun jsrt_buffer_numeric(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, 
         }
         width = integer(ctx, arg(ctx, count, args, width_arg), 6, ex);
         if (width == 0 && deref ex == null) {
-            fail(ctx, ex, 2, "byteLength must be between 1 and 6");
+            coded_range(ctx, ex, "ERR_OUT_OF_RANGE", "byteLength must be between 1 and 6");
         }
     } else {
         width = widths[id];
@@ -197,8 +206,10 @@ export(c) fun jsrt_buffer_numeric(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, 
     if (variable || kind(ctx, requested) != 0) {
         offset = integer(ctx, requested, length, ex);
     }
-    if (width > length || offset > length - width) {
-        fail(ctx, ex, 2, "numeric Buffer access exceeds view bounds");
+    if (width > length) {
+        coded_range(ctx, ex, "ERR_BUFFER_OUT_OF_BOUNDS", "numeric Buffer access exceeds view bounds");
+    } else if (offset > length - width) {
+        coded_range(ctx, ex, "ERR_OUT_OF_RANGE", "numeric Buffer offset is out of range");
     }
     if (deref ex != null) {
         return undefined(ctx);

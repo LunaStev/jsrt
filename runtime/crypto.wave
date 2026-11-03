@@ -16,7 +16,7 @@ import("std::mem::alloc")::{mem_alloc, mem_free};
 import("std::mem::cstr")::{mem_eq_cstr};
 import("std::random::fill")::{RandomFillResult, random_fill};
 import("./config")::{BUFFER_LIMIT};
-import("./values")::{get, put, plain, text, define, fail};
+import("./values")::{get, put, plain, text, define, fail, fail_coded};
 import("./buffer")::{buffer_integer, copy_buffer_input};
 import("./buffer_core")::{byte_view_length, copy_byte_view, buffer_from_bytes};
 import("./byte_codec")::{encode_utf8, encoding};
@@ -171,7 +171,7 @@ export(c) fun jsrt_crypto_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, coun
             return undefined(ctx);
         }
         if (na != nb) {
-            fail(ctx, ex, 2, "timingSafeEqual requires equal byte lengths");
+            fail_coded(ctx, ex, 2, "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH", "timingSafeEqual requires equal byte lengths");
             return undefined(ctx);
         }
         if (na == 0) {
@@ -275,7 +275,7 @@ export(c) fun jsrt_crypto_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, coun
         return undefined(ctx);
     }
     if (flag(ctx, record, "done", ex)) {
-        fail(ctx, ex, 0, "Hash already finalized");
+        fail_coded(ctx, ex, 0, "ERR_CRYPTO_HASH_FINALIZED", "Hash already finalized");
         return undefined(ctx);
     }
     if (equal(ctx, fn, (deref host_state.methods)[5])) {

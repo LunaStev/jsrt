@@ -322,6 +322,7 @@ extern JSValue jsrt_buffer_to_json(const void *, void *, void *, size_t, const J
 extern JSValue jsrt_buffer_compare_static(const void *, void *, void *, size_t, const JSValue *,
                                           JSValue *);
 extern JSValue jsrt_buffer_write(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+extern JSValue jsrt_buffer_swap(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 JSCallback jsrt_buffer_callback(int32_t kind) {
     switch (kind) {
     case 0:
@@ -354,6 +355,8 @@ JSCallback jsrt_buffer_callback(int32_t kind) {
         return jsrt_buffer_compare_static;
     case 14:
         return jsrt_buffer_write;
+    case 15:
+        return jsrt_buffer_swap;
     default:
         return NULL;
     }

@@ -1,6 +1,6 @@
 // UTF-8 Web encoders and incremental decoders, including BOM and fatal policy.
 import("./context_state")::{owned_context_slot, context_slot, release_context_slot};
-import("./values")::{get, put, text, plain, define, getter, fail};
+import("./values")::{get, put, text, plain, define, getter, fail, fail_coded};
 import("./collections")::{weak_map, weak_get, weak_set, flag, set_flag};
 import("./web_support")::{source_bytes, usv_text, public_constructor};
 import("./buffer_core")::{byte_view_length, copy_byte_view, buffer_from_bytes, write_byte_view};
@@ -254,7 +254,7 @@ fun decode(ctx: ptr<u8>, r: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr
         }
         if (!valid) {
             if (flag(ctx, r, "fatal", ex)) {
-                fail(ctx, ex, 1, "invalid UTF-8 in TextDecoder");
+                fail_coded(ctx, ex, 1, "ERR_ENCODING_INVALID_ENCODED_DATA", "invalid UTF-8 in TextDecoder");
                 break;
             }
             cp = 65533;

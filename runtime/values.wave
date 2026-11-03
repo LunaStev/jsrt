@@ -77,6 +77,18 @@ pub fun fail(ctx: ptr<u8>, ex: ptr<ptr<u8>>, kind: i32, message: str) {
     unprotect(ctx, args[0]);
 }
 
+// Like fail(), and additionally sets Node's `code` property on a freshly created error.
+pub fun fail_coded(ctx: ptr<u8>, ex: ptr<ptr<u8>>, kind: i32, code: str, message: str) {
+    if (deref ex != null) {
+        return;
+    }
+    fail(ctx, ex, kind, message);
+    if (deref ex != null) {
+        var ignored: ptr<u8> = null;
+        define(ctx, deref ex, "code", text(ctx, code), &ignored, true);
+    }
+}
+
 pub fun define_key(ctx: ptr<u8>, object: ptr<u8>, key: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>, enumerable: bool) {
     if (deref ex != null) {
         return;
