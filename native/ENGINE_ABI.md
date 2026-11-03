@@ -59,8 +59,8 @@ constructor so user constructor/species changes cannot hijack scheduling.
 Wave catches callback exceptions and keeps the first failure until reporting.
 No JavaScript bootstrap is evaluated for timers, microtasks or wjson JSON.
 
-Current execution is tested with JSC 2.54.1. Older engines require an explicitly
-labelled compatibility build. The default version policy requires JSC 2.54.1 or newer.
+The default version policy requires JSC 2.54.1 or newer. Older engines require
+an explicitly labelled compatibility build.
 
 ## Byte storage ABI
 
@@ -119,10 +119,7 @@ are drained before endpoint records or the JSC context are freed.
 
 The parser pauses at message completion. Connection: close is the default;
 explicit keepAlive enables state recycling and queues bounded subsequent bytes.
-All llhttp leniency settings stay disabled. Protocol and response-byte tests run
-without sockets; denied socket creation skips the TCP suite in ordinary mode
-and fails --require-tcp. Earlier successful live runs and current denied runs
-are recorded separately in README.
+All llhttp leniency settings stay disabled.
 
 File streams submit open, bounded read/write and close work to the existing Wave
 worker queue. Workers do not touch JSC. Open-result descriptors transfer to the
@@ -235,7 +232,8 @@ Pattern ordering, fallback arrays, self references and external imports are Wave
 
 URL parsing calls libcurl's URL API directly from Wave and releases every handle
 within the operation. URLSearchParams form codecs and live JS state remain in Wave.
-The HTTP(S) subset and divergences from WHATWG are documented in README.
+The HTTP(S) subset and divergences from WHATWG are documented in the
+[compatibility guide](../docs/compatibility.md).
 
 Package installation links system libarchive.so.13. Wave drives its tar/gzip reader,
 validates paths/types/byte limits and controls descriptor-relative writes and rollback.
@@ -247,8 +245,3 @@ flock lifetime, wjson recovery journal, fsync ordering and publication decisions
 are Wave policies in package_transaction.wave. Ownership proofs use hard links
 to prevent inode reuse from confusing a replaced lock or dependency tree with
 the interrupted install. The two published paths are recoverable, not atomic together.
-
-Response method tests create a real JSC host in the Wave test harness. No mocked
-Promise, substitute JS engine, or product-only test hook is used. Local TCP and
-OpenSSL TLS integration fixtures remain capability-gated and --require-tcp makes
-a denied capability a failure. Their syntax is checked even when sockets are denied.

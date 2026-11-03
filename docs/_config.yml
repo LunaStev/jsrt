@@ -1,0 +1,36 @@
+title: jsrt
+description: Documentation for the Wave-powered JavaScript runtime.
+url: https://potatosl.github.io
+baseurl: /jsrt
+lang: en
+theme: just-the-docs
+
+permalink: pretty
+search_enabled: true
+heading_anchors: true
+
+aux_links:
+  GitHub: https://github.com/potatosl/jsrt
+  Contributing: https://github.com/potatosl/jsrt/blob/main/CONTRIBUTING.md
+
+gh_edit_link: true
+gh_edit_link_text: Edit this page on GitHub
+gh_edit_repository: https://github.com/potatosl/jsrt
+gh_edit_branch: main
+gh_edit_source: docs
+gh_edit_view_mode: edit
+
+plugins:
+  - jekyll-relative-links
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor
+  - .bundle
