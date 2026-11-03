@@ -75,7 +75,7 @@ exit 이벤트, stdout/stderr Writable을 추가했다. stdio는 동기 descript
 프로세스를 유지하지 않으며 Worker의 신호 구독은 거부한다. 2026-10-26에 beforeExit를 추가했다.
 정상 유휴 시 현재 exitCode로 호출하며 예약된 타이머·파일·자식 프로세스가 끝난 뒤 다시 발생한다.
 예외 종료에는 호출하지 않는다. nextTick/stdin은 아래 확장 범위를 제공하며 전체 process는 아니다.
-util.inherits와 기본 구분자 querystring.parse/decode를 추가했다. querystring은 기존 Wave form decoder를
+util.inherits와 기본 구분자 querystring.parse/decode를 추가했다(stringify는 2026-11-03에 추가). querystring은 기존 Wave form decoder를
 사용하며 입력 8191바이트/1024쌍 한도, 다른 구분자·options·stringify는 지원하지 않는다.
 
 ## 코어 전역·유틸리티 (2026-11)
@@ -98,6 +98,13 @@ rmdir·rename·readdir`의 콜백 형태를 제공한다. 마지막 인자가 �
 동기적으로 던지고, 결과는 `process.nextTick`으로 전달한다. 거짓 거부 값은 `ERR_FALSY_VALUE_REJECTION`
 오류로 감싼다. 콜백 형태의 open/close/read/write/appendFile 등은 아직 없다.
 
+**util.deprecate / util.promisify.custom.** `util.deprecate(fn, message[, code])`는 래퍼를 돌려주고, 래퍼마다 첫 호출에서
+한 번만 `(jsrt) [code] DeprecationWarning: message`를 stderr에 쓴 뒤 receiver와 인자를 그대로 전달한다. 함수가 아니면
+`TypeError`, 문자열이 아닌 메시지는 첫 호출에서 `TypeError`다(Node와 같다). Node와 다른 점: `process.emitWarning`/`warning`
+이벤트·`--no-deprecation`·code 단위 중복 제거가 없고 `new`로 호출하는 생성자 래핑을 따로 처리하지 않는다.
+`util.promisify.custom`은 `Symbol.for('nodejs.util.promisify.custom')`이며 `fn[custom]`이 함수면 `promisify`가
+그 함수를 그대로 돌려주고, 함수가 아닌 값이면 `TypeError`다. 회귀는 tests/core_modules.js(Node와 같은 결과).
+
 **타이머.** setTimeout·setInterval은 Timeout 객체를 반환하고 `ref`·`unref`·`hasRef`·`refresh`·`close`와
 `Symbol.toPrimitive`(숫자 id)를 제공한다. 숫자 id와 객체 모두 clearTimeout/clearInterval에 쓸 수 있다.
 `unref`된 타이머는 다른 작업이 남아 있으면 정상 실행하지만 그것만으로 이벤트 루프를 유지하지 않는다.
@@ -114,8 +121,19 @@ external·arrayBuffers는 0이다.
 **전역.** `global`(globalThis 별칭), `performance.now()`/`timeOrigin`(다른 Performance API 없음),
 `atob`/`btoa`(HTML 표준의 forgiving-base64, 실패 시 DOMException InvalidCharacterError)를 제공한다.
 
-아직 없는 것: `timers/promises`, `url.fileURLToPath`/`pathToFileURL`(URL이 file: 스킴을 표현하지 못함),
-`querystring.stringify`, `util.deprecate`/`promisify.custom`, `assert.deepStrictEqual`, `process.chdir`/`kill`,
+**2026-11-03 추가.** `querystring.stringify`/`encode`는 기본 구분자만 지원한다(공백은 `%20`, `!'()*~`는 유지,
+문자열·유한 숫자·bigint·boolean 외 값은 빈 문자열, 배열은 키 반복, 쌍 한도는 URLSearchParams와 같다).
+`process.chdir(path)`는 문자열만 받고 실패하면 현재 디렉터리를 유지하며 Worker 안에서는 거부한다.
+작업 디렉터리는 프로세스 전체가 공유하므로 이미 대기 중인 상대 경로 비동기 파일 작업이 바뀐 디렉터리에서
+실행될 수 있다. `assert.deepStrictEqual`/`notDeepStrictEqual`은 `Object.is`, 프로토타입, 태그, 열거 가능한 문자열 키,
+Date·RegExp·원시 래퍼·Error·Map·Set·ArrayBuffer·typed array를 구조 비교한다. 순환은 지원하고
+깊이 64·비교 200만 단계를 넘으면 RangeError다. Symbol 키·WeakMap/Promise 내용은 비교하지 않고 같은 객체일 때만 같다.
+`deepEqual`/`notDeepEqual`은 기존 `equal` 별칭처럼 엄격 비교와 같다(느슨한 비교가 아니다).
+`timers/promises`는 `setTimeout`/`setImmediate`/`scheduler.wait`/`scheduler.yield`를 제공하며 옵션(signal·ref)을
+주면 거부하고 setInterval 비동기 반복자는 없다. `timers`도 `setImmediate`/`clearImmediate`/`promises`를 노출한다.
+
+아직 없는 것: `url.fileURLToPath`/`pathToFileURL`(URL이 file: 스킴을 표현하지 못함),
+`process.kill`,
 `net`/`tls`/`dns`/`zlib`/`readline`/`tty`/`async_hooks`/`perf_hooks`/`module`, `crypto.subtle`.
 
 ## 스트림·CLI 확장

@@ -14,6 +14,7 @@ import("./buffer")::{buffer_module};
 import("./events")::{events_module};
 import("./streams")::{streams_module};
 import("./web_streams")::{web_streams_module};
+import("./timers_promises")::{timers_promises_module};
 import("./stream_utils")::{stream_promises_module};
 import("./http_client")::{https_module};
 import("./path")::{path_module};
@@ -382,6 +383,8 @@ pub fun install_modules(ctx: ptr<u8>, path: str, evaluating: bool, ex: ptr<ptr<u
     wr_protect(ctx, (deref host_state.builtins)[19]);
     (deref host_state.builtins)[20] = web_streams_module(ctx);
     wr_protect(ctx, (deref host_state.builtins)[20]);
+    (deref host_state.builtins)[21] = timers_promises_module(ctx, ex);
+    wr_protect(ctx, (deref host_state.builtins)[21]);
     var fs_key: ptr<u8> = wr_string_utf8("fs");
     wr_delete(ctx, global, fs_key, ex);
     wr_string_release(fs_key);
@@ -396,6 +399,13 @@ pub fun install_modules(ctx: ptr<u8>, path: str, evaluating: bool, ex: ptr<ptr<u
         define(ctx, (deref host_state.builtins)[2], timer_names[i], get(ctx, global, timer_names[i],
             ex), ex, true);
     }
+    // The timers module also exposes the immediate functions and the promises namespace.
+    var immediate_names: array<str, 2> = ["setImmediate", "clearImmediate"];
+    for (var i: i64 = 0; i < 2; i++) {
+        define(ctx, (deref host_state.builtins)[2], immediate_names[i], get(ctx, global, immediate_names[i],
+            ex), ex, true);
+    }
+    define(ctx, (deref host_state.builtins)[2], "promises", (deref host_state.builtins)[21], ex, true);
     var main_path: ptr<u8> = null;
     if (evaluating) {
         main_path = mem_alloc(PATH_CAP);
@@ -490,7 +500,7 @@ pub fun shutdown_modules(ctx: ptr<u8>) {
             (deref host_state.constructors)[i] = null;
         }
     }
-    for (var i: i64 = 0; i < 21; i++) {
+    for (var i: i64 = 0; i < 22; i++) {
         if ((deref host_state.builtins)[i] != null) {
             wr_unprotect(ctx, (deref host_state.builtins)[i]);
             (deref host_state.builtins)[i] = null;

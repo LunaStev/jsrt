@@ -162,6 +162,9 @@ pub fun annotate(ctx: ptr<u8>, value: ptr<u8>, path: str) {
 }
 
 pub fun builtin(request: str) -> i64 {
+    if (mem_eq_cstr(request, "timers/promises") || mem_eq_cstr(request, "node:timers/promises")) {
+        return 21;
+    }
     if (mem_eq_cstr(request, "stream/web") || mem_eq_cstr(request, "node:stream/web")) {
         return 20;
     }

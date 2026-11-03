@@ -46,7 +46,7 @@ extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, coun
     ex: ptr<ptr<u8>>) -> ptr<u8>;
 extern(c, "jsrt_params_callback") fun callback(code: i32) -> ptr<u8>;
 
-fun pair(ctx: ptr<u8>, name: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+pub fun pair(ctx: ptr<u8>, name: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
     protect(ctx, name);
     protect(ctx, value);
     var result: ptr<u8> = list(ctx, ex);
@@ -141,7 +141,9 @@ pub fun parse_pairs(ctx: ptr<u8>, source: ptr<u8>, strip_question: bool, ex: ptr
     return entries;
 }
 
-fun encoded_field(ctx: ptr<u8>, value: ptr<u8>, bytes: ptr<u8>, used: i64, ex: ptr<ptr<u8>>) -> i64 {
+// query selects querystring.escape rules (space as %20, !'()*~ kept) instead of the
+// form-urlencoded rules used by URLSearchParams (space as +).
+fun encoded_field(ctx: ptr<u8>, value: ptr<u8>, bytes: ptr<u8>, used: i64, query: bool, ex: ptr<ptr<u8>>) -> i64 {
     var source: array<u8, 8192>;
     var n: i64 = encode_utf8(ctx, value, &source[0], URL_CAP, false, ex);
     if (n < 0) {
@@ -152,8 +154,11 @@ fun encoded_field(ctx: ptr<u8>, value: ptr<u8>, bytes: ptr<u8>, used: i64, ex: p
     for (var i: i64 = 0; i < n; i++) {
         var c: u8 = source[i];
         var safe: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 42 || c == 45 || c == 46 || c == 95;
+        if (query) {
+            safe = safe || c == 33 || c == 39 || c == 40 || c == 41 || c == 126;
+        }
         var width: i64 = 1;
-        if (!safe && c != 32) {
+        if (!safe && (c != 32 || query)) {
             width = 3;
         }
         if (cursor + width >= URL_CAP) {
@@ -162,7 +167,7 @@ fun encoded_field(ctx: ptr<u8>, value: ptr<u8>, bytes: ptr<u8>, used: i64, ex: p
         }
         if (safe) {
             bytes[cursor] = c;
-        } else if (c == 32) {
+        } else if (c == 32 && !query) {
             bytes[cursor] = 43;
         } else {
             bytes[cursor] = 37;
@@ -175,6 +180,14 @@ fun encoded_field(ctx: ptr<u8>, value: ptr<u8>, bytes: ptr<u8>, used: i64, ex: p
 }
 
 pub fun serialize_pairs(ctx: ptr<u8>, entries: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return serialize_styled(ctx, entries, false, ex);
+}
+
+pub fun serialize_query_pairs(ctx: ptr<u8>, entries: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return serialize_styled(ctx, entries, true, ex);
+}
+
+fun serialize_styled(ctx: ptr<u8>, entries: ptr<u8>, query: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
     var bytes: array<u8, 8192>;
     var used: i64 = 0;
     for (var i: i64 = 0; i < length(ctx, entries, ex) && deref ex == null; i++) {
@@ -187,7 +200,7 @@ pub fun serialize_pairs(ctx: ptr<u8>, entries: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr
             used += 1;
         }
         var entry: ptr<u8> = at(ctx, entries, i, ex);
-        used = encoded_field(ctx, at(ctx, entry, 0, ex), &bytes[0], used, ex);
+        used = encoded_field(ctx, at(ctx, entry, 0, ex), &bytes[0], used, query, ex);
         if (used < 0) {
             break;
         }
@@ -197,7 +210,7 @@ pub fun serialize_pairs(ctx: ptr<u8>, entries: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr
         }
         bytes[used] = 61;
         used += 1;
-        used = encoded_field(ctx, at(ctx, entry, 1, ex), &bytes[0], used, ex);
+        used = encoded_field(ctx, at(ctx, entry, 1, ex), &bytes[0], used, query, ex);
         if (used < 0) {
             break;
         }

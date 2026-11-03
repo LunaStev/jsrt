@@ -87,6 +87,9 @@ pub fun stream_tests() {
     var core_command: array<str, 3> = [(deref suite.binary) as str, "run", "tests/core_globals.js"];
     expect("Core inspect, format, timer and process regressions", &core_command[0], 3, null, -1, 0, "");
     check("Core global regressions completed", contains((deref suite.output), (deref suite.output_count), "Core global checks passed"));
+    var module_command: array<str, 3> = [(deref suite.binary) as str, "run", "tests/core_modules.js"];
+    expect("querystring, chdir, deep assert and timers/promises regressions", &module_command[0], 3, null, -1, 0, "");
+    check("Core module regressions completed", contains((deref suite.output), (deref suite.output_count), "Core module checks passed"));
     test("Request fetch preserves TLS refusal and first throwing option getter", "const q=new Request('https://example.test/',{method:'POST',body:'x'}),r=new Request('https://example.test/'),reason={};let later=false;Promise.all([fetch(q,{rejectUnauthorized:false}).catch(e=>console.log(e.message.includes('cannot be disabled'))),fetch(r,{get method(){throw reason},get headers(){later=true}}).catch(e=>console.log(e===reason,later))]);",
         "true\ntrue false\n", 0, "");
     test("FormData and Blob uploads preserve pre-aborted fetch reasons", "const c=new AbortController,reason={};c.abort(reason);const f=new FormData;f.append('name','value');Promise.all([f,new Blob(['x'])].map(body=>fetch('https://example.test/',{method:'POST',body,signal:c.signal}).catch(e=>console.log(e===reason))));",

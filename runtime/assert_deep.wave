@@ -1,0 +1,489 @@
+// Structural equality for assert.deepStrictEqual / notDeepStrictEqual.
+//
+// Every intrinsic is captured once at install time, so later changes to Object,
+// Map, Date and friends by user code cannot change the comparison. The walk is
+// bounded (depth and step limits) and cycle-safe: a pair of objects already on the
+// current path is assumed equal, which is what makes recursive structures finite.
+// Symbol-keyed properties, property descriptors and WeakMap/WeakSet/Promise
+// contents are not compared; those values are equal only when identical.
+import("std::mem::alloc")::{mem_alloc_zeroed, mem_free};
+import("std::mem::cstr")::{mem_eq_cstr};
+import("./byte_codec")::{encode_utf8};
+import("./values")::{get, capture, fail};
+import("./collections")::{length, at};
+
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_to_string") fun to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_string_release") fun release_string(value: ptr<u8>);
+extern(c, "wr_get") fun dynamic_get(ctx: ptr<u8>, owner: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_construct") fun construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+
+// JSType codes returned by wr_type, and error kinds understood by values.fail.
+const TYPE_OBJECT: i32 = 5;
+const ERROR_RANGE: i32 = 2;
+
+const DEEP_DEPTH_LIMIT: i64 = 64;
+const DEEP_STEP_LIMIT: i64 = 2000000;
+
+// Indexes into DeepIntrinsics.functions.
+const FN_SAME: i64 = 0;
+const FN_GET_PROTOTYPE: i64 = 1;
+const FN_KEYS: i64 = 2;
+const FN_TAG: i64 = 3;
+const FN_FROM: i64 = 4;
+const FN_HAS_OWN: i64 = 5;
+const FN_IS_ENUMERABLE: i64 = 6;
+const FN_DATE_TIME: i64 = 7;
+const FN_REGEXP_TEXT: i64 = 8;
+const FN_NUMBER_VALUE: i64 = 9;
+const FN_STRING_VALUE: i64 = 10;
+const FN_BOOLEAN_VALUE: i64 = 11;
+const FN_UINT8_ARRAY: i64 = 12;
+const FN_BIGINT_VALUE: i64 = 13;
+const FN_SYMBOL_VALUE: i64 = 14;
+const DEEP_FUNCTION_COUNT: i64 = 15;
+
+pub struct DeepIntrinsics {
+    functions: array<ptr<u8>, 15>;
+}
+
+// Per-comparison scratch: the active path for cycle detection and a step budget.
+struct DeepRun {
+    intrinsics: ptr<DeepIntrinsics>;
+    steps: i64;
+    path_a: array<ptr<u8>, 64>;
+    path_b: array<ptr<u8>, 64>;
+}
+
+fun intrinsic(run: ptr<DeepRun>, index: i64) -> ptr<u8> {
+    var table: ptr<DeepIntrinsics> = deref run.intrinsics;
+    return (deref table.functions)[index];
+}
+
+pub fun deep_install(ctx: ptr<u8>, table: ptr<DeepIntrinsics>, ex: ptr<ptr<u8>>) -> bool {
+    var root: ptr<u8> = global(ctx);
+    var object_ctor: ptr<u8> = get(ctx, root, "Object", ex);
+    var object_proto: ptr<u8> = get(ctx, object_ctor, "prototype", ex);
+    (deref table.functions)[FN_SAME] = capture(ctx, object_ctor, "is", ex);
+    (deref table.functions)[FN_GET_PROTOTYPE] = capture(ctx, object_ctor, "getPrototypeOf", ex);
+    (deref table.functions)[FN_KEYS] = capture(ctx, object_ctor, "keys", ex);
+    (deref table.functions)[FN_TAG] = capture(ctx, object_proto, "toString", ex);
+    (deref table.functions)[FN_HAS_OWN] = capture(ctx, object_proto, "hasOwnProperty", ex);
+    (deref table.functions)[FN_IS_ENUMERABLE] = capture(ctx, object_proto, "propertyIsEnumerable", ex);
+    (deref table.functions)[FN_FROM] = capture(ctx, get(ctx, root, "Array", ex), "from", ex);
+    (deref table.functions)[FN_DATE_TIME] = capture(ctx, get(ctx, get(ctx, root, "Date", ex), "prototype", ex),
+        "getTime", ex);
+    (deref table.functions)[FN_REGEXP_TEXT] = capture(ctx, get(ctx, get(ctx, root, "RegExp", ex), "prototype", ex),
+        "toString", ex);
+    (deref table.functions)[FN_NUMBER_VALUE] = capture(ctx, get(ctx, get(ctx, root, "Number", ex), "prototype", ex),
+        "valueOf", ex);
+    (deref table.functions)[FN_STRING_VALUE] = capture(ctx, get(ctx, get(ctx, root, "String", ex), "prototype", ex),
+        "valueOf", ex);
+    (deref table.functions)[FN_BOOLEAN_VALUE] = capture(ctx, get(ctx, get(ctx, root, "Boolean", ex), "prototype", ex),
+        "valueOf", ex);
+    (deref table.functions)[FN_UINT8_ARRAY] = capture(ctx, root, "Uint8Array", ex);
+    (deref table.functions)[FN_BIGINT_VALUE] = capture(ctx, get(ctx, get(ctx, root, "BigInt", ex), "prototype", ex),
+        "valueOf", ex);
+    (deref table.functions)[FN_SYMBOL_VALUE] = capture(ctx, get(ctx, get(ctx, root, "Symbol", ex), "prototype", ex),
+        "valueOf", ex);
+    return deref ex == null;
+}
+
+pub fun deep_release(ctx: ptr<u8>, table: ptr<DeepIntrinsics>) {
+    for (var i: i64 = 0; i < DEEP_FUNCTION_COUNT; i++) {
+        if ((deref table.functions)[i] != null) {
+            unprotect(ctx, (deref table.functions)[i]);
+            (deref table.functions)[i] = null;
+        }
+    }
+}
+
+fun same(ctx: ptr<u8>, run: ptr<DeepRun>, a: ptr<u8>, b: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var pair: array<ptr<u8>, 2> = [a, b];
+    var result: ptr<u8> = call(ctx, intrinsic(run, FN_SAME), null, 2, &pair[0], ex);
+    return deref ex == null && truth(ctx, result);
+}
+
+// Calls a captured method with `receiver` as this and no arguments.
+fun method0(ctx: ptr<u8>, run: ptr<DeepRun>, index: i64, receiver: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return call(ctx, intrinsic(run, index), receiver, 0, null, ex);
+}
+
+fun unary(ctx: ptr<u8>, run: ptr<DeepRun>, index: i64, argument: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var arguments: array<ptr<u8>, 1> = [argument];
+    return call(ctx, intrinsic(run, index), null, 1, &arguments[0], ex);
+}
+
+// Compares the results of a zero-argument intrinsic called on both objects.
+fun same_result(ctx: ptr<u8>, run: ptr<DeepRun>, index: i64, a: ptr<u8>, b: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var left: ptr<u8> = method0(ctx, run, index, a, ex);
+    if (deref ex != null) {
+        return false;
+    }
+    protect(ctx, left);
+    var right: ptr<u8> = method0(ctx, run, index, b, ex);
+    var result: bool = false;
+    if (deref ex == null) {
+        result = same(ctx, run, left, right, ex);
+    }
+    unprotect(ctx, left);
+    return result;
+}
+
+fun on_path(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: ptr<u8>) -> bool {
+    for (var i: i64 = 0; i < depth; i++) {
+        if ((deref run.path_a)[i] == a && (deref run.path_b)[i] == b) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Tag codes derived from Object.prototype.toString.
+const TAG_PLAIN: i64 = 0;
+const TAG_DATE: i64 = 1;
+const TAG_REGEXP: i64 = 2;
+const TAG_NUMBER: i64 = 3;
+const TAG_STRING: i64 = 4;
+const TAG_BOOLEAN: i64 = 5;
+const TAG_BIGINT: i64 = 6;
+const TAG_SYMBOL: i64 = 7;
+const TAG_MAP: i64 = 8;
+const TAG_SET: i64 = 9;
+const TAG_ARRAY_BUFFER: i64 = 10;
+const TAG_ERROR: i64 = 11;
+const TAG_OPAQUE: i64 = 12;
+const TAG_NAME_CAPACITY: i64 = 64;
+
+fun tag_code(ctx: ptr<u8>, tag: ptr<u8>, ex: ptr<ptr<u8>>) -> i64 {
+    var bytes: array<u8, 64>;
+    var used: i64 = encode_utf8(ctx, tag, &bytes[0], TAG_NAME_CAPACITY - 1, false, ex);
+    if (used < 0 || deref ex != null) {
+        return TAG_PLAIN;
+    }
+    bytes[used] = 0;
+    var name: str = &bytes[0] as str;
+    if (mem_eq_cstr(name, "[object Date]")) {
+        return TAG_DATE;
+    }
+    if (mem_eq_cstr(name, "[object RegExp]")) {
+        return TAG_REGEXP;
+    }
+    if (mem_eq_cstr(name, "[object Number]")) {
+        return TAG_NUMBER;
+    }
+    if (mem_eq_cstr(name, "[object String]")) {
+        return TAG_STRING;
+    }
+    if (mem_eq_cstr(name, "[object Boolean]")) {
+        return TAG_BOOLEAN;
+    }
+    if (mem_eq_cstr(name, "[object BigInt]")) {
+        return TAG_BIGINT;
+    }
+    if (mem_eq_cstr(name, "[object Symbol]")) {
+        return TAG_SYMBOL;
+    }
+    if (mem_eq_cstr(name, "[object Map]")) {
+        return TAG_MAP;
+    }
+    if (mem_eq_cstr(name, "[object Set]")) {
+        return TAG_SET;
+    }
+    if (mem_eq_cstr(name, "[object ArrayBuffer]")) {
+        return TAG_ARRAY_BUFFER;
+    }
+    if (mem_eq_cstr(name, "[object Error]")) {
+        return TAG_ERROR;
+    }
+    if (mem_eq_cstr(name, "[object WeakMap]") || mem_eq_cstr(name, "[object WeakSet]") ||
+        mem_eq_cstr(name, "[object Promise]") || mem_eq_cstr(name, "[object WeakRef]")) {
+        return TAG_OPAQUE;
+    }
+    return TAG_PLAIN;
+}
+
+// Reads a property through a key value produced by Object.keys.
+fun read_property(ctx: ptr<u8>, owner: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var raw: ptr<u8> = to_string(ctx, key, ex);
+    if (raw == null || deref ex != null) {
+        return undefined(ctx);
+    }
+    var result: ptr<u8> = dynamic_get(ctx, owner, raw, ex);
+    release_string(raw);
+    if (result == null || deref ex != null) {
+        return undefined(ctx);
+    }
+    return result;
+}
+
+// Getter results are temporaries, so they stay protected during the recursive walk.
+fun compare_property(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: ptr<u8>, key: ptr<u8>,
+    ex: ptr<ptr<u8>>) -> bool {
+    var value_a: ptr<u8> = read_property(ctx, a, key, ex);
+    if (deref ex != null) {
+        return false;
+    }
+    protect(ctx, value_a);
+    var value_b: ptr<u8> = read_property(ctx, b, key, ex);
+    var result: bool = false;
+    if (deref ex == null) {
+        protect(ctx, value_b);
+        result = deep(ctx, run, depth + 1, value_a, value_b, ex);
+        unprotect(ctx, value_b);
+    }
+    unprotect(ctx, value_a);
+    return result;
+}
+
+// True when b owns an enumerable property named key. hasOwnProperty alone could match
+// a non-enumerable property, so both checks are needed to prove the key sets equal.
+fun has_enumerable(ctx: ptr<u8>, run: ptr<DeepRun>, owner: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var arguments: array<ptr<u8>, 1> = [key];
+    var owned: ptr<u8> = call(ctx, intrinsic(run, FN_HAS_OWN), owner, 1, &arguments[0], ex);
+    if (deref ex != null || !truth(ctx, owned)) {
+        return false;
+    }
+    var enumerable: ptr<u8> = call(ctx, intrinsic(run, FN_IS_ENUMERABLE), owner, 1, &arguments[0], ex);
+    return deref ex == null && truth(ctx, enumerable);
+}
+
+fun compare_keys(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var keys_a: ptr<u8> = unary(ctx, run, FN_KEYS, a, ex);
+    if (deref ex != null) {
+        return false;
+    }
+    protect(ctx, keys_a);
+    var keys_b: ptr<u8> = unary(ctx, run, FN_KEYS, b, ex);
+    var result: bool = deref ex == null;
+    if (result) {
+        protect(ctx, keys_b);
+        var count: i64 = length(ctx, keys_a, ex);
+        result = deref ex == null && count == length(ctx, keys_b, ex);
+        for (var i: i64 = 0; result && deref ex == null && i < count; i++) {
+            var key: ptr<u8> = at(ctx, keys_a, i, ex);
+            result = deref ex == null && has_enumerable(ctx, run, b, key, ex);
+            if (result) {
+                result = compare_property(ctx, run, depth, a, b, key, ex);
+            }
+        }
+        unprotect(ctx, keys_b);
+    }
+    unprotect(ctx, keys_a);
+    return result;
+}
+
+// Unordered Map/Set comparison: each entry of a must match a distinct entry of b.
+// Quadratic, but bounded by DEEP_STEP_LIMIT through the nested deep() calls.
+fun compare_collection(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: ptr<u8>, is_map: bool,
+    ex: ptr<ptr<u8>>) -> bool {
+    var items_a: ptr<u8> = unary(ctx, run, FN_FROM, a, ex);
+    if (deref ex != null) {
+        return false;
+    }
+    protect(ctx, items_a);
+    var items_b: ptr<u8> = unary(ctx, run, FN_FROM, b, ex);
+    var result: bool = deref ex == null;
+    if (result) {
+        protect(ctx, items_b);
+        var count: i64 = length(ctx, items_a, ex);
+        result = deref ex == null && count == length(ctx, items_b, ex);
+        var used: ptr<u8> = null;
+        if (result && count > 0) {
+            used = mem_alloc_zeroed(count);
+            result = used != null;
+        }
+        for (var i: i64 = 0; result && deref ex == null && i < count; i++) {
+            var found: bool = false;
+            var left: ptr<u8> = at(ctx, items_a, i, ex);
+            for (var j: i64 = 0; !found && deref ex == null && j < count; j++) {
+                if (used[j] == 0) {
+                    var right: ptr<u8> = at(ctx, items_b, j, ex);
+                    found = deref ex == null && entries_equal(ctx, run, depth, left, right, is_map, ex);
+                    if (found) {
+                        used[j] = 1;
+                    }
+                }
+            }
+            result = found;
+        }
+        if (used != null) {
+            mem_free(used, count);
+        }
+        unprotect(ctx, items_b);
+    }
+    unprotect(ctx, items_a);
+    return result;
+}
+
+// A Set element compares directly; a Map entry is a [key, value] pair.
+fun entries_equal(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, left: ptr<u8>, right: ptr<u8>, is_map: bool,
+    ex: ptr<ptr<u8>>) -> bool {
+    if (!is_map) {
+        return deep(ctx, run, depth + 1, left, right, ex);
+    }
+    var key_left: ptr<u8> = at(ctx, left, 0, ex);
+    var key_right: ptr<u8> = at(ctx, right, 0, ex);
+    if (deref ex != null || !deep(ctx, run, depth + 1, key_left, key_right, ex)) {
+        return false;
+    }
+    var value_left: ptr<u8> = at(ctx, left, 1, ex);
+    var value_right: ptr<u8> = at(ctx, right, 1, ex);
+    return deref ex == null && deep(ctx, run, depth + 1, value_left, value_right, ex);
+}
+
+fun compare_buffers(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var arguments_a: array<ptr<u8>, 1> = [a];
+    var view_a: ptr<u8> = construct(ctx, intrinsic(run, FN_UINT8_ARRAY), 1, &arguments_a[0], ex);
+    if (deref ex != null) {
+        return false;
+    }
+    protect(ctx, view_a);
+    var arguments_b: array<ptr<u8>, 1> = [b];
+    var view_b: ptr<u8> = construct(ctx, intrinsic(run, FN_UINT8_ARRAY), 1, &arguments_b[0], ex);
+    var result: bool = false;
+    if (deref ex == null) {
+        protect(ctx, view_b);
+        result = compare_keys(ctx, run, depth, view_a, view_b, ex);
+        unprotect(ctx, view_b);
+    }
+    unprotect(ctx, view_a);
+    return result;
+}
+
+fun named_property_equal(ctx: ptr<u8>, run: ptr<DeepRun>, a: ptr<u8>, b: ptr<u8>, name: str,
+    ex: ptr<ptr<u8>>) -> bool {
+    var left: ptr<u8> = get(ctx, a, name, ex);
+    if (deref ex != null) {
+        return false;
+    }
+    protect(ctx, left);
+    var right: ptr<u8> = get(ctx, b, name, ex);
+    var result: bool = deref ex == null && same(ctx, run, left, right, ex);
+    unprotect(ctx, left);
+    return result;
+}
+
+// Tag-specific content first, then the enumerable own properties shared by all objects.
+fun compare_contents(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: ptr<u8>, code: i64,
+    ex: ptr<ptr<u8>>) -> bool {
+    if (code == TAG_OPAQUE) {
+        return false;
+    }
+    if (code == TAG_DATE && !same_result(ctx, run, FN_DATE_TIME, a, b, ex)) {
+        return false;
+    }
+    if (code == TAG_REGEXP) {
+        if (!same_result(ctx, run, FN_REGEXP_TEXT, a, b, ex) || !named_property_equal(ctx, run, a, b, "lastIndex", ex)) {
+            return false;
+        }
+    }
+    if (code == TAG_NUMBER && !same_result(ctx, run, FN_NUMBER_VALUE, a, b, ex)) {
+        return false;
+    }
+    if (code == TAG_STRING && !same_result(ctx, run, FN_STRING_VALUE, a, b, ex)) {
+        return false;
+    }
+    if (code == TAG_BOOLEAN && !same_result(ctx, run, FN_BOOLEAN_VALUE, a, b, ex)) {
+        return false;
+    }
+    if (code == TAG_BIGINT && !same_result(ctx, run, FN_BIGINT_VALUE, a, b, ex)) {
+        return false;
+    }
+    if (code == TAG_SYMBOL && !same_result(ctx, run, FN_SYMBOL_VALUE, a, b, ex)) {
+        return false;
+    }
+    if (deref ex != null) {
+        return false;
+    }
+    if (code == TAG_ERROR) {
+        if (!named_property_equal(ctx, run, a, b, "message", ex) || !named_property_equal(ctx, run, a, b, "name", ex)) {
+            return false;
+        }
+    }
+    if (code == TAG_MAP || code == TAG_SET) {
+        if (!compare_collection(ctx, run, depth, a, b, code == TAG_MAP, ex)) {
+            return false;
+        }
+    }
+    if (code == TAG_ARRAY_BUFFER) {
+        return compare_buffers(ctx, run, depth, a, b, ex);
+    }
+    return deref ex == null && compare_keys(ctx, run, depth, a, b, ex);
+}
+
+fun deep(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    deref run.steps += 1;
+    if (depth >= DEEP_DEPTH_LIMIT || deref run.steps > DEEP_STEP_LIMIT) {
+        fail(ctx, ex, ERROR_RANGE, "deep comparison depth or size limit exceeded");
+        return false;
+    }
+    if (same(ctx, run, a, b, ex)) {
+        return true;
+    }
+    // Primitives that are not Object.is-equal, and functions that are not identical,
+    // never match. Two different object kinds cannot match either.
+    if (deref ex != null || kind(ctx, a) != TYPE_OBJECT || kind(ctx, b) != TYPE_OBJECT) {
+        return false;
+    }
+    if (callable(ctx, a) || callable(ctx, b)) {
+        return false;
+    }
+    if (on_path(ctx, run, depth, a, b)) {
+        return true;
+    }
+    var proto_a: ptr<u8> = unary(ctx, run, FN_GET_PROTOTYPE, a, ex);
+    if (deref ex != null) {
+        return false;
+    }
+    protect(ctx, proto_a);
+    var proto_b: ptr<u8> = unary(ctx, run, FN_GET_PROTOTYPE, b, ex);
+    var result: bool = deref ex == null && same(ctx, run, proto_a, proto_b, ex);
+    unprotect(ctx, proto_a);
+    if (!result) {
+        return false;
+    }
+    var tag_a: ptr<u8> = method0(ctx, run, FN_TAG, a, ex);
+    if (deref ex != null) {
+        return false;
+    }
+    protect(ctx, tag_a);
+    var tag_b: ptr<u8> = method0(ctx, run, FN_TAG, b, ex);
+    result = deref ex == null && same(ctx, run, tag_a, tag_b, ex);
+    var code: i64 = TAG_PLAIN;
+    if (result) {
+        code = tag_code(ctx, tag_a, ex);
+    }
+    unprotect(ctx, tag_a);
+    if (!result || deref ex != null) {
+        return false;
+    }
+    (deref run.path_a)[depth] = a;
+    (deref run.path_b)[depth] = b;
+    result = compare_contents(ctx, run, depth, a, b, code, ex);
+    (deref run.path_a)[depth] = null;
+    (deref run.path_b)[depth] = null;
+    return result;
+}
+
+// Entry point. Returns false on mismatch or when ex was set by a throwing getter or
+// by the comparison limits; callers must check ex first.
+pub fun deep_equal(ctx: ptr<u8>, table: ptr<DeepIntrinsics>, a: ptr<u8>, b: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var run: DeepRun;
+    deref run.intrinsics = table;
+    deref run.steps = 0;
+    for (var i: i64 = 0; i < DEEP_DEPTH_LIMIT; i++) {
+        (deref run.path_a)[i] = null;
+        (deref run.path_b)[i] = null;
+    }
+    return deep(ctx, &run, 0, a, b, ex);
+}

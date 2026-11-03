@@ -1,7 +1,9 @@
 // Bounded default querystring.parse policy, sharing Wave's form decoder.
-import("./url_params")::{parse_pairs};
+import("./url_params")::{parse_pairs, pair, serialize_query_pairs};
 import("./values")::{plain, text, define_key, define, fail};
-import("./collections")::{length, at};
+import("./collections")::{length, at, list, append};
+import("./config")::{URL_PAIR_LIMIT};
+import("./http_values")::{http_keys};
 import("./http_values")::{http_native};
 extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
 extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
@@ -13,6 +15,15 @@ extern(c, "wr_string_release") fun release_string(value: ptr<u8>);
 extern(c, "wr_set_index") fun set_index(ctx: ptr<u8>, owner: ptr<u8>, index: u32, value: ptr<u8>, ex: ptr<ptr<u8>>);
 extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
 extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_string_value") fun string_value(ctx: ptr<u8>, value: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_to_number") fun to_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+
+// JSType codes returned by wr_type.
+const TYPE_BOOLEAN: i32 = 2;
+const TYPE_NUMBER: i32 = 3;
+const TYPE_STRING: i32 = 4;
+const TYPE_OBJECT: i32 = 5;
+const TYPE_BIGINT: i32 = 7;
 
 export(c) fun jsrt_query_parse(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64,
     args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
@@ -51,11 +62,89 @@ export(c) fun jsrt_query_parse(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count:
     return result;
 }
 
+// Node stringifyPrimitive: strings, finite numbers, bigints and booleans convert; anything
+// else becomes the empty string.
+fun primitive_text(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var value_type: i32 = kind(ctx, value);
+    var convertible: bool = value_type == TYPE_STRING || value_type == TYPE_BOOLEAN || value_type == TYPE_BIGINT;
+    if (value_type == TYPE_NUMBER) {
+        var number: f64 = to_number(ctx, value, ex);
+        convertible = number == number && number - number == 0.0;
+    }
+    if (!convertible || deref ex != null) {
+        return text(ctx, "");
+    }
+    var raw: ptr<u8> = to_string(ctx, value, ex);
+    if (raw == null || deref ex != null) {
+        return text(ctx, "");
+    }
+    var result: ptr<u8> = string_value(ctx, raw);
+    release_string(raw);
+    return result;
+}
+
+fun add_entry(ctx: ptr<u8>, entries: ptr<u8>, name: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (length(ctx, entries, ex) >= URL_PAIR_LIMIT) {
+        fail(ctx, ex, 2, "querystring.stringify pair limit exceeded");
+        return;
+    }
+    var converted: ptr<u8> = primitive_text(ctx, value, ex);
+    protect(ctx, converted);
+    append(ctx, entries, pair(ctx, name, converted, ex), ex);
+    unprotect(ctx, converted);
+}
+
+// Default separators only, like parse. Bounded by the shared URL pair and byte limits.
+export(c) fun jsrt_query_stringify(ctx: ptr<u8>, fn: ptr<u8>, owner: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0 || kind(ctx, args[0]) != TYPE_OBJECT) {
+        return text(ctx, "");
+    }
+    if (count > 1) {
+        fail(ctx, ex, 1, "querystring.stringify supports the default separators only");
+        return undefined(ctx);
+    }
+    var source: ptr<u8> = args[0];
+    var entries: ptr<u8> = list(ctx, ex);
+    protect(ctx, entries);
+    var keys: ptr<u8> = http_keys(ctx, source, ex);
+    protect(ctx, keys);
+    for (var i: i64 = 0; i < length(ctx, keys, ex) && deref ex == null; i++) {
+        var name: ptr<u8> = at(ctx, keys, i, ex);
+        protect(ctx, name);
+        var raw_name: ptr<u8> = to_string(ctx, name, ex);
+        var value: ptr<u8> = undefined(ctx);
+        if (raw_name != null && deref ex == null) {
+            value = get_key(ctx, source, raw_name, ex);
+            release_string(raw_name);
+        }
+        if (deref ex == null && is_array(ctx, value)) {
+            protect(ctx, value);
+            for (var j: i64 = 0; j < length(ctx, value, ex) && deref ex == null; j++) {
+                add_entry(ctx, entries, name, at(ctx, value, j, ex), ex);
+            }
+            unprotect(ctx, value);
+        } else if (deref ex == null) {
+            add_entry(ctx, entries, name, value, ex);
+        }
+        unprotect(ctx, name);
+    }
+    var result: ptr<u8> = undefined(ctx);
+    if (deref ex == null) {
+        result = serialize_query_pairs(ctx, entries, ex);
+    }
+    unprotect(ctx, keys);
+    unprotect(ctx, entries);
+    return result;
+}
+
 pub fun querystring_module(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
     var result: ptr<u8> = plain(ctx);
     protect(ctx, result);
     define(ctx, result, "parse", http_native(ctx, "parse", 17), ex, true);
     define(ctx, result, "decode", http_native(ctx, "decode", 17), ex, true);
+    define(ctx, result, "stringify", http_native(ctx, "stringify", 25), ex, true);
+    define(ctx, result, "encode", http_native(ctx, "encode", 25), ex, true);
     unprotect(ctx, result);
     return result;
 }

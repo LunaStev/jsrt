@@ -1,5 +1,18 @@
 # 다음 대화 시작점
 
+## 코어 API 4종 추가와 2시간 soak — 2026-11-03 (Asia/Seoul)
+
+사용자가 남은 항목을 모두 만든 뒤 2시간 검증을 요청했다. querystring.stringify/encode, process.chdir,
+assert.deepStrictEqual/notDeepStrictEqual(deepEqual은 엄격 별칭), timers/promises(setTimeout·setImmediate·
+scheduler.wait/yield, 옵션은 거부)를 추가했다. 계약은 docs/compatibility.md, 회귀는 tests/core_modules.js.
+
+- build **1060/0/0** 통과 후 새 runtime 게시, SHA-256 ****. 독립 test·test-npm·release는 이번에 다시 실행하지 않았다.
+- 2시간 soak(7200초) **PASS, exit 0**: 60354 batches·241416 lanes·7910719488바이트·385912 Worker·96478 abort.
+  RSS KiB warm/peak/end 54696/57924/51444, FD 최대 36, thread 최대 17. 최대 지연 **7409 ms**(이전 60초 부하 4922 ms),
+  250 ms 초과 lane 11757개(4.9%). 지연은 SLO가 아니다. 24시간 부하는 아니다.
+- 정정: ESM은 이미 구현돼 있다(esm.wave). inspect의 Proxy 대상·Promise 상태·WeakMap 내용은 엔진 패치/재빌드가 필요해 미구현.
+- 미수행: 커밋, target/ 정리(허락 필요), 원격 CI/VM, 운영 서명, 공개 업로드, 새 release archive.
+
 ## 전체 검토·검증과 최신 release — 2026-11-02 (Asia/Seoul)
 
 사용자가 전체 검토와 검증을 요청했다. 정적 검사·1058/0/0 회귀(build·독립 test·npm)·Valgrind·Node 대조가

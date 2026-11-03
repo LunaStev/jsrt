@@ -235,6 +235,7 @@ extern JSValue jsrt_read_file(const void *, void *, void *, size_t, const JSValu
 extern JSValue jsrt_write_file(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 extern JSValue jsrt_exit_get(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 extern JSValue jsrt_exit_set(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+extern JSValue jsrt_chdir(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 JSCallback jsrt_system_callback(int32_t kind) {
     switch (kind) {
     case 0:
@@ -247,6 +248,8 @@ JSCallback jsrt_system_callback(int32_t kind) {
         return jsrt_exit_get;
     case 4:
         return jsrt_exit_set;
+    case 5:
+        return jsrt_chdir;
     default:
         return NULL;
     }
@@ -546,6 +549,11 @@ JSCallback jsrt_extras_callback(void) {
 extern JSValue jsrt_callbacks_api(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 JSCallback jsrt_callbacks_callback(void) {
     return jsrt_callbacks_api;
+}
+extern JSValue jsrt_timers_promises_api(const void *, void *, void *, size_t, const JSValue *,
+                                         JSValue *);
+JSCallback jsrt_timers_promises_callback(void) {
+    return jsrt_timers_promises_api;
 }
 extern JSValue jsrt_assert_api(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 JSCallback jsrt_assert_callback(void) {
