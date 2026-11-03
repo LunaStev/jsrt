@@ -39,6 +39,7 @@ import("./collections")::{bind_one, flag, set_flag, weak_map, weak_get, weak_set
 import("./output")::{write_text, print_value};
 import("./assert_deep")::{DeepIntrinsics, deep_install, deep_release, deep_equal};
 import("./buffer_core")::{is_byte_view};
+import("./byte_codec")::{encode_bytes};
 import("./config")::{ARGUMENT_LIMIT};
 import("./format")::{format_to_value, inspect_to_value};
 import("./inspect_engine")::{set_inspect_function, inspect_intrinsic, INSPECT_CUSTOM};
@@ -57,6 +58,8 @@ extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, coun
     ex: ptr<ptr<u8>>) -> ptr<u8>;
 extern(c, "wr_promise") fun promise(ctx: ptr<u8>, resolve: ptr<ptr<u8>>, reject: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
 extern(c, "jsrt_util_callback") fun callback() -> ptr<u8>;
+extern(c, "jsrt_util_type_callback") fun type_callback() -> ptr<u8>;
+extern(c, "wr_typed_type") fun typed_type(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i32;
 extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
 
 fun format_result(ctx: ptr<u8>, value: ptr<u8>) -> ptr<u8> {
@@ -306,6 +309,70 @@ export(c) fun jsrt_util_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count:
     return result;
 }
 
+
+// util.types checks backed by the engine's own brand (JSTypedArrayType), so a forged
+// Symbol.toStringTag cannot fool them. Codes: Int8 0, Int16 1, Int32 2, Uint8 3, Uint8Clamped 4,
+// Uint16 5, Uint32 6, Float32 7, Float64 8, ArrayBuffer 9, none 10, BigInt64 11, BigUint64 12.
+const TYPED_ARRAY_NONE: i32 = 10;
+const TYPED_ARRAY_BUFFER: i32 = 9;
+
+// Name -> engine typed array code, or -1 for the generic checks handled by name below.
+fun typed_code_for(name: str) -> i32 {
+    var names: array<str, 11> = ["isInt8Array", "isInt16Array", "isInt32Array", "isUint8Array",
+        "isUint8ClampedArray", "isUint16Array", "isUint32Array", "isFloat32Array", "isFloat64Array",
+        "isBigInt64Array", "isBigUint64Array"];
+    var codes: array<i32, 11> = [0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12];
+    for (var i: i64 = 0; i < 11; i++) {
+        if (same_name(name, names[i])) {
+            return codes[i];
+        }
+    }
+    return -1;
+}
+
+fun same_name(a: str, b: str) -> bool {
+    var left: ptr<u8> = a as ptr<u8>;
+    var right: ptr<u8> = b as ptr<u8>;
+    var i: i64 = 0;
+    while (left[i] != 0 && right[i] != 0) {
+        if (left[i] != right[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return left[i] == right[i];
+}
+
+// One callback serves every typed check; the function object's name picks the check.
+export(c) fun jsrt_util_type_check(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0 || kind(ctx, args[0]) != 5) {
+        return boolean(ctx, false);
+    }
+    var label: ptr<u8> = get(ctx, fn, "name", ex);
+    var buffer: array<u8, 64>;
+    var length: i64 = 0;
+    if (deref ex == null && kind(ctx, label) == 4) {
+        length = encode_bytes(ctx, label, 0, &buffer[0], 63, ex);
+    }
+    if (length <= 0 || deref ex != null) {
+        return boolean(ctx, false);
+    }
+    buffer[length] = 0;
+    var name: str = &buffer[0] as str;
+    var actual: i32 = typed_type(ctx, args[0], ex);
+    if (deref ex != null) {
+        return boolean(ctx, false);
+    }
+    if (same_name(name, "isTypedArray")) {
+        return boolean(ctx, actual != TYPED_ARRAY_NONE && actual != TYPED_ARRAY_BUFFER);
+    }
+    if (same_name(name, "isArrayBuffer") || same_name(name, "isAnyArrayBuffer")) {
+        return boolean(ctx, actual == TYPED_ARRAY_BUFFER);
+    }
+    var expected: i32 = typed_code_for(name);
+    return boolean(ctx, expected >= 0 && actual == expected);
+}
 pub fun install_util(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     var host_state: ptr<UtilState> = util_storage(ctx);
     deref host_state.set_prototype_fn = capture(ctx, get(ctx, global(ctx), "Reflect", ex), "setPrototypeOf", ex);
@@ -350,6 +417,15 @@ pub fun install_util(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     var types: ptr<u8> = plain(ctx);
     protect(ctx, types);
     define(ctx, types, "isUint8Array", (deref host_state.methods)[3], ex, false);
+    // The remaining brand-based checks share one native callback and are told apart by name.
+    var check_names: array<str, 13> = ["isTypedArray", "isArrayBuffer", "isAnyArrayBuffer", "isInt8Array",
+        "isInt16Array", "isInt32Array", "isUint8ClampedArray", "isUint16Array", "isUint32Array",
+        "isFloat32Array", "isFloat64Array", "isBigInt64Array", "isBigUint64Array"];
+    for (var i: i64 = 0; i < 13; i++) {
+        var check_name: ptr<u8> = utf8(check_names[i]);
+        define(ctx, types, check_names[i], function(ctx, check_name, type_callback()), ex, false);
+        release(check_name);
+    }
     define(ctx, (deref host_state.exports), "types", types, ex, false);
     unprotect(ctx, types);
     return deref ex == null;

@@ -571,6 +571,10 @@ extern JSValue jsrt_util_api(const void *, void *, void *, size_t, const JSValue
 JSCallback jsrt_util_callback(void) {
     return jsrt_util_api;
 }
+extern JSValue jsrt_util_type_check(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+JSCallback jsrt_util_type_callback(void) {
+    return jsrt_util_type_check;
+}
 extern JSValue jsrt_extras_api(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 JSCallback jsrt_extras_callback(void) {
     return jsrt_extras_api;
