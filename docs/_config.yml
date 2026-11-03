@@ -4,6 +4,7 @@ url: https://potatosl.github.io
 baseurl: /jsrt
 lang: en
 theme: just-the-docs
+color_scheme: jsrt-light
 
 permalink: pretty
 search_enabled: true
