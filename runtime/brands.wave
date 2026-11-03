@@ -1,0 +1,134 @@
+// Engine-backed brand checks shared by structuredClone and util.types.
+//
+// JavaScriptCore's C API only exposes brands for typed arrays, arrays and dates. Everything else is
+// told apart here by calling an intrinsic that throws a TypeError on any other receiver (for
+// example the Map.prototype.size getter), or, for errors, the engine's own Error.isError. Both are
+// captured before user code runs, so replacing Map.prototype or forging Symbol.toStringTag cannot
+// change the answer. A thrown TypeError means "not that kind"; the exception is discarded here.
+import("./context_state")::{owned_context_slot, release_context_slot, BRANDS_SLOT};
+import("./values")::{get, capture};
+import("./inspect_engine")::{capture_getter};
+import("std::mem::layout")::{size_of};
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+
+const TYPE_OBJECT: i32 = 5;
+
+// Indexes into BrandState.checks.
+const CHECK_MAP: i64 = 0;
+const CHECK_SET: i64 = 1;
+const CHECK_WEAK_MAP: i64 = 2;
+const CHECK_WEAK_SET: i64 = 3;
+const CHECK_REGEXP: i64 = 4;
+const CHECK_PROMISE: i64 = 5;
+const CHECK_ERROR: i64 = 6;
+const CHECK_COUNT: i64 = 7;
+
+struct BrandState {
+    checks: array<ptr<u8>, 7>;
+}
+
+fun storage(ctx: ptr<u8>) -> ptr<BrandState> {
+    return owned_context_slot(ctx, BRANDS_SLOT, size_of<BrandState>() as i64) as ptr<BrandState>;
+}
+
+// Calls checks[index] with `value` as the receiver. getter_style checks (size, source) take no
+// argument; method-style checks (has, then) take one throwaway argument.
+fun passes(ctx: ptr<u8>, index: i64, value: ptr<u8>, argument: bool) -> bool {
+    if (kind(ctx, value) != TYPE_OBJECT) {
+        return false;
+    }
+    var state: ptr<BrandState> = storage(ctx);
+    var check: ptr<u8> = (deref state.checks)[index];
+    if (check == null) {
+        return false;
+    }
+    var discarded: ptr<u8> = null;
+    var count: i64 = 0;
+    var probe: array<ptr<u8>, 1> = [value];
+    if (argument) {
+        count = 1;
+    }
+    call(ctx, check, value, count, &probe[0], &discarded);
+    return discarded == null;
+}
+
+pub fun is_map(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    return passes(ctx, CHECK_MAP, value, false);
+}
+
+pub fun is_set(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    return passes(ctx, CHECK_SET, value, false);
+}
+
+pub fun is_weak_map(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    return passes(ctx, CHECK_WEAK_MAP, value, true);
+}
+
+pub fun is_weak_set(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    return passes(ctx, CHECK_WEAK_SET, value, true);
+}
+
+pub fun is_regexp(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    return passes(ctx, CHECK_REGEXP, value, false);
+}
+
+// Promise.prototype.then returns a new Promise, so it is only used for its brand check; calling it
+// without a callback has no observable effect beyond the derived promise it returns.
+pub fun is_promise(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    return passes(ctx, CHECK_PROMISE, value, false);
+}
+
+// Error.isError is the engine's brand check: it accepts real error objects (including subclasses)
+// and rejects Object.create(Error.prototype) and objects that only claim the Error tag.
+pub fun is_native_error(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    if (kind(ctx, value) != TYPE_OBJECT) {
+        return false;
+    }
+    var state: ptr<BrandState> = storage(ctx);
+    var check: ptr<u8> = (deref state.checks)[CHECK_ERROR];
+    if (check == null) {
+        return false;
+    }
+    var discarded: ptr<u8> = null;
+    var argument: array<ptr<u8>, 1> = [value];
+    var answer: ptr<u8> = call(ctx, check, null, 1, &argument[0], &discarded);
+    return discarded == null && answer != null && truth(ctx, answer);
+}
+
+pub fun install_brands(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var state: ptr<BrandState> = storage(ctx);
+    var root: ptr<u8> = global(ctx);
+    (deref state.checks)[CHECK_MAP] = capture_getter(ctx, "Map", "size", ex);
+    (deref state.checks)[CHECK_SET] = capture_getter(ctx, "Set", "size", ex);
+    (deref state.checks)[CHECK_REGEXP] = capture_getter(ctx, "RegExp", "source", ex);
+    (deref state.checks)[CHECK_WEAK_MAP] = capture(ctx, get(ctx, get(ctx, root, "WeakMap", ex), "prototype", ex), "has", ex);
+    (deref state.checks)[CHECK_WEAK_SET] = capture(ctx, get(ctx, get(ctx, root, "WeakSet", ex), "prototype", ex), "has", ex);
+    (deref state.checks)[CHECK_PROMISE] = capture(ctx, get(ctx, get(ctx, root, "Promise", ex), "prototype", ex), "then", ex);
+    (deref state.checks)[CHECK_ERROR] = capture(ctx, get(ctx, root, "Error", ex), "isError", ex);
+    for (var i: i64 = 0; i < CHECK_COUNT; i++) {
+        if ((deref state.checks)[i] != null) {
+            protect(ctx, (deref state.checks)[i]);
+        }
+    }
+    return deref ex == null;
+}
+
+pub fun shutdown_brands(ctx: ptr<u8>) {
+    var state: ptr<BrandState> = storage(ctx);
+    if (state == null) {
+        return;
+    }
+    for (var i: i64 = 0; i < CHECK_COUNT; i++) {
+        if ((deref state.checks)[i] != null) {
+            unprotect(ctx, (deref state.checks)[i]);
+            (deref state.checks)[i] = null;
+        }
+    }
+    release_context_slot(ctx, BRANDS_SLOT, size_of<BrandState>() as i64);
+}

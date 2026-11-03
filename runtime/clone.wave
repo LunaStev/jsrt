@@ -3,6 +3,7 @@
 import("./config")::{CLONE_NODE_LIMIT, CLONE_BYTE_LIMIT, CLONE_DEPTH_LIMIT};
 import("./context_state")::{context_slot, allocate_context_slot, release_context_slot};
 import("./values")::{get, text, capture, define, define_key, fail};
+import("./brands")::{is_map, is_set, is_regexp, is_native_error, is_weak_map, is_weak_set, is_promise};
 import("./collections")::{length, at};
 import("./buffer_core")::{copy_byte_view};
 import("std::mem::alloc")::{mem_alloc_zeroed, mem_alloc, mem_free};
@@ -50,11 +51,41 @@ const RECORD: i32 = 5;
 const ARRAY: i32 = 8;
 const BYTES: i32 = 9;
 const DATE: i32 = 10;
+// Node tags for the structured clone extensions. Children hang off edges as (key, value) pairs:
+// MAP uses (key, value), SET uses (element, element), REGEXP uses (source, flags) strings, ERROR
+// uses (name, message[, cause]) pairs and BOXED uses one (primitive, primitive) pair whose kind is
+// kept in node.value (BOXED_NUMBER..BOXED_BIGINT).
+const MAP: i32 = 11;
+const SET: i32 = 12;
+const REGEXP: i32 = 13;
+const ERROR: i32 = 14;
+const BOXED: i32 = 15;
+const BOXED_NUMBER: f64 = 0.0;
+const BOXED_STRING: f64 = 1.0;
+const BOXED_BOOLEAN: f64 = 2.0;
+const BOXED_BIGINT: f64 = 3.0;
 // roots[8] is Object.prototype.hasOwnProperty, used to skip keys an earlier getter deleted.
 const ROOT_HAS_OWN: i64 = 8;
-const ROOT_COUNT: i64 = 9;
+// roots 9.. capture the intrinsics the new tags need: Map entries, Set values, Array.from, the
+// RegExp constructor, the primitive wrappers' valueOf and the standard error constructors.
+const ROOT_MAP_ENTRIES: i64 = 9;
+const ROOT_SET_VALUES: i64 = 10;
+const ROOT_ARRAY_FROM: i64 = 11;
+const ROOT_MAP_CTOR: i64 = 12;
+const ROOT_SET_CTOR: i64 = 13;
+const ROOT_REGEXP_CTOR: i64 = 14;
+const ROOT_NUMBER_VALUE: i64 = 15;
+const ROOT_STRING_VALUE: i64 = 16;
+const ROOT_BOOLEAN_VALUE: i64 = 17;
+const ROOT_BIGINT_VALUE: i64 = 18;
+const ROOT_ERROR_CTORS: i64 = 19;
+const ROOT_SYMBOL_VALUE: i64 = 26;
+const ROOT_MAP_SET: i64 = 27;
+const ROOT_SET_ADD: i64 = 28;
+const ERROR_CTOR_COUNT: i64 = 7;
+const ROOT_COUNT: i64 = 29;
 struct CloneState {
-    roots: array<ptr<u8>, 9>;
+    roots: array<ptr<u8>, 29>;
 }
 pub struct CloneNode {
     tag: i32;
@@ -176,6 +207,194 @@ fun visit(ctx: ptr<u8>, walk: ptr<Walk>, value: ptr<u8>, depth: i64,
     }
     return index;
 }
+// Adds one (key, value) child pair to node's edge list, growing it by one slot. The edge array is
+// owned by the node and freed through capacity in free_clone.
+fun add_edge(ctx: ptr<u8>, walk: ptr<Walk>, node: ptr<CloneNode>, key_value: ptr<u8>, item: ptr<u8>, depth: i64,
+    ex: ptr<ptr<u8>>) {
+    var key_index: i64 = visit(ctx, walk, key_value, depth + 1, ex);
+    if (deref ex != null) {
+        return;
+    }
+    var item_index: i64 = visit(ctx, walk, item, depth + 1, ex);
+    if (deref ex != null) {
+        return;
+    }
+    if (deref node.count >= deref node.capacity) {
+        var grown: i64 = deref node.capacity * 2;
+        if (grown < 4) {
+            grown = 4;
+        }
+        if (grown > CLONE_NODE_LIMIT) {
+            clone_failure(ctx, ex, "clone property limit exceeded");
+            return;
+        }
+        var edges: ptr<i64> = mem_alloc_zeroed(grown * 16) as ptr<i64>;
+        if (edges == null) {
+            clone_failure(ctx, ex, "cannot allocate clone properties");
+            return;
+        }
+        if (deref node.edges != null) {
+            mem_copy(edges as ptr<u8>, deref node.edges as ptr<u8>, deref node.count * 16);
+            mem_free(deref node.edges as ptr<u8>, deref node.capacity * 16);
+        }
+        deref node.edges = edges;
+        deref node.capacity = grown;
+    }
+    (deref node.edges)[deref node.count * 2] = key_index;
+    (deref node.edges)[deref node.count * 2 + 1] = item_index;
+    deref node.count += 1;
+}
+
+// Reads a string property through the engine's own getter chain (source, flags, message, name).
+fun string_property(ctx: ptr<u8>, value: ptr<u8>, name: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var content: ptr<u8> = get(ctx, value, name, ex);
+    if (deref ex != null || kind(ctx, content) != 4) {
+        return text(ctx, "");
+    }
+    return content;
+}
+
+// Snapshots a Map: (key, value) pairs from the captured Map.prototype.entries, so an overridden
+// Symbol.iterator on the instance cannot change what is cloned.
+fun visit_map(ctx: ptr<u8>, walk: ptr<Walk>, node: ptr<CloneNode>, value: ptr<u8>, depth: i64, ex: ptr<ptr<u8>>) {
+    var state: ptr<CloneState> = storage(ctx);
+    deref node.tag = MAP;
+    var iterator: ptr<u8> = call(ctx, (deref state.roots)[ROOT_MAP_ENTRIES], value, 0, null, ex);
+    if (deref ex != null) {
+        return;
+    }
+    protect(ctx, iterator);
+    var args: array<ptr<u8>, 1> = [iterator];
+    var items: ptr<u8> = call(ctx, (deref state.roots)[ROOT_ARRAY_FROM], null, 1, &args[0], ex);
+    unprotect(ctx, iterator);
+    if (deref ex != null) {
+        return;
+    }
+    protect(ctx, items);
+    var total: i64 = length(ctx, items, ex);
+    for (var i: i64 = 0; i < total && deref ex == null; i++) {
+        var entry: ptr<u8> = at(ctx, items, i, ex);
+        var key: ptr<u8> = at(ctx, entry, 0, ex);
+        var item: ptr<u8> = at(ctx, entry, 1, ex);
+        if (deref ex == null) {
+            add_edge(ctx, walk, node, key, item, depth, ex);
+        }
+    }
+    unprotect(ctx, items);
+}
+
+fun visit_set(ctx: ptr<u8>, walk: ptr<Walk>, node: ptr<CloneNode>, value: ptr<u8>, depth: i64, ex: ptr<ptr<u8>>) {
+    var state: ptr<CloneState> = storage(ctx);
+    deref node.tag = SET;
+    var iterator: ptr<u8> = call(ctx, (deref state.roots)[ROOT_SET_VALUES], value, 0, null, ex);
+    if (deref ex != null) {
+        return;
+    }
+    protect(ctx, iterator);
+    var args: array<ptr<u8>, 1> = [iterator];
+    var items: ptr<u8> = call(ctx, (deref state.roots)[ROOT_ARRAY_FROM], null, 1, &args[0], ex);
+    unprotect(ctx, iterator);
+    if (deref ex != null) {
+        return;
+    }
+    protect(ctx, items);
+    var total: i64 = length(ctx, items, ex);
+    for (var i: i64 = 0; i < total && deref ex == null; i++) {
+        var item: ptr<u8> = at(ctx, items, i, ex);
+        if (deref ex == null) {
+            add_edge(ctx, walk, node, item, item, depth, ex);
+        }
+    }
+    unprotect(ctx, items);
+}
+
+// RegExp keeps only its source and flags; lastIndex is reset by the receiver, as in the standard.
+fun visit_regexp(ctx: ptr<u8>, walk: ptr<Walk>, node: ptr<CloneNode>, value: ptr<u8>, depth: i64, ex: ptr<ptr<u8>>) {
+    deref node.tag = REGEXP;
+    var source: ptr<u8> = string_property(ctx, value, "source", ex);
+    protect(ctx, source);
+    var flags: ptr<u8> = string_property(ctx, value, "flags", ex);
+    protect(ctx, flags);
+    if (deref ex == null) {
+        add_edge(ctx, walk, node, source, flags, depth, ex);
+    }
+    unprotect(ctx, flags);
+    unprotect(ctx, source);
+}
+
+// Errors keep name (only the standard names survive, others become "Error"), message and cause.
+// The stack is not cloned. Edge 0 is (name, message); an optional edge 1 is (cause, cause).
+fun visit_error(ctx: ptr<u8>, walk: ptr<Walk>, node: ptr<CloneNode>, value: ptr<u8>, depth: i64, ex: ptr<ptr<u8>>) {
+    deref node.tag = ERROR;
+    var name: ptr<u8> = string_property(ctx, value, "name", ex);
+    protect(ctx, name);
+    var message: ptr<u8> = string_property(ctx, value, "message", ex);
+    protect(ctx, message);
+    if (deref ex == null) {
+        add_edge(ctx, walk, node, name, message, depth, ex);
+    }
+    var has_cause: bool = false;
+    var cause: ptr<u8> = undefined(ctx);
+    if (deref ex == null) {
+        var state: ptr<CloneState> = storage(ctx);
+        var key: array<ptr<u8>, 1> = [text(ctx, "cause")];
+        protect(ctx, key[0]);
+        has_cause = truth(ctx, call(ctx, (deref state.roots)[ROOT_HAS_OWN], value, 1, &key[0], ex));
+        unprotect(ctx, key[0]);
+        if (deref ex == null && has_cause) {
+            cause = get(ctx, value, "cause", ex);
+        }
+    }
+    if (deref ex == null && has_cause) {
+        protect(ctx, cause);
+        add_edge(ctx, walk, node, cause, cause, depth, ex);
+        unprotect(ctx, cause);
+    }
+    unprotect(ctx, message);
+    unprotect(ctx, name);
+}
+// A boxed primitive is recognized by calling the captured X.prototype.valueOf on it: that throws a
+// TypeError for anything that is not a real wrapper object (including forged prototypes). On
+// success the primitive is cloned as the single child and node.value records which wrapper it was.
+fun unbox(ctx: ptr<u8>, value: ptr<u8>, root: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<CloneState> = storage(ctx);
+    var discarded: ptr<u8> = null;
+    var primitive: ptr<u8> = call(ctx, (deref state.roots)[root], value, 0, null, &discarded);
+    if (discarded != null || primitive == null) {
+        return null;
+    }
+    return primitive;
+}
+
+fun visit_boxed(ctx: ptr<u8>, walk: ptr<Walk>, node: ptr<CloneNode>, value: ptr<u8>, depth: i64,
+    ex: ptr<ptr<u8>>) -> bool {
+    var roots: array<i64, 4> = [ROOT_NUMBER_VALUE, ROOT_STRING_VALUE, ROOT_BOOLEAN_VALUE, ROOT_BIGINT_VALUE];
+    var kinds: array<f64, 4> = [BOXED_NUMBER, BOXED_STRING, BOXED_BOOLEAN, BOXED_BIGINT];
+    for (var i: i64 = 0; i < 4; i++) {
+        var primitive: ptr<u8> = unbox(ctx, value, roots[i], ex);
+        if (primitive != null) {
+            deref node.tag = BOXED;
+            deref node.value = kinds[i];
+            protect(ctx, primitive);
+            add_edge(ctx, walk, node, primitive, primitive, depth, ex);
+            unprotect(ctx, primitive);
+            return true;
+        }
+    }
+    return false;
+}
+
+// True when `prototype` is the named global's prototype object. A forged prototype can only make a
+// value look like a DataView, which makes it get rejected, never wrongly accepted.
+fun inherits_from_global(ctx: ptr<u8>, prototype: ptr<u8>, name: str, ex: ptr<ptr<u8>>) -> bool {
+    var constructor: ptr<u8> = get(ctx, global(ctx), name, ex);
+    if (deref ex != null || kind(ctx, constructor) != 5) {
+        return false;
+    }
+    var expected: ptr<u8> = get(ctx, constructor, "prototype", ex);
+    return deref ex == null && kind(ctx, expected) == 5 && equal(ctx, prototype, expected);
+}
+
 fun visit_object(ctx: ptr<u8>, walk: ptr<Walk>, node: ptr<CloneNode>, value: ptr<u8>, depth: i64,
     ex: ptr<ptr<u8>>) {
     var state: ptr<CloneState> = storage(ctx);
@@ -210,12 +429,53 @@ fun visit_object(ctx: ptr<u8>, walk: ptr<Walk>, node: ptr<CloneNode>, value: ptr
         }
         return;
     }
+    // Built-ins with internal state are recognized by engine-backed brand checks (brands.wave), never
+    // by Symbol.toStringTag. Uncloneable built-ins are rejected instead of silently becoming plain
+    // records. Anything else with a prototype, such as a class instance, is cloned as a plain record
+    // that keeps its own enumerable data properties.
+    if (is_map(ctx, value)) {
+        visit_map(ctx, walk, node, value, depth, ex);
+        return;
+    }
+    if (is_set(ctx, value)) {
+        visit_set(ctx, walk, node, value, depth, ex);
+        return;
+    }
+    if (is_regexp(ctx, value)) {
+        visit_regexp(ctx, walk, node, value, depth, ex);
+        return;
+    }
+    if (is_native_error(ctx, value)) {
+        visit_error(ctx, walk, node, value, depth, ex);
+        return;
+    }
+    if (is_weak_map(ctx, value) || is_weak_set(ctx, value) || is_promise(ctx, value)) {
+        clone_failure(ctx, ex, "WeakMap, WeakSet and Promise objects cannot be cloned");
+        return;
+    }
+    // Typed arrays other than Uint8Array, ArrayBuffer and DataView are not cloned yet. They must be
+    // rejected here: falling through would turn them into empty plain records.
+    if (view_kind != 10) {
+        clone_failure(ctx, ex, "ArrayBuffer and typed array views other than Uint8Array cannot be cloned yet");
+        return;
+    }
+    if (inherits_from_global(ctx, parent, "DataView", ex)) {
+        clone_failure(ctx, ex, "DataView objects cannot be cloned yet");
+        return;
+    }
+    if (visit_boxed(ctx, walk, node, value, depth, ex)) {
+        return;
+    }
+    if (deref ex != null) {
+        return;
+    }
+    if (unbox(ctx, value, ROOT_SYMBOL_VALUE, ex) != null) {
+        clone_failure(ctx, ex, "Symbol objects cannot be cloned");
+        return;
+    }
     if (is_array(ctx, value)) {
         deref node.tag = ARRAY;
         deref node.value = numeric(ctx, get(ctx, value, "length", ex), ex);
-    } else if (!equal(ctx, parent, (deref state.roots)[2]) && kind(ctx, parent) != 1) {
-        clone_failure(ctx, ex, "only plain records arrays Date and Uint8Array objects can be cloned");
-        return;
     }
     if (deref ex != null) {
         return;
@@ -293,6 +553,70 @@ pub fun snapshot_clone(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<Cl
     }
     return graph;
 }
+// Wraps a restored primitive in its wrapper object by calling the wrapper constructor as a function
+// through Object(value), which is exactly what new Number(1), new String("s") and so on produce.
+fun box_primitive(ctx: ptr<u8>, primitive: ptr<u8>, kind_code: f64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<CloneState> = storage(ctx);
+    var argument: array<ptr<u8>, 1> = [primitive];
+    var wrapper: ptr<u8> = get(ctx, global(ctx), "Object", ex);
+    if (deref ex != null) {
+        return null;
+    }
+    var result: ptr<u8> = call(ctx, wrapper, null, 1, &argument[0], ex);
+    if (deref ex != null) {
+        return null;
+    }
+    return result;
+}
+
+// Picks the standard error constructor matching the cloned name; any other name becomes Error.
+fun build_error(ctx: ptr<u8>, node: ptr<CloneNode>, refs: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<CloneState> = storage(ctx);
+    var name: ptr<u8> = refs[(deref node.edges)[0]];
+    var message: ptr<u8> = refs[(deref node.edges)[1]];
+    var names: array<str, 7> = ["Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError",
+        "URIError"];
+    var chosen: i64 = 0;
+    for (var i: i64 = 1; i < ERROR_CTOR_COUNT; i++) {
+        var candidate: ptr<u8> = text(ctx, names[i]);
+        protect(ctx, candidate);
+        if (equal(ctx, name, candidate)) {
+            chosen = i;
+        }
+        unprotect(ctx, candidate);
+    }
+    var arguments: array<ptr<u8>, 2> = [message, undefined(ctx)];
+    var count: i64 = 1;
+    var options: ptr<u8> = null;
+    if (deref node.count > 1) {
+        options = object(ctx, null, null);
+        protect(ctx, options);
+        define(ctx, options, "cause", refs[(deref node.edges)[2]], ex, true);
+        arguments[1] = options;
+        count = 2;
+    }
+    var result: ptr<u8> = construct(ctx, (deref state.roots)[ROOT_ERROR_CTORS + chosen], count, &arguments[0], ex);
+    if (options != null) {
+        unprotect(ctx, options);
+    }
+    if (deref ex != null) {
+        return null;
+    }
+    return result;
+}
+
+fun map_set(ctx: ptr<u8>, map: ptr<u8>, key: ptr<u8>, item: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var state: ptr<CloneState> = storage(ctx);
+    var pair: array<ptr<u8>, 2> = [key, item];
+    call(ctx, (deref state.roots)[ROOT_MAP_SET], map, 2, &pair[0], ex);
+}
+
+fun set_add(ctx: ptr<u8>, collection: ptr<u8>, item: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var state: ptr<CloneState> = storage(ctx);
+    var argument: array<ptr<u8>, 1> = [item];
+    call(ctx, (deref state.roots)[ROOT_SET_ADD], collection, 1, &argument[0], ex);
+}
+
 pub fun restore_clone(ctx: ptr<u8>, graph: ptr<CloneGraph>, ex: ptr<ptr<u8>>) -> ptr<u8> {
     var refs: ptr<ptr<u8>> = mem_alloc_zeroed(deref graph.count * 8) as ptr<ptr<u8>>;
     if (refs == null) {
@@ -324,6 +648,13 @@ pub fun restore_clone(ctx: ptr<u8>, graph: ptr<CloneGraph>, ex: ptr<ptr<u8>>) ->
             value = object(ctx, null, null);
         } else if (tag == ARRAY) {
             value = array(ctx, 0, null, ex);
+        } else if (tag == MAP) {
+            value = construct(ctx, (deref state.roots)[ROOT_MAP_CTOR], 0, null, ex);
+        } else if (tag == SET) {
+            value = construct(ctx, (deref state.roots)[ROOT_SET_CTOR], 0, null, ex);
+        } else if (tag == REGEXP || tag == ERROR || tag == BOXED) {
+            // Built in the reverse pass below, once every child value exists.
+            value = null;
         } else if (tag == DATE) {
             var arg: array<ptr<u8>, 1> = [number(ctx, deref node.value)];
             value = construct(ctx, (deref state.roots)[5], 1, &arg[0], ex);
@@ -343,12 +674,41 @@ pub fun restore_clone(ctx: ptr<u8>, graph: ptr<CloneGraph>, ex: ptr<ptr<u8>>) ->
             refs[i] = value;
         }
     }
+    // Reverse pass: RegExp, Error and boxed values are built from children that already exist.
+    // Children always have larger indexes than their parent, so walking backwards builds a child
+    // before any value that uses it.
+    for (var back: i64 = deref graph.count - 1; back >= 0 && deref ex == null; back--) {
+        var built: ptr<CloneNode> = deref graph.nodes + back;
+        var built_tag: i32 = deref built.tag;
+        var made: ptr<u8> = null;
+        if (built_tag == REGEXP && deref built.count > 0) {
+            var pattern: array<ptr<u8>, 2> = [refs[(deref built.edges)[0]], refs[(deref built.edges)[1]]];
+            made = construct(ctx, (deref state.roots)[ROOT_REGEXP_CTOR], 2, &pattern[0], ex);
+        } else if (built_tag == BOXED && deref built.count > 0) {
+            made = box_primitive(ctx, refs[(deref built.edges)[0]], deref built.value, ex);
+        } else if (built_tag == ERROR && deref built.count > 0) {
+            made = build_error(ctx, built, refs, ex);
+        }
+        if (made != null && deref ex == null) {
+            protect(ctx, made);
+            refs[back] = made;
+        }
+    }
     for (var i: i64 = 0; i < deref graph.count && deref ex == null; i++) {
         var node: ptr<CloneNode> = deref graph.nodes + i;
+        var fill_tag: i32 = deref node.tag;
         for (var j: i64 = 0; j < deref node.count && deref ex == null; j++) {
             var key: i64 = (deref node.edges)[j * 2];
             var value: i64 = (deref node.edges)[j * 2 + 1];
-            define_key(ctx, refs[i], refs[key], refs[value], ex, true);
+            if (fill_tag == MAP) {
+                // Map.prototype.set through the receiver's own prototype is avoided: the pair is
+                // added with the intrinsic captured at install time.
+                map_set(ctx, refs[i], refs[key], refs[value], ex);
+            } else if (fill_tag == SET) {
+                set_add(ctx, refs[i], refs[key], ex);
+            } else if (fill_tag != REGEXP && fill_tag != ERROR && fill_tag != BOXED) {
+                define_key(ctx, refs[i], refs[key], refs[value], ex, true);
+            }
         }
         if (deref node.tag == ARRAY && deref ex == null) {
             var key: ptr<u8> = utf8("length");
@@ -398,6 +758,27 @@ pub fun install_clone(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     (deref state.roots)[7] = capture(ctx, (deref state.roots)[5], "prototype", ex);
     (deref state.roots)[6] = capture(ctx, (deref state.roots)[7], "getTime", ex);
     (deref state.roots)[ROOT_HAS_OWN] = capture(ctx, (deref state.roots)[2], "hasOwnProperty", ex);
+    var root: ptr<u8> = global(ctx);
+    (deref state.roots)[ROOT_MAP_CTOR] = capture(ctx, root, "Map", ex);
+    (deref state.roots)[ROOT_SET_CTOR] = capture(ctx, root, "Set", ex);
+    (deref state.roots)[ROOT_REGEXP_CTOR] = capture(ctx, root, "RegExp", ex);
+    (deref state.roots)[ROOT_MAP_ENTRIES] = capture(ctx, get(ctx, (deref state.roots)[ROOT_MAP_CTOR], "prototype", ex),
+        "entries", ex);
+    (deref state.roots)[ROOT_SET_VALUES] = capture(ctx, get(ctx, (deref state.roots)[ROOT_SET_CTOR], "prototype", ex),
+        "values", ex);
+    (deref state.roots)[ROOT_ARRAY_FROM] = capture(ctx, arr, "from", ex);
+    (deref state.roots)[ROOT_MAP_SET] = capture(ctx, get(ctx, (deref state.roots)[ROOT_MAP_CTOR], "prototype", ex), "set", ex);
+    (deref state.roots)[ROOT_SET_ADD] = capture(ctx, get(ctx, (deref state.roots)[ROOT_SET_CTOR], "prototype", ex), "add", ex);
+    (deref state.roots)[ROOT_NUMBER_VALUE] = capture(ctx, get(ctx, get(ctx, root, "Number", ex), "prototype", ex), "valueOf", ex);
+    (deref state.roots)[ROOT_STRING_VALUE] = capture(ctx, get(ctx, get(ctx, root, "String", ex), "prototype", ex), "valueOf", ex);
+    (deref state.roots)[ROOT_BOOLEAN_VALUE] = capture(ctx, get(ctx, get(ctx, root, "Boolean", ex), "prototype", ex), "valueOf", ex);
+    (deref state.roots)[ROOT_BIGINT_VALUE] = capture(ctx, get(ctx, get(ctx, root, "BigInt", ex), "prototype", ex), "valueOf", ex);
+    (deref state.roots)[ROOT_SYMBOL_VALUE] = capture(ctx, get(ctx, get(ctx, root, "Symbol", ex), "prototype", ex), "valueOf", ex);
+    var error_names: array<str, 7> = ["Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError",
+        "URIError"];
+    for (var i: i64 = 0; i < ERROR_CTOR_COUNT; i++) {
+        (deref state.roots)[ROOT_ERROR_CTORS + i] = capture(ctx, root, error_names[i], ex);
+    }
     var name: ptr<u8> = utf8("structuredClone");
     var fn: ptr<u8> = function(ctx, name, clone_callback());
     release(name);

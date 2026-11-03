@@ -42,6 +42,7 @@ import("./text_codec")::{install_text_codec, shutdown_text_codec};
 import("./web_events")::{install_web_events, shutdown_web_events};
 import("./web_streams")::{install_web_streams, shutdown_web_streams};
 import("./clone")::{install_clone, shutdown_clone};
+import("./brands")::{install_brands, shutdown_brands};
 import("./workers")::{install_workers, shutdown_workers};
 import("./process_events")::{install_process_events, shutdown_process_events};
 import("./process_io")::{shutdown_process_io};
@@ -101,7 +102,7 @@ pub fun install_host(context: ptr<u8>, source_index: i32, eval_mode: bool, path:
     }
     install_next_ticks(context, exception);
     install_process_events(context, get(context, process_global(context), "process", exception), exception);
-    return deref exception == null && install_clone(context, exception) && install_esm(context, exception) &&
+    return deref exception == null && install_brands(context, exception) && install_clone(context, exception) && install_esm(context, exception) &&
         install_process_extras(context, exception) && finish_callbacks(context, exception);
 }
 
@@ -112,6 +113,7 @@ pub fun shutdown_host(context: ptr<u8>) -> bool {
     shutdown_callbacks(context);
     shutdown_esm(context);
     shutdown_clone(context);
+    shutdown_brands(context);
     shutdown_next_ticks(context);
     shutdown_timers(context);
     shutdown_client(context);
