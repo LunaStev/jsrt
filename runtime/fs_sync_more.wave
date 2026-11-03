@@ -16,6 +16,7 @@ import("std::mem::alloc")::{mem_alloc, mem_free};
 import("std::mem::layout")::{size_of};
 import("std::mem::cstr")::{mem_len_cstr};
 import("std::mem::ops")::{mem_copy};
+import("std::time::clock")::{time_now_realtime_ns};
 import("std::sys::fs")::{open, close, fstat, ftruncate, fsync, unlink, rmdir, Stat, FS_O_RDONLY, FS_O_WRONLY, FS_O_RDWR,
     FS_O_CREAT, FS_O_EXCL, FS_O_TRUNC, FS_O_APPEND};
 extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
@@ -23,6 +24,8 @@ extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
 extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
 extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
 extern(c, "wr_to_number") fun numeric(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_has") fun has_property(ctx: ptr<u8>, owner: ptr<u8>, key: ptr<u8>) -> bool;
 extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
 extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
 extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
@@ -40,6 +43,7 @@ extern(c, "opendir") fun open_directory(path: str) -> ptr<u8>;
 extern(c, "closedir") fun close_directory(directory: ptr<u8>) -> i32;
 extern(c, "lstat") fun link_stat(path: str, info: ptr<Stat>) -> i32;
 extern(c, "chmod") fun libc_chmod(path: str, mode: u32) -> i32;
+extern(c, "fchmod") fun libc_fchmod(fd: i32, mode: u32) -> i32;
 extern(c, "truncate") fun libc_truncate(path: str, length: i64) -> i32;
 extern(c, "symlink") fun libc_symlink(target: str, path: str) -> i32;
 extern(c, "readlink") fun libc_readlink(path: str, buffer: ptr<u8>, size: i64) -> i64;
@@ -345,17 +349,57 @@ fun do_mkdtemp(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -
 }
 
 // Seconds for numbers and milliseconds for Date objects, as in Node.
-fun time_seconds(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64 {
-    if (kind(ctx, value) == TYPE_OBJECT) {
-        return numeric(ctx, value, ex) / 1000.0;
+// Node error codes for argument validation, attached to the thrown error.
+fun coded_failure(ctx: ptr<u8>, ex: ptr<ptr<u8>>, kind_code: i32, code: str, message: str) {
+    fail(ctx, ex, kind_code, message);
+    if (deref ex != null) {
+        var ignored: ptr<u8> = null;
+        define(ctx, deref ex, "code", text(ctx, code), &ignored, true);
     }
-    if (kind(ctx, value) != TYPE_NUMBER) {
-        fail(ctx, ex, ERROR_TYPE, "times must be numbers or Dates");
-        return 0.0;
-    }
-    return numeric(ctx, value, ex);
 }
 
+fun type_failure(ctx: ptr<u8>, ex: ptr<ptr<u8>>, message: str) {
+    coded_failure(ctx, ex, ERROR_TYPE, "ERR_INVALID_ARG_TYPE", message);
+}
+
+fun range_failure(ctx: ptr<u8>, ex: ptr<ptr<u8>>, message: str) {
+    coded_failure(ctx, ex, ERROR_RANGE, "ERR_OUT_OF_RANGE", message);
+}
+
+// Seconds for numbers and numeric strings, milliseconds for Date objects, as in Node. Non-finite
+// values are rejected here, before any conversion to native integers.
+fun time_seconds(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64 {
+    var value_kind: i32 = kind(ctx, value);
+    if (value_kind != TYPE_OBJECT && value_kind != TYPE_NUMBER && value_kind != TYPE_STRING) {
+        type_failure(ctx, ex, "times must be numbers, numeric strings or Dates");
+        return 0.0;
+    }
+    var seconds: f64 = numeric(ctx, value, ex);
+    if (deref ex != null) {
+        return 0.0;
+    }
+    if (value_kind == TYPE_OBJECT) {
+        seconds = seconds / 1000.0;
+    }
+    if (seconds != seconds || seconds - seconds != 0.0) {
+        type_failure(ctx, ex, "times must be finite");
+        return 0.0;
+    }
+    // Node reads a negative number or numeric string as "now"; Dates keep their own value.
+    if (value_kind != TYPE_OBJECT && seconds < 0.0) {
+        return time_now_realtime_ns() as f64 / 1000000000.0;
+    }
+    return seconds;
+}
+
+// Largest magnitude whose whole seconds fit in a signed 64-bit time_t with room for the fraction.
+const TIME_SECONDS_LIMIT: f64 = 9.0e18;
+
+fun time_in_range(seconds: f64) -> bool {
+    return seconds < TIME_SECONDS_LIMIT && seconds > -TIME_SECONDS_LIMIT;
+}
+
+// Callers check time_in_range first, so both casts below are representable.
 fun fill_timespec(times: ptr<i64>, index: i64, seconds: f64) {
     var whole: i64 = seconds as i64;
     var fraction: f64 = seconds - whole as f64;
@@ -382,6 +426,11 @@ fun do_utimes(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) ->
         modified = time_seconds(ctx, args[2], ex);
     }
     if (deref ex != null) {
+        return undefined(ctx);
+    }
+    // Finite values too large for time_t are an EINVAL from the system, as in Node.
+    if (!time_in_range(accessed) || !time_in_range(modified)) {
+        io_failure(ctx, ex, "utime", &path[0] as str, EINVAL);
         return undefined(ctx);
     }
     var times: array<i64, 4>;
@@ -472,6 +521,11 @@ fun do_copy_file(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>)
         status = ftruncate(dest_fd, 0);
         if (status == 0) {
             status = copy_descriptor(source_fd, dest_fd);
+        }
+        // The creation mode only applies to a new file, so an existing destination gets the
+        // source permissions explicitly, as libuv does for Node.
+        if (status == 0 && libc_fchmod(dest_fd as i32, (source_info.mode & MODE_LIMIT as i32) as u32) < 0) {
+            status = current_errno();
         }
     }
     if (dest_fd >= 0) {
@@ -635,12 +689,30 @@ fun do_rm(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr
     return undefined(ctx);
 }
 
+// rmSync options must be real booleans: a string such as "false" is a TypeError, never a coerced
+// true, because a wrong guess here deletes files. An absent option is false.
+const TYPE_BOOLEAN: i32 = 2;
+
 fun flag_option(ctx: ptr<u8>, options: ptr<u8>, name: str, ex: ptr<ptr<u8>>) -> bool {
     var value: ptr<u8> = get(ctx, options, name, ex);
-    if (deref ex != null || kind(ctx, value) == TYPE_UNDEFINED) {
+    if (deref ex != null) {
         return false;
     }
-    return numeric(ctx, value, ex) != 0.0;
+    if (kind(ctx, value) == TYPE_UNDEFINED) {
+        // Only an absent option defaults to false; an explicit undefined is rejected like Node.
+        var key: ptr<u8> = utf8(name);
+        var present: bool = has_property(ctx, options, key);
+        release(key);
+        if (present) {
+            type_failure(ctx, ex, "rmSync options must be booleans");
+        }
+        return false;
+    }
+    if (kind(ctx, value) != TYPE_BOOLEAN) {
+        type_failure(ctx, ex, "rmSync options must be booleans");
+        return false;
+    }
+    return truth(ctx, value);
 }
 
 // ---- descriptor operations ----
@@ -723,6 +795,35 @@ fun position_argument(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64 {
     return integer_argument(ctx, value, 0, 9007199254740991, "position is out of range", ex);
 }
 
+// readSync positions follow Node: null, undefined and -1 mean "current position"; other values must
+// be integers (number or BigInt) from 0 to 2^53 - 1. Anything below -1 or fractional is a
+// RangeError, and other types are a TypeError. writeSync keeps the lenient position_argument.
+const TYPE_BIGINT: i32 = 7;
+const MAX_SAFE_POSITION: f64 = 9007199254740991.0;
+
+fun read_position_argument(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64 {
+    var value_kind: i32 = kind(ctx, value);
+    if (value_kind == TYPE_UNDEFINED || value_kind == 1) {
+        return -1;
+    }
+    if (value_kind != TYPE_NUMBER && value_kind != TYPE_BIGINT) {
+        type_failure(ctx, ex, "position must be a number, bigint or null");
+        return -1;
+    }
+    var n: f64 = numeric(ctx, value, ex);
+    if (deref ex != null) {
+        return -1;
+    }
+    if (n == -1.0) {
+        return -1;
+    }
+    if (n != n || n < 0.0 || n > MAX_SAFE_POSITION || (n as i64) as f64 != n) {
+        range_failure(ctx, ex, "position is out of range");
+        return -1;
+    }
+    return n as i64;
+}
+
 fun do_read(ctx: ptr<u8>, state: ptr<MoreState>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
     var fd: i64 = descriptor_argument(ctx, count, args, ex);
     if (deref ex != null) {
@@ -752,7 +853,7 @@ fun do_read(ctx: ptr<u8>, state: ptr<MoreState>, count: i64, args: ptr<ptr<u8>>,
         }
         value = get(ctx, options, "position", ex);
         if (deref ex == null) {
-            position = position_argument(ctx, value, ex);
+            position = read_position_argument(ctx, value, ex);
         }
     } else if (deref ex == null) {
         if (has_argument(ctx, count, args, 2)) {
@@ -763,7 +864,7 @@ fun do_read(ctx: ptr<u8>, state: ptr<MoreState>, count: i64, args: ptr<ptr<u8>>,
             wanted = integer_argument(ctx, args[3], 0, view_length - offset, "length is out of range", ex);
         }
         if (deref ex == null && count > 4) {
-            position = position_argument(ctx, args[4], ex);
+            position = read_position_argument(ctx, args[4], ex);
         }
     }
     if (deref ex != null) {
