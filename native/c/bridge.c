@@ -596,6 +596,10 @@ extern JSValue jsrt_crypto_api(const void *, void *, void *, size_t, const JSVal
 JSCallback jsrt_crypto_callback(void) {
     return jsrt_crypto_api;
 }
+extern JSValue jsrt_crypto_hashes(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+JSCallback jsrt_crypto_hashes_callback(void) {
+    return jsrt_crypto_hashes;
+}
 extern void jsrt_crypto_finalize(void *, void *);
 void *jsrt_crypto_deallocator(void) {
     return (void *)jsrt_crypto_finalize;

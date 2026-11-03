@@ -8,6 +8,8 @@ import("./byte_codec")::{decode_bytes};
 extern(c, "EVP_sha256") fun sha256() -> ptr<u8>;
 extern(c, "EVP_sha384") fun sha384() -> ptr<u8>;
 extern(c, "EVP_sha512") fun sha512() -> ptr<u8>;
+extern(c, "EVP_sha1") fun sha1() -> ptr<u8>;
+extern(c, "EVP_md5") fun md5() -> ptr<u8>;
 extern(c, "EVP_MD_CTX_new") fun digest_new() -> ptr<u8>;
 extern(c, "EVP_MD_CTX_free") fun digest_free(state: ptr<u8>);
 extern(c, "EVP_DigestInit_ex") fun digest_init(state: ptr<u8>, algorithm: ptr<u8>, engine: ptr<u8>) -> i32;
@@ -73,6 +75,10 @@ pub fun create_hash_state(ctx: ptr<u8>, alg: i64, keyed: bool, key: ptr<u8>, ex:
             selected = sha384();
         } else if (alg == 2) {
             selected = sha512();
+        } else if (alg == 3) {
+            selected = sha1();
+        } else if (alg == 4) {
+            selected = md5();
         }
         if (deref state.digest != null) {
             ok = digest_init(deref state.digest, selected, null) == 1;
@@ -101,6 +107,10 @@ pub fun create_hash_state(ctx: ptr<u8>, alg: i64, keyed: bool, key: ptr<u8>, ex:
                 name = "SHA384";
             } else if (alg == 2) {
                 name = "SHA512";
+            } else if (alg == 3) {
+                name = "SHA1";
+            } else if (alg == 4) {
+                name = "MD5";
             }
             var params: array<Param, 2> = [Param {
                 key: "digest" as ptr<u8>, data_type: 4, data: name as ptr<u8>, data_size: 0, return_size: 0

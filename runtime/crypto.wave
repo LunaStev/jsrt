@@ -13,7 +13,7 @@ fun crypto_storage(ctx: ptr<u8>) -> ptr<CryptoState> {
 // Wave owns validation and JS state; OpenSSL owns digest primitives.
 // Incremental native state is owned by private engine ArrayBuffers.
 import("std::mem::alloc")::{mem_alloc, mem_free};
-import("std::mem::cstr")::{mem_eq_cstr};
+import("std::mem::cstr")::{mem_eq_cstr, mem_len_cstr};
 import("std::random::fill")::{RandomFillResult, random_fill};
 import("./config")::{BUFFER_LIMIT};
 import("./values")::{get, put, plain, text, define, fail, fail_coded};
@@ -35,6 +35,8 @@ extern(c, "wr_string_release") fun release(value: ptr<u8>);
 extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
 extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
 extern(c, "jsrt_crypto_callback") fun callback() -> ptr<u8>;
+extern(c, "jsrt_crypto_hashes_callback") fun hashes_callback() -> ptr<u8>;
+extern(c, "wr_array") fun wr_array(ctx: ptr<u8>, count: i64, values: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
 
 fun arg(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, index: i64) -> ptr<u8> {
     if (index < count) {
@@ -43,27 +45,51 @@ fun arg(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, index: i64) -> ptr<u8> {
     return undefined(ctx);
 }
 
+// Algorithm codes shared with crypto_state: 0 sha256, 1 sha384, 2 sha512, 3 sha1, 4 md5. Names are
+// case-insensitive and a dash after "sha" is accepted ("SHA-256"), as Node/OpenSSL do.
 fun algorithm(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64 {
+    var raw: array<u8, 32>;
     var name: array<u8, 32>;
-    var n: i64 = encode_utf8(ctx, value, &name[0], 32, false, ex);
+    var n: i64 = encode_utf8(ctx, value, &raw[0], 31, false, ex);
     if (n < 0) {
         return -1;
     }
+    var used: i64 = 0;
     for (var i: i64 = 0; i < n; i++) {
-        if (name[i] >= 65 && name[i] <= 90) {
-            name[i] += 32;
+        var c: u8 = raw[i];
+        if (c >= 65 && c <= 90) {
+            c += 32;
         }
+        if (c == 45 && used == 3) {
+            continue;
+        }
+        name[used] = c;
+        used += 1;
     }
-    if (mem_eq_cstr(&name[0] as str, "sha256") && n == 6) {
+    name[used] = 0;
+    // A NUL inside the name must not truncate it ("sha256\0suffix" is not sha256): the decoded length
+    // has to equal the C-string length.
+    var text: str = &name[0] as str;
+    if (mem_len_cstr(text) != used) {
+        fail(ctx, ex, 1, "supported hash algorithms: sha1, sha256, sha384, sha512, md5");
+        return -1;
+    }
+    if (mem_eq_cstr(text, "sha256")) {
         return 0;
     }
-    if (mem_eq_cstr(&name[0] as str, "sha384") && n == 6) {
+    if (mem_eq_cstr(text, "sha384")) {
         return 1;
     }
-    if (mem_eq_cstr(&name[0] as str, "sha512") && n == 6) {
+    if (mem_eq_cstr(text, "sha512")) {
         return 2;
     }
-    fail(ctx, ex, 1, "supported hash algorithms: sha256, sha384, sha512");
+    if (mem_eq_cstr(text, "sha1")) {
+        return 3;
+    }
+    if (mem_eq_cstr(text, "md5")) {
+        return 4;
+    }
+    fail(ctx, ex, 1, "supported hash algorithms: sha1, sha256, sha384, sha512, md5");
     return -1;
 }
 
@@ -326,9 +352,32 @@ pub fun install_crypto(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
         }
     }
     define(ctx, (deref host_state.exports), "opensslVersion", text(ctx, openssl_version(0)), ex, false);
+    var hashes_name: ptr<u8> = utf8("getHashes");
+    define(ctx, (deref host_state.exports), "getHashes", function(ctx, hashes_name, hashes_callback()), ex, false);
+    release(hashes_name);
     return deref ex == null;
 }
 
+
+// crypto.getHashes(): the algorithms createHash/createHmac accept here, as a fresh array each call.
+// Node lists every algorithm name OpenSSL knows; only the supported ones are reported.
+export(c) fun jsrt_crypto_hashes(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var names: array<str, 5> = ["md5", "sha1", "sha256", "sha384", "sha512"];
+    var items: array<ptr<u8>, 5>;
+    for (var i: i64 = 0; i < 5; i++) {
+        items[i] = text(ctx, names[i]);
+        protect(ctx, items[i]);
+    }
+    var result: ptr<u8> = wr_array(ctx, 5, &items[0], ex);
+    for (var i: i64 = 0; i < 5; i++) {
+        unprotect(ctx, items[i]);
+    }
+    if (deref ex != null || result == null) {
+        return undefined(ctx);
+    }
+    return result;
+}
 pub fun crypto_module() -> ptr<u8> {
     var host_state: ptr<CryptoState> = crypto_storage(active_context());
     return(deref host_state.exports);
