@@ -93,6 +93,26 @@ pub fun expanded_target(ctx: ptr<u8>, value: ptr<u8>, pattern: ptr<u8>, imports:
     return text(ctx, &result[0] as str);
 }
 
+
+// True for a canonical array-index key ("0", "7", "4294967294"): digits only, no leading zero unless
+// the key is "0", and below 2^32 - 1. Only these keys are invalid package condition names.
+fun is_array_index_key(key: ptr<u8>) -> bool {
+    var length: i64 = mem_len_cstr(key as str);
+    if (length == 0 || length > 10) {
+        return false;
+    }
+    var value: i64 = 0;
+    for (var i: i64 = 0; i < length; i++) {
+        if (key[i] < 48 || key[i] > 57) {
+            return false;
+        }
+        value = value * 10 + (key[i] - 48) as i64;
+    }
+    if (length > 1 && key[0] == 48) {
+        return false;
+    }
+    return value < 4294967295;
+}
 pub fun select_target(ctx: ptr<u8>, value: ptr<u8>, level: i64, pattern: ptr<u8>, imports: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
     var host_state: ptr<ModulesState> = modules_storage(ctx);
     if (level > 16) {
@@ -136,7 +156,9 @@ pub fun select_target(ctx: ptr<u8>, value: ptr<u8>, level: i64, pattern: ptr<u8>
                     deref ex = nested;
                     break;
                 }
-            } else if (wr_type(ctx, result) != 0) {
+            } else if (wr_type(ctx, result) != 0 && wr_type(ctx, result) != 1) {
+                // A null entry blocks only when it is the whole target; inside a fallback array it
+                // is skipped so the next entry can still match, as in Node.
                 if (last != null) {
                     wr_unprotect(ctx, last);
                 }
@@ -168,7 +190,7 @@ pub fun select_target(ctx: ptr<u8>, value: ptr<u8>, level: i64, pattern: ptr<u8>
         if (copy_host_path(ctx, key, &bytes[0], PATH_CAP, ex) < 0) {
             break;
         }
-        if (bytes[0] == 46 || (bytes[0] >= 48 && bytes[0] <= 57)) {
+        if (bytes[0] == 46 || is_array_index_key(&bytes[0])) {
             error(ctx, ex, 1, "invalid package condition key", "ERR_INVALID_PACKAGE_CONFIG");
             break;
         }

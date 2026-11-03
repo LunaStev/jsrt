@@ -258,7 +258,9 @@ extern "C" napi_status napi_get_value_int64(napi_env env, napi_value value, int6
     napi_status s = napi_get_value_double(env, value, &number);
     if (s != napi_ok)
         return s;
-    if (std::isnan(number))
+    // The Node-API contract returns 0 for every non-finite value (NaN and both infinities); finite
+    // values beyond the int64 range still saturate.
+    if (!std::isfinite(number))
         *out = 0;
     else if (number >= 9223372036854775808.0)
         *out = INT64_MAX;

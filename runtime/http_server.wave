@@ -18,6 +18,7 @@ import("./network_deadlines")::{connection_deadline, earliest};
 import("./buffer")::{buffer_integer};
 import("./config")::{HTTP_HEADERS_TIMEOUT_MS, HTTP_REQUEST_TIMEOUT_MS, HTTP_IDLE_TIMEOUT_MS, HTTP_KEEP_ALIVE_TIMEOUT_MS};
 import("./http_keepalive")::{recycle_connection};
+import("./http_client")::{append_node_response_header};
 import("std::net::address")::{Ipv4ParseResult, ipv4_parse, Ipv6ParseResult, ipv6_parse};
 import("./events")::{event_parent, add_listener, emit_named};
 import("./config")::{HTTP_SERVER_LIMIT, HTTP_CONNECTION_LIMIT};
@@ -606,8 +607,12 @@ fun request_object(ctx: ptr<u8>, request: ptr<HttpRequest>, ex: ptr<ptr<u8>>) ->
     protect(ctx, headers);
     for (var i: i64 = 0; i < deref request.header_count; i++) {
         var field: ptr<HttpHeader> = deref request.fields + i;
-        http_put(ctx, headers, (deref request.headers + deref field.name) as str, http_latin1(ctx, deref request.headers + deref field.value,
-            deref field.length), ex);
+        // Repeated fields are combined like Node's IncomingMessage.headers instead of the last one
+        // overwriting the earlier values.
+        var item: ptr<u8> = http_latin1(ctx, deref request.headers + deref field.value, deref field.length);
+        protect(ctx, item);
+        append_node_response_header(ctx, headers, (deref request.headers + deref field.name) as str, item, ex);
+        unprotect(ctx, item);
     }
     http_define(ctx, object, "headers", headers, ex);
     unprotect(ctx, headers);

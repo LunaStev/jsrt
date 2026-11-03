@@ -580,7 +580,9 @@ fun singleton_response_header(name: str) -> bool {
     return false;
 }
 
-fun append_node_response_header(ctx: ptr<u8>, headers: ptr<u8>, name: str, value: ptr<u8>,
+// Shared with the HTTP server: Node joins ordinary duplicate fields with ", ", Cookie with "; ", keeps
+// Set-Cookie as an array and keeps the first value of singleton fields.
+pub fun append_node_response_header(ctx: ptr<u8>, headers: ptr<u8>, name: str, value: ptr<u8>,
     ex: ptr<ptr<u8>>) {
     var previous: ptr<u8> = get(ctx, headers, name, ex);
     if (deref ex != null) {
