@@ -49,6 +49,8 @@ function chdirCases() {
         fs.writeFileSync('relative.txt', 'ok');
         equal(fs.readFileSync(path.join(directory, 'relative.txt'), 'utf8'), 'ok', 'relative write lands in the new directory');
         throws(() => process.chdir(path.join(directory, 'missing')), error => error instanceof Error, 'missing directory');
+        throws(() => process.chdir(path.join(directory, 'missing')), error => error.code === 'ENOENT', 'missing directory code');
+        throws(() => process.chdir(path.join(directory, 'relative.txt')), error => error.code === 'ENOTDIR', 'file is not a directory');
         equal(path.basename(process.cwd()), path.basename(directory), 'failed chdir keeps the directory');
         throws(() => process.chdir(), error => error instanceof TypeError, 'path is required');
         throws(() => process.chdir(5), error => error instanceof TypeError, 'path must be a string');
@@ -60,7 +62,33 @@ function chdirCases() {
     equal(process.cwd(), original, 'cwd restored');
 }
 
+function symbolKeyCases() {
+    const key = Symbol('k');
+    const other = Symbol('other');
+    assert.deepStrictEqual({[key]: 1}, {[key]: 1});
+    assert.deepStrictEqual({[key]: {inner: [1, 2]}, a: 1}, {a: 1, [key]: {inner: [1, 2]}});
+    throws(() => assert.deepStrictEqual({[key]: 1}, {[key]: 2}), error => error.code === 'ERR_ASSERTION', 'symbol value differs');
+    throws(() => assert.deepStrictEqual({[key]: 1}, {}), error => error.code === 'ERR_ASSERTION', 'symbol only on the left');
+    throws(() => assert.deepStrictEqual({}, {[key]: 1}), error => error.code === 'ERR_ASSERTION', 'symbol only on the right');
+    throws(() => assert.deepStrictEqual({[key]: 1}, {[other]: 1}), error => error.code === 'ERR_ASSERTION', 'different symbol keys');
+    throws(() => assert.deepStrictEqual({[key]: {a: 1}}, {[key]: {a: 2}}), error => error.code === 'ERR_ASSERTION', 'nested symbol value');
+    // Non-enumerable symbols are ignored, matching Node.
+    const hidden = {a: 1};
+    Object.defineProperty(hidden, key, {value: 1, enumerable: false});
+    assert.deepStrictEqual(hidden, {a: 1});
+    assert.deepStrictEqual({a: 1}, hidden);
+    assert.notDeepStrictEqual({[key]: 1}, {[key]: 2});
+    assert.notDeepStrictEqual({[key]: 1}, {});
+    const map = new Map([[1, 2]]);
+    map[key] = 1;
+    throws(() => assert.deepStrictEqual(map, new Map([[1, 2]])), error => error.code === 'ERR_ASSERTION', 'symbol on a Map');
+    const array = [1];
+    array[key] = 'x';
+    throws(() => assert.deepStrictEqual(array, [1]), error => error.code === 'ERR_ASSERTION', 'symbol on an array');
+}
+
 function deepCases() {
+    symbolKeyCases();
     assert.deepStrictEqual({a: 1, b: [1, 2, {c: 3}]}, {a: 1, b: [1, 2, {c: 3}]});
     assert.deepStrictEqual(new Date(5), new Date(5));
     assert.deepStrictEqual(/a/gi, /a/gi);

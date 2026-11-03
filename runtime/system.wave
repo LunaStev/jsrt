@@ -266,8 +266,10 @@ export(c) fun jsrt_chdir(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, cou
         return wr_undefined(ctx);
     }
     buffer[length] = 0;
-    if (env_chdir(&buffer[0] as str) < 0) {
-        fail(ctx, ex, 0, "ENOENT or ENOTDIR: cannot change the current directory");
+    // env_chdir returns -errno; io_failure maps it to error.code/errno like the fs functions.
+    var status: i64 = env_chdir(&buffer[0] as str);
+    if (status < 0) {
+        io_failure(ctx, ex, "chdir", &buffer[0] as str, status);
         return wr_undefined(ctx);
     }
     return wr_undefined(ctx);

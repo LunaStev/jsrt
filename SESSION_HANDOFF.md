@@ -1,12 +1,27 @@
 # 다음 대화 시작점
 
+## 검토 후속 수정·README 재작성·GitHub 게시 — 2026-11-04 (Asia/Seoul)
+
+전체 검토에서 나온 버그 2건을 고치고 영구 회귀를 추가했다. util.deprecate와 util.promisify.custom도 추가했다.
+
+- assert.deepStrictEqual이 열거 가능한 own Symbol 키를 비교한다(Node와 같음). process.chdir 실패 오류에
+  code/errno/syscall/path가 붙는다. 회귀는 tests/core_modules.js(Node에서도 같은 결과).
+- build와 독립 test(--require-tcp --probe-worker-termination) 각각 **1060/0/0**, 실패·생략 0.
+  runtime SHA-256 **9bbd27958dde56d58db2295ed07bc7bac297be46a4b7c9e50331e9cdfa865871**. test-npm·release는 이번에 다시 실행하지 않았다.
+- 알려진 차이: assert.equal/deepEqual은 엄격 별칭. util.deprecate는 process.emitWarning·--no-deprecation 없음.
+- README를 새로 썼다. 예시 출력과 HTTP 서버 예제는 실제로 실행해 확인했다.
+- 공개 저장소는 https://github.com/potatosl/jsrt 이며 에이전트 도구 관련 파일·문구를 뺀 기록을 올렸다.
+  로컬 main과 공개 main의 커밋 해시가 다르므로 문서의 옛 해시는 공개 기록과 맞지 않는다.
+- 미수행: 원격 CI/VM, 운영 서명, 24시간 부하, 깨끗한 환경의 엔진 전체 재컴파일, target/ 정리(허락 필요).
+- 남은 후보: file URL(fileURLToPath), 느슨한 assert.deepEqual, timers/promises signal·setInterval 반복자.
+
 ## 코어 API 4종 추가와 2시간 soak — 2026-11-03 (Asia/Seoul)
 
 사용자가 남은 항목을 모두 만든 뒤 2시간 검증을 요청했다. querystring.stringify/encode, process.chdir,
 assert.deepStrictEqual/notDeepStrictEqual(deepEqual은 엄격 별칭), timers/promises(setTimeout·setImmediate·
 scheduler.wait/yield, 옵션은 거부)를 추가했다. 계약은 docs/compatibility.md, 회귀는 tests/core_modules.js.
 
-- build **1060/0/0** 통과 후 새 runtime 게시, SHA-256 ****. 독립 test·test-npm·release는 이번에 다시 실행하지 않았다.
+- build **1060/0/0** 통과 후 새 runtime 게시, SHA-256은 이후 항목의 최신 값을 따른다. 독립 test·test-npm·release는 이번에 다시 실행하지 않았다.
 - 2시간 soak(7200초) **PASS, exit 0**: 60354 batches·241416 lanes·7910719488바이트·385912 Worker·96478 abort.
   RSS KiB warm/peak/end 54696/57924/51444, FD 최대 36, thread 최대 17. 최대 지연 **7409 ms**(이전 60초 부하 4922 ms),
   250 ms 초과 lane 11757개(4.9%). 지연은 SLO가 아니다. 24시간 부하는 아니다.
