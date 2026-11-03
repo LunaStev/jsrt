@@ -1,9 +1,17 @@
 import("./context_state")::{owned_context_slot, active_context};
+import("./assert_deep")::{DeepIntrinsics, deep_install, deep_release, deep_equal};
 import("std::mem::layout")::{size_of};
 struct AssertState {
-    methods: array<ptr<u8>, 7>;
+    methods: array<ptr<u8>, 9>;
     same: ptr<u8>;
+    deep: DeepIntrinsics;
 }
+
+// Method slots: 0 ok, 1 strictEqual, 2 notStrictEqual, 3 fail, 4 throws, 5 doesNotThrow,
+// 6 ifError, 7 deepStrictEqual, 8 notDeepStrictEqual.
+const METHOD_COUNT: i64 = 9;
+const METHOD_DEEP_EQUAL: i64 = 7;
+const METHOD_NOT_DEEP_EQUAL: i64 = 8;
 
 fun assert_storage(ctx: ptr<u8>) -> ptr<AssertState> {
     return owned_context_slot(ctx, 9, size_of<AssertState>() as i64) as ptr<AssertState>;
@@ -78,6 +86,24 @@ export(c) fun jsrt_assert_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, coun
             }
             assertion(ctx, actual, expected, message, operation, ex);
         }
+    } else if (equal(ctx, fn, (deref host_state.methods)[METHOD_DEEP_EQUAL]) ||
+        equal(ctx, fn, (deref host_state.methods)[METHOD_NOT_DEEP_EQUAL])) {
+        if (count < 2) {
+            fail(ctx, ex, 1, "deep equality requires two values");
+            return undefined(ctx);
+        }
+        var matches: bool = deep_equal(ctx, &(deref host_state.deep), actual, expected, ex);
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        var negate: bool = equal(ctx, fn, (deref host_state.methods)[METHOD_NOT_DEEP_EQUAL]);
+        if ((matches && negate) || (!matches && !negate)) {
+            var operation: str = "deepStrictEqual";
+            if (negate) {
+                operation = "notDeepStrictEqual";
+            }
+            assertion(ctx, actual, expected, message, operation, ex);
+        }
     } else if (equal(ctx, fn, (deref host_state.methods)[3])) {
         assertion(ctx, undefined(ctx), undefined(ctx), actual, "fail", ex);
     } else if (equal(ctx, fn, (deref host_state.methods)[6])) {
@@ -107,20 +133,26 @@ export(c) fun jsrt_assert_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, coun
 pub fun install_assert(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     var host_state: ptr<AssertState> = assert_storage(ctx);
     (deref host_state.same) = capture(ctx, get(ctx, global(ctx), "Object", ex), "is", ex);
-    var names: array<str, 7> = ["ok", "strictEqual", "notStrictEqual", "fail", "throws", "doesNotThrow",
-        "ifError"];
-    for (var i: i64 = 0; i < 7; i++) {
+    var names: array<str, 9> = ["ok", "strictEqual", "notStrictEqual", "fail", "throws", "doesNotThrow",
+        "ifError", "deepStrictEqual", "notDeepStrictEqual"];
+    if (!deep_install(ctx, &(deref host_state.deep), ex)) {
+        return false;
+    }
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
         var name: ptr<u8> = utf8(names[i]);
         (deref host_state.methods)[i] = function(ctx, name, callback());
         release(name);
         protect(ctx, (deref host_state.methods)[i]);
     }
-    for (var i: i64 = 0; i < 7; i++) {
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
         define(ctx, (deref host_state.methods)[0], names[i], (deref host_state.methods)[i], ex, false);
     }
     define(ctx, (deref host_state.methods)[0], "strict", (deref host_state.methods)[0], ex, false);
     define(ctx, (deref host_state.methods)[0], "equal", (deref host_state.methods)[1], ex, false);
     define(ctx, (deref host_state.methods)[0], "notEqual", (deref host_state.methods)[2], ex, false);
+    // Like equal/notEqual above, the loose names alias the strict behavior.
+    define(ctx, (deref host_state.methods)[0], "deepEqual", (deref host_state.methods)[METHOD_DEEP_EQUAL], ex, false);
+    define(ctx, (deref host_state.methods)[0], "notDeepEqual", (deref host_state.methods)[METHOD_NOT_DEEP_EQUAL], ex, false);
     return deref ex == null;
 }
 
@@ -135,7 +167,8 @@ pub fun shutdown_assert(ctx: ptr<u8>) {
         unprotect(ctx, (deref host_state.same));
         (deref host_state.same) = null;
     }
-    for (var i: i64 = 0; i < 7; i++) {
+    deep_release(ctx, &(deref host_state.deep));
+    for (var i: i64 = 0; i < METHOD_COUNT; i++) {
         if ((deref host_state.methods)[i] != null) {
             unprotect(ctx, (deref host_state.methods)[i]);
             (deref host_state.methods)[i] = null;

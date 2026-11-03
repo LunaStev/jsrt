@@ -1,6 +1,7 @@
 import("./context_state")::{context_slot, allocate_context_slot, release_context_slot, SYSTEM_SLOT};
 // Process facilities and binary/text file operations are Wave host policies.
-import("std::env::cwd")::{env_getcwd};
+import("std::env::cwd")::{env_getcwd, env_chdir};
+import("./worker_state")::{worker_state, WorkerState};
 import("./config")::{FILE_LIMIT, FILE_HANDLE_OPEN_OPERATION, FILE_HANDLE_CLOSE_OPERATION};
 import("./byte_codec")::{encode_utf8, decode_utf8_strict};
 import("./buffer_core")::{buffer_from_bytes, copy_byte_view};
@@ -239,6 +240,37 @@ export(c) fun jsrt_cwd(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count
         return wr_undefined(ctx);
     }
     return text_value(ctx, &buffer[0] as str);
+}
+
+// The working directory is shared by every thread in the process, so Workers may not
+// change it (Node rejects this too). The path is validated and fully converted before
+// the directory changes, and the previous directory stays in effect on failure.
+export(c) fun jsrt_chdir(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var workers: ptr<WorkerState> = worker_state(ctx);
+    if (workers != null && deref workers.parent != null) {
+        fail(ctx, ex, 0, "process.chdir() is not supported in Workers");
+        return wr_undefined(ctx);
+    }
+    if (count == 0 || wr_type(ctx, args[0]) != 4) {
+        fail(ctx, ex, 1, "process.chdir requires a directory path string");
+        return wr_undefined(ctx);
+    }
+    var buffer: array<u8, 16385>;
+    var length: i64 = string_bytes(ctx, args[0], &buffer[0], PATH_CAP, true, ex);
+    if (length < 0 || deref ex != null) {
+        return wr_undefined(ctx);
+    }
+    if (length == 0) {
+        fail(ctx, ex, 0, "process.chdir requires a non-empty path");
+        return wr_undefined(ctx);
+    }
+    buffer[length] = 0;
+    if (env_chdir(&buffer[0] as str) < 0) {
+        fail(ctx, ex, 0, "ENOENT or ENOTDIR: cannot change the current directory");
+        return wr_undefined(ctx);
+    }
+    return wr_undefined(ctx);
 }
 
 export(c) fun jsrt_exit_get(ctx: ptr<u8>, function: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
@@ -727,6 +759,7 @@ pub fun install_system(ctx: ptr<u8>, source_index: i32, eval_mode: bool) -> bool
     }
     put(ctx, process, "env", environment, &ex);
     put(ctx, process, "cwd", native_function(ctx, "cwd", 0), &ex);
+    put(ctx, process, "chdir", native_function(ctx, "chdir", 5), &ex);
     install_exit_code(ctx, process, &ex);
     put(ctx, fs, "readFileSync", native_function(ctx, "readFileSync", 1), &ex);
     put(ctx, fs, "writeFileSync", native_function(ctx, "writeFileSync", 2), &ex);

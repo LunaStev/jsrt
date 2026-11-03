@@ -1,0 +1,151 @@
+// node:timers/promises. Each export is a native function bound to a private record that
+// holds the scheduler intrinsic (the engine-visible setTimeout/setImmediate captured
+// when the module is built) and the operation mode, so later changes to the globals
+// cannot redirect it and no per-context state slot is needed. The Promise settles from
+// the ordinary timer callback; this module owns no timer storage (see timers.wave).
+// AbortSignal and ref options are not implemented: passing options rejects the Promise,
+// and setInterval's async iterator is not provided.
+import("./values")::{get, put, plain, define, fail};
+import("./collections")::{bind_one};
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_to_number") fun to_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_promise") fun promise(ctx: ptr<u8>, resolve: ptr<ptr<u8>>, reject: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "jsrt_timers_promises_callback") fun callback() -> ptr<u8>;
+
+// Operation modes stored in the bound record.
+const MODE_TIMEOUT: f64 = 0.0;
+const MODE_WAIT: f64 = 1.0;
+const MODE_IMMEDIATE: f64 = 2.0;
+const JS_UNDEFINED: i32 = 0;
+
+// Settles with a rejection instead of throwing, as every Promise API does.
+fun rejected(ctx: ptr<u8>, reason: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var resolve: ptr<u8> = null;
+    var reject: ptr<u8> = null;
+    var result: ptr<u8> = promise(ctx, &resolve, &reject, ex);
+    if (result == null || deref ex != null) {
+        return undefined(ctx);
+    }
+    protect(ctx, result);
+    var arguments: array<ptr<u8>, 1> = [reason];
+    call(ctx, reject, null, 1, &arguments[0], ex);
+    unprotect(ctx, result);
+    return result;
+}
+
+// Arguments: [record, user arguments...]. The record is read once and validated first.
+export(c) fun jsrt_timers_promises_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count < 1) {
+        fail(ctx, ex, 1, "invalid timers/promises receiver");
+        return undefined(ctx);
+    }
+    var record: ptr<u8> = args[0];
+    var scheduler: ptr<u8> = get(ctx, record, "scheduler", ex);
+    var mode: f64 = to_number(ctx, get(ctx, record, "mode", ex), ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    // User arguments start at index 1. Options are the last accepted parameter.
+    var user_count: i64 = count - 1;
+    var options_index: i64 = 2;
+    if (mode == MODE_WAIT || mode == MODE_IMMEDIATE) {
+        options_index = 1;
+    }
+    if (user_count > options_index && kind(ctx, args[1 + options_index]) != JS_UNDEFINED) {
+        var problem: ptr<u8> = null;
+        fail(ctx, &problem, 1, "timers/promises options (signal, ref) are not implemented");
+        return rejected(ctx, problem, ex);
+    }
+    var resolve: ptr<u8> = null;
+    var reject: ptr<u8> = null;
+    var result: ptr<u8> = promise(ctx, &resolve, &reject, ex);
+    if (result == null || deref ex != null) {
+        return undefined(ctx);
+    }
+    protect(ctx, result);
+    protect(ctx, resolve);
+    protect(ctx, reject);
+    var nested: ptr<u8> = null;
+    var schedule: array<ptr<u8>, 3> = [resolve, undefined(ctx), undefined(ctx)];
+    var schedule_count: i64 = 1;
+    if (mode == MODE_TIMEOUT) {
+        // setTimeout(resolve, delay, value)
+        if (user_count > 0) {
+            schedule[1] = args[1];
+        }
+        if (user_count > 1) {
+            schedule[2] = args[2];
+        }
+        schedule_count = 3;
+    } else if (mode == MODE_WAIT) {
+        // scheduler.wait(delay) resolves with undefined.
+        if (user_count > 0) {
+            schedule[1] = args[1];
+        }
+        schedule_count = 2;
+    } else {
+        // setImmediate(resolve, value)
+        if (user_count > 0) {
+            schedule[1] = args[1];
+            schedule_count = 2;
+        }
+    }
+    call(ctx, scheduler, null, schedule_count, &schedule[0], &nested);
+    if (nested != null) {
+        var reason: array<ptr<u8>, 1> = [nested];
+        call(ctx, reject, null, 1, &reason[0], ex);
+    }
+    unprotect(ctx, reject);
+    unprotect(ctx, resolve);
+    unprotect(ctx, result);
+    return result;
+}
+
+fun entry(ctx: ptr<u8>, scheduler: ptr<u8>, mode: f64, name: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var record: ptr<u8> = plain(ctx);
+    protect(ctx, record);
+    put(ctx, record, "scheduler", scheduler, ex);
+    put(ctx, record, "mode", number(ctx, mode), ex);
+    var key: ptr<u8> = utf8(name);
+    var native: ptr<u8> = function(ctx, key, callback());
+    release(key);
+    protect(ctx, native);
+    var bound: ptr<u8> = bind_one(ctx, native, null, record, ex);
+    unprotect(ctx, native);
+    unprotect(ctx, record);
+    return bound;
+}
+
+// Called once per context while the module table is built, after timers are installed.
+pub fun timers_promises_module(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var result: ptr<u8> = plain(ctx);
+    protect(ctx, result);
+    var set_timeout: ptr<u8> = get(ctx, global(ctx), "setTimeout", ex);
+    var set_immediate: ptr<u8> = get(ctx, global(ctx), "setImmediate", ex);
+    protect(ctx, set_timeout);
+    protect(ctx, set_immediate);
+    define(ctx, result, "setTimeout", entry(ctx, set_timeout, MODE_TIMEOUT, "setTimeout", ex), ex, true);
+    define(ctx, result, "setImmediate", entry(ctx, set_immediate, MODE_IMMEDIATE, "setImmediate", ex), ex, true);
+    var scheduler: ptr<u8> = plain(ctx);
+    protect(ctx, scheduler);
+    define(ctx, scheduler, "wait", entry(ctx, set_timeout, MODE_WAIT, "wait", ex), ex, true);
+    define(ctx, scheduler, "yield", entry(ctx, set_immediate, MODE_IMMEDIATE, "yield", ex), ex, true);
+    define(ctx, result, "scheduler", scheduler, ex, true);
+    unprotect(ctx, scheduler);
+    unprotect(ctx, set_immediate);
+    unprotect(ctx, set_timeout);
+    unprotect(ctx, result);
+    return result;
+}

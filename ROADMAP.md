@@ -50,11 +50,11 @@ UTF-8 codec·EventTarget·기본 Web Streams·Readable adapter를 추가했다.
 | Web Streams | byte/BYOB·transfer, 추가 queuing strategy·codec stream 클래스와 WPT 적합성 |
 | Web 본문 | 네트워크 Response clone, Request 스트리밍 생성자, File·multipart 파싱·추가 Body 메서드와 Fetch 옵션 |
 | 텍스트·이벤트 | UTF-8 이외 decoder, legacy Event 필드·전체 DOM dispatch 적합성 |
-| process | TTY·raw mode, stdio 배열, IPC, 자식 env/cwd·추가 spawn 옵션, chdir·kill, 힙 통계 |
+| process | TTY·raw mode, stdio 배열, IPC, 자식 env/cwd·추가 spawn 옵션, kill, 힙 통계 |
 | 파일 | FileHandle 추가 overload·vectored I/O·스트림, 콜백 형태의 open/close/read/write/appendFile 등, watch·권한 변경 등 |
 | 네트워크 | 독립 net/tls/dns, 서버 TLS, upgrade/WebSocket·압축·프록시, 추가 Fetch/HTTP 옵션과 실패 전이 |
 | 패키지 | 일반 glob·nested/개발 링크 workspaces, 그래프 backtracking·전역 hoisting·추가 optional/peer 풀이, 인증·bin/scripts |
-| 모듈·유틸리티 | require(ESM)·CJS named export 추론, file/기타 URL(fileURLToPath 포함), querystring.stringify, timers/promises, util.deprecate·promisify.custom, assert.deepStrictEqual, 추가 crypto 등 |
+| 모듈·유틸리티 | require(ESM)·CJS named export 추론, file/기타 URL(fileURLToPath 포함), timers/promises의 signal·setInterval 반복자, 느슨한 assert.deepEqual, 추가 crypto 등 |
 | Worker·애드온 | MessageChannel·transfer·추가 clone 형식, 확장 Node-API·실제 SDK 패키지 사례 |
 | 개발 도구 | REPL·watch·source map·디버거·프로파일링·타입 선언 |
 
