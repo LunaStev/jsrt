@@ -9,7 +9,7 @@
 import("std::mem::alloc")::{mem_alloc_zeroed, mem_free};
 import("std::mem::cstr")::{mem_eq_cstr};
 import("./byte_codec")::{encode_utf8};
-import("./values")::{get, capture, fail};
+import("./values")::{get, capture, fail, text};
 import("./collections")::{length, at};
 
 extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
@@ -19,6 +19,7 @@ extern(c, "wr_to_string") fun to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<pt
 extern(c, "wr_string_release") fun release_string(value: ptr<u8>);
 extern(c, "wr_get") fun dynamic_get(ctx: ptr<u8>, owner: ptr<u8>, key: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
 extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_is_array") fun is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
 extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
 extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
 extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
@@ -54,10 +55,12 @@ const FN_SYMBOL_VALUE: i64 = 14;
 // Object.getOwnPropertySymbols and Reflect.get: symbol keys cannot go through wr_get.
 const FN_SYMBOLS: i64 = 15;
 const FN_REFLECT_GET: i64 = 16;
-const DEEP_FUNCTION_COUNT: i64 = 17;
+// Set.prototype.values reads the internal storage, so an overridden Symbol.iterator cannot hide entries.
+const FN_SET_VALUES: i64 = 17;
+const DEEP_FUNCTION_COUNT: i64 = 18;
 
 pub struct DeepIntrinsics {
-    functions: array<ptr<u8>, 17>;
+    functions: array<ptr<u8>, 18>;
 }
 
 // Per-comparison scratch: the active path for cycle detection and a step budget.
@@ -82,6 +85,7 @@ pub fun deep_install(ctx: ptr<u8>, table: ptr<DeepIntrinsics>, ex: ptr<ptr<u8>>)
     (deref table.functions)[FN_KEYS] = capture(ctx, object_ctor, "keys", ex);
     (deref table.functions)[FN_SYMBOLS] = capture(ctx, object_ctor, "getOwnPropertySymbols", ex);
     (deref table.functions)[FN_REFLECT_GET] = capture(ctx, get(ctx, root, "Reflect", ex), "get", ex);
+    (deref table.functions)[FN_SET_VALUES] = capture(ctx, get(ctx, get(ctx, root, "Set", ex), "prototype", ex), "values", ex);
     (deref table.functions)[FN_TAG] = capture(ctx, object_proto, "toString", ex);
     (deref table.functions)[FN_HAS_OWN] = capture(ctx, object_proto, "hasOwnProperty", ex);
     (deref table.functions)[FN_IS_ENUMERABLE] = capture(ctx, object_proto, "propertyIsEnumerable", ex);
@@ -168,6 +172,7 @@ const TAG_SET: i64 = 9;
 const TAG_ARRAY_BUFFER: i64 = 10;
 const TAG_ERROR: i64 = 11;
 const TAG_OPAQUE: i64 = 12;
+const TAG_DATA_VIEW: i64 = 13;
 const TAG_NAME_CAPACITY: i64 = 64;
 
 fun tag_code(ctx: ptr<u8>, tag: ptr<u8>, ex: ptr<ptr<u8>>) -> i64 {
@@ -204,6 +209,9 @@ fun tag_code(ctx: ptr<u8>, tag: ptr<u8>, ex: ptr<ptr<u8>>) -> i64 {
     }
     if (mem_eq_cstr(name, "[object Set]")) {
         return TAG_SET;
+    }
+    if (mem_eq_cstr(name, "[object DataView]")) {
+        return TAG_DATA_VIEW;
     }
     if (mem_eq_cstr(name, "[object ArrayBuffer]")) {
         return TAG_ARRAY_BUFFER;
@@ -342,16 +350,32 @@ fun compare_keys(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: ptr
     return result;
 }
 
+// Set elements come from the captured Set.prototype.values, which reads the internal storage. Map
+// entries keep using Array.from(map); Node also follows a Map's own iterator here.
+fun collection_items(ctx: ptr<u8>, run: ptr<DeepRun>, value: ptr<u8>, is_map: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (is_map) {
+        return unary(ctx, run, FN_FROM, value, ex);
+    }
+    var iterator: ptr<u8> = method0(ctx, run, FN_SET_VALUES, value, ex);
+    if (deref ex != null) {
+        return null;
+    }
+    protect(ctx, iterator);
+    var items: ptr<u8> = unary(ctx, run, FN_FROM, iterator, ex);
+    unprotect(ctx, iterator);
+    return items;
+}
+
 // Unordered Map/Set comparison: each entry of a must match a distinct entry of b.
 // Quadratic, but bounded by DEEP_STEP_LIMIT through the nested deep() calls.
 fun compare_collection(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: ptr<u8>, is_map: bool,
     ex: ptr<ptr<u8>>) -> bool {
-    var items_a: ptr<u8> = unary(ctx, run, FN_FROM, a, ex);
+    var items_a: ptr<u8> = collection_items(ctx, run, a, is_map, ex);
     if (deref ex != null) {
         return false;
     }
     protect(ctx, items_a);
-    var items_b: ptr<u8> = unary(ctx, run, FN_FROM, b, ex);
+    var items_b: ptr<u8> = collection_items(ctx, run, b, is_map, ex);
     var result: bool = deref ex == null;
     if (result) {
         protect(ctx, items_b);
@@ -420,6 +444,57 @@ fun compare_buffers(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: 
     return result;
 }
 
+// Compares the bytes a DataView can see: byte length first, then a Uint8Array over the same window.
+fun compare_data_views(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (!named_property_equal(ctx, run, a, b, "byteLength", ex)) {
+        return false;
+    }
+    var view_a: ptr<u8> = data_view_bytes(ctx, run, a, ex);
+    if (deref ex != null) {
+        return false;
+    }
+    protect(ctx, view_a);
+    var view_b: ptr<u8> = data_view_bytes(ctx, run, b, ex);
+    var result: bool = false;
+    if (deref ex == null) {
+        protect(ctx, view_b);
+        result = compare_keys(ctx, run, depth, view_a, view_b, ex);
+        unprotect(ctx, view_b);
+    }
+    unprotect(ctx, view_a);
+    return result;
+}
+
+fun data_view_bytes(ctx: ptr<u8>, run: ptr<DeepRun>, view: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var window: array<ptr<u8>, 3> = [get(ctx, view, "buffer", ex), get(ctx, view, "byteOffset", ex),
+        get(ctx, view, "byteLength", ex)];
+    if (deref ex != null) {
+        return null;
+    }
+    return construct(ctx, intrinsic(run, FN_UINT8_ARRAY), 3, &window[0], ex);
+}
+
+// Error.cause and AggregateError.errors are normally non-enumerable, so they are compared explicitly:
+// both sides must own the property or neither, and owned values must be deeply equal.
+fun compare_hidden_property(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b: ptr<u8>, name: str,
+    ex: ptr<ptr<u8>>) -> bool {
+    var key: ptr<u8> = text(ctx, name);
+    protect(ctx, key);
+    var argument: array<ptr<u8>, 1> = [key];
+    var owned_a: bool = truth(ctx, call(ctx, intrinsic(run, FN_HAS_OWN), a, 1, &argument[0], ex));
+    var owned_b: bool = false;
+    if (deref ex == null) {
+        owned_b = truth(ctx, call(ctx, intrinsic(run, FN_HAS_OWN), b, 1, &argument[0], ex));
+    }
+    var same_presence: bool = (owned_a && owned_b) || (!owned_a && !owned_b);
+    var result: bool = deref ex == null && same_presence;
+    if (result && owned_a) {
+        result = compare_property(ctx, run, depth, a, b, key, ex);
+    }
+    unprotect(ctx, key);
+    return result;
+}
+
 fun named_property_equal(ctx: ptr<u8>, run: ptr<DeepRun>, a: ptr<u8>, b: ptr<u8>, name: str,
     ex: ptr<ptr<u8>>) -> bool {
     var left: ptr<u8> = get(ctx, a, name, ex);
@@ -469,14 +544,26 @@ fun compare_contents(ctx: ptr<u8>, run: ptr<DeepRun>, depth: i64, a: ptr<u8>, b:
         if (!named_property_equal(ctx, run, a, b, "message", ex) || !named_property_equal(ctx, run, a, b, "name", ex)) {
             return false;
         }
+        if (!compare_hidden_property(ctx, run, depth, a, b, "cause", ex) ||
+            !compare_hidden_property(ctx, run, depth, a, b, "errors", ex)) {
+            return false;
+        }
     }
     if (code == TAG_MAP || code == TAG_SET) {
         if (!compare_collection(ctx, run, depth, a, b, code == TAG_MAP, ex)) {
             return false;
         }
     }
-    if (code == TAG_ARRAY_BUFFER) {
-        return compare_buffers(ctx, run, depth, a, b, ex);
+    // Byte contents are compared first; own enumerable properties are still checked below.
+    if (code == TAG_ARRAY_BUFFER && !compare_buffers(ctx, run, depth, a, b, ex)) {
+        return false;
+    }
+    if (code == TAG_DATA_VIEW && !compare_data_views(ctx, run, depth, a, b, ex)) {
+        return false;
+    }
+    // Sparse arrays with the same enumerable keys can still differ in length.
+    if (deref ex == null && is_array(ctx, a) && is_array(ctx, b) && !named_property_equal(ctx, run, a, b, "length", ex)) {
+        return false;
     }
     return deref ex == null && compare_keys(ctx, run, depth, a, b, ex);
 }
