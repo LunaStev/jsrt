@@ -4,7 +4,7 @@
 배포 복구와 추가 부하를 수행하고 별도 test를 재실행한다. 그 산출물을 Ubuntu 26.04/26.10
 사용자 공간에서 검증한다. 그 안에서 고정 npm 그래프를 HTTPS로 설치하고 Polka TCP 사례도 실행한다.
 워크플로 파일을 준비한 것과 GitHub에서 실행한 결과를 구분한다.
-현재 작업 디렉터리에 .git/원격 연결이 없어 여기서 원격 실행이나 runner 등록을 수행하지 않았다.
+저장소는 https://github.com/potatosl/jsrt 이며 self-hosted runner는 아직 연결하지 않았다. 그래서 push·schedule 트리거를 꺼 두었고 워크플로는 수동(workflow_dispatch)으로만 실행한다. 원격 실행 결과는 아직 없다.
 
 2026-10-26에 native-vm job을 추가했다. GitHub-hosted ubuntu-26.04 VM에서 artifact의
 외부 SHA-256을 검사하고 압축을 푼 뒤 동봉된 Wave jsrt-deploy check를 실행한다.

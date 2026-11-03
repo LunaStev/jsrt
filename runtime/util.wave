@@ -2,8 +2,9 @@ import("./context_state")::{owned_context_slot, active_context};
 import("std::mem::layout")::{size_of};
 // Method slots are indexes into UtilState.methods; the first seven predate
 // the named constants and are still matched by number in jsrt_util_api.
-const UTIL_METHOD_COUNT: i64 = 8;
+const UTIL_METHOD_COUNT: i64 = 9;
 const UTIL_METHOD_DEPRECATE: i64 = 7;
+const UTIL_METHOD_IS_DEEP_EQUAL: i64 = 8;
 // JSValueGetType results used for argument validation.
 const VALUE_UNDEFINED: i32 = 0;
 const VALUE_STRING: i32 = 4;
@@ -23,7 +24,9 @@ struct UtilState {
     reflect_get: ptr<u8>;
     // Symbol.for('nodejs.util.promisify.custom'), shared with npm packages.
     promisify_custom: ptr<u8>;
-    methods: array<ptr<u8>, 8>;
+    methods: array<ptr<u8>, 9>;
+    // Captured intrinsics for util.isDeepStrictEqual, shared with assert.deepStrictEqual.
+    deep: DeepIntrinsics;
 }
 
 fun util_storage(ctx: ptr<u8>) -> ptr<UtilState> {
@@ -34,6 +37,7 @@ fun util_storage(ctx: ptr<u8>) -> ptr<UtilState> {
 import("./values")::{get, put, plain, define, fail, capture, text};
 import("./collections")::{bind_one, flag, set_flag, weak_map, weak_get, weak_set};
 import("./output")::{write_text, print_value};
+import("./assert_deep")::{DeepIntrinsics, deep_install, deep_release, deep_equal};
 import("./buffer_core")::{is_byte_view};
 import("./config")::{ARGUMENT_LIMIT};
 import("./format")::{format_to_value, inspect_to_value};
@@ -193,6 +197,17 @@ export(c) fun jsrt_util_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count:
     if (equal(ctx, fn, (deref host_state.methods)[UTIL_METHOD_DEPRECATE])) {
         return make_deprecated(ctx, host_state, count, args, ex);
     }
+    if (equal(ctx, fn, (deref host_state.methods)[UTIL_METHOD_IS_DEEP_EQUAL])) {
+        if (count < 2) {
+            fail(ctx, ex, FAIL_TYPE_ERROR, "isDeepStrictEqual requires two values");
+            return undefined(ctx);
+        }
+        var matches: bool = deep_equal(ctx, &(deref host_state.deep), args[0], args[1], ex);
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        return boolean(ctx, matches);
+    }
     if (equal(ctx, fn, (deref host_state.methods)[0])) {
         if (count == 0 || kind(ctx, args[0]) != 5 || !callable(ctx, args[0])) {
             fail(ctx, ex, 1, "promisify requires a function");
@@ -294,6 +309,9 @@ export(c) fun jsrt_util_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count:
 pub fun install_util(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     var host_state: ptr<UtilState> = util_storage(ctx);
     deref host_state.set_prototype_fn = capture(ctx, get(ctx, global(ctx), "Reflect", ex), "setPrototypeOf", ex);
+    if (!deep_install(ctx, &(deref host_state.deep), ex)) {
+        return false;
+    }
     deref host_state.reflect_get = capture(ctx, get(ctx, global(ctx), "Reflect", ex), "get", ex);
     var symbol_ctor: ptr<u8> = get(ctx, global(ctx), "Symbol", ex);
     var symbol_for: ptr<u8> = get(ctx, symbol_ctor, "for", ex);
@@ -311,8 +329,8 @@ pub fun install_util(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     protect(ctx, (deref host_state.deprecations));
     (deref host_state.exports) = plain(ctx);
     protect(ctx, (deref host_state.exports));
-    var names: array<str, 8> = ["promisify", "promisified", "completion", "isUint8Array", "inherits", "format", "inspect",
-        "deprecate"];
+    var names: array<str, 9> = ["promisify", "promisified", "completion", "isUint8Array", "inherits", "format", "inspect",
+        "deprecate", "isDeepStrictEqual"];
     for (var i: i64 = 0; i < UTIL_METHOD_COUNT; i++) {
         var name: ptr<u8> = utf8(names[i]);
         (deref host_state.methods)[i] = function(ctx, name, callback());
@@ -322,6 +340,8 @@ pub fun install_util(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     define(ctx, (deref host_state.exports), "promisify", (deref host_state.methods)[0], ex, false);
     define(ctx, (deref host_state.methods)[0], "custom", deref host_state.promisify_custom, ex, false);
     define(ctx, (deref host_state.exports), "deprecate", (deref host_state.methods)[UTIL_METHOD_DEPRECATE], ex, false);
+    define(ctx, (deref host_state.exports), "isDeepStrictEqual", (deref host_state.methods)[UTIL_METHOD_IS_DEEP_EQUAL],
+        ex, false);
     define(ctx, (deref host_state.exports), "inherits", (deref host_state.methods)[4], ex, false);
     define(ctx, (deref host_state.exports), "format", (deref host_state.methods)[5], ex, false);
     define(ctx, (deref host_state.exports), "inspect", (deref host_state.methods)[6], ex, false);
@@ -346,6 +366,7 @@ pub fun shutdown_util(ctx: ptr<u8>) {
         unprotect(ctx, deref host_state.set_prototype_fn);
         deref host_state.set_prototype_fn = null;
     }
+    deep_release(ctx, &(deref host_state.deep));
     if (deref host_state.reflect_get != null) {
         unprotect(ctx, deref host_state.reflect_get);
         deref host_state.reflect_get = null;

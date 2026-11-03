@@ -759,6 +759,17 @@ pub fun install_system(ctx: ptr<u8>, source_index: i32, eval_mode: bool) -> bool
         executable[executable_size] = 0;
         put(ctx, process, "execPath", text_value(ctx, &executable[0] as str), &ex);
     }
+    // Static identity fields. process.version is jsrt's own version, not a Node version, and
+    // process.versions deliberately has no "node" entry so feature checks do not assume one.
+    put(ctx, process, "version", text_value(ctx, "v0.1.0-dev"), &ex);
+    put(ctx, process, "title", text_value(ctx, "jsrt"), &ex);
+    put(ctx, process, "argv0", text_value(ctx, jsrt_argv(0)), &ex);
+    put(ctx, process, "execArgv", wr_array(ctx, 0, null, &ex), &ex);
+    var release: ptr<u8> = wr_object(ctx, null, null);
+    wr_protect(ctx, release);
+    put(ctx, release, "name", text_value(ctx, "jsrt"), &ex);
+    put(ctx, process, "release", release, &ex);
+    wr_unprotect(ctx, release);
     put(ctx, process, "env", environment, &ex);
     put(ctx, process, "cwd", native_function(ctx, "cwd", 0), &ex);
     put(ctx, process, "chdir", native_function(ctx, "chdir", 5), &ex);

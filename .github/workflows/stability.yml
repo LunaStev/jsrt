@@ -1,7 +1,6 @@
 name: Sustained runtime stability
 on:
-  schedule:
-    - cron: '0 16 * * 6'
+# 주간 schedule 트리거는 self-hosted runner를 연결한 뒤에 다시 켠다(runner가 없으면 대기열에 쌓인다).
   workflow_dispatch:
     inputs:
       duration:
