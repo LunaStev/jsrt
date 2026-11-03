@@ -2,7 +2,14 @@
 import("./config")::{URL_CAP};
 import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
 import("./byte_codec")::{encode_utf8, decode_bytes};
-import("./values")::{text, fail};
+import("./values")::{text, fail, define};
+import("std::mem::ops")::{mem_copy};
+
+// curl_url parts used below.
+const PART_URL: i32 = 0;
+const PART_PATH: i32 = 7;
+const PART_QUERY: i32 = 8;
+const PART_FRAGMENT: i32 = 9;
 extern(c, "wr_to_string") fun stringify(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
 extern(c, "wr_string_value") fun string_value(ctx: ptr<u8>, value: ptr<u8>) -> ptr<u8>;
 extern(c, "wr_string_release") fun release(value: ptr<u8>);
@@ -87,9 +94,9 @@ fun canonical(ctx: ptr<u8>, handle: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
     var result: ptr<u8> = undefined(ctx);
     if (url_get(handle, 1, &scheme, 0) != 0 || (!mem_eq_cstr(scheme as str, "http") && !mem_eq_cstr(scheme as str,
         "https"))) {
-        fail(ctx, ex, 1, "URL currently supports HTTP and HTTPS schemes");
+        invalid_url(ctx, ex, "URL currently supports HTTP and HTTPS schemes");
     } else if (url_get(handle, 5, &host, 4096) != 0) {
-        fail(ctx, ex, 1, "invalid URL hostname");
+        invalid_url(ctx, ex, "invalid URL hostname");
     } else {
         var lower: array<u8, 8192>;
         var n: i64 = mem_len_cstr(host as str);
@@ -105,7 +112,7 @@ fun canonical(ctx: ptr<u8>, handle: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
             }
             lower[n] = 0;
             if (url_set(handle, 5, &lower[0], 0) != 0 || url_get(handle, 0, &whole, 16386) != 0) {
-                fail(ctx, ex, 1, "invalid URL");
+                invalid_url(ctx, ex, "invalid URL");
             } else if (mem_len_cstr(whole as str) >= URL_CAP) {
                 fail(ctx, ex, 2, "URL byte limit exceeded");
             } else {
@@ -125,9 +132,83 @@ fun canonical(ctx: ptr<u8>, handle: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
     return result;
 }
 
+
+// Parsing failures carry Node's code so callers can match on it.
+fun invalid_url(ctx: ptr<u8>, ex: ptr<ptr<u8>>, message: str) {
+    fail(ctx, ex, 1, message);
+    if (deref ex != null) {
+        var ignored: ptr<u8> = null;
+        define(ctx, deref ex, "code", text(ctx, "ERR_INVALID_URL"), &ignored, false);
+    }
+}
+
+fun lower_ascii(c: u8) -> u8 {
+    if (c >= 65 && c <= 90) {
+        return c + 32;
+    }
+    return c;
+}
+
+// curl lowercases percent-escapes in a part that is set on its own (a full parse keeps them). The
+// URL standard keeps the spelling it was given, so the part curl stored is swapped back for the
+// bytes we passed in, provided the two differ only in letter case.
+fun restore_part_case(ctx: ptr<u8>, handle: ptr<u8>, part: i32, wanted: ptr<u8>, href: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (part != PART_PATH && part != PART_QUERY && part != PART_FRAGMENT) {
+        return href;
+    }
+    var stored: ptr<u8> = null;
+    if (url_get(handle, part, &stored, 0) != 0 || stored == null) {
+        return href;
+    }
+    var length: i64 = mem_len_cstr(stored as str);
+    var same_letters: bool = length == mem_len_cstr(wanted as str);
+    for (var i: i64 = 0; same_letters && i < length; i++) {
+        same_letters = lower_ascii(stored[i]) == lower_ascii(wanted[i]);
+    }
+    var whole: array<u8, 8192>;
+    var total: i64 = -1;
+    if (same_letters) {
+        total = encode_utf8(ctx, href, &whole[0], URL_CAP, false, ex);
+    }
+    var result: ptr<u8> = href;
+    if (total > 0 && deref ex == null) {
+        // The part lies after "://host" for the path, after '?' for the query and after '#' for the fragment.
+        var marker: u8 = 47;
+        if (part == PART_QUERY) {
+            marker = 63;
+        } else if (part == PART_FRAGMENT) {
+            marker = 35;
+        }
+        var start: i64 = 0;
+        if (part == PART_PATH) {
+            while (start + 2 < total && !(whole[start] == 58 && whole[start + 1] == 47 && whole[start + 2] == 47)) {
+                start += 1;
+            }
+            start += 3;
+        }
+        while (start < total && whole[start] != marker) {
+            start += 1;
+        }
+        if (part != PART_PATH) {
+            start += 1;
+        }
+        var matches: bool = start + length <= total;
+        for (var i: i64 = 0; matches && i < length; i++) {
+            matches = whole[start + i] == stored[i];
+        }
+        if (matches) {
+            mem_copy(&whole[start], wanted, length);
+            whole[total] = 0;
+            result = text(ctx, &whole[0] as str);
+        }
+    }
+    curl_free(stored);
+    return result;
+}
 pub fun parse_url(ctx: ptr<u8>, value: ptr<u8>, base: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
     var bytes: array<u8, 8192>;
-    if (encoded(ctx, value, &bytes[0], true, ex) < 0) {
+    var input_length: i64 = encoded(ctx, value, &bytes[0], true, ex);
+    if (input_length < 0) {
         return undefined(ctx);
     }
     var handle: ptr<u8> = url_new();
@@ -138,12 +219,19 @@ pub fun parse_url(ctx: ptr<u8>, value: ptr<u8>, base: ptr<u8>, ex: ptr<ptr<u8>>)
     var ok: bool = true;
     if (base != null) {
         var previous: array<u8, 8192>;
-        if (encoded(ctx, base, &previous[0], true, ex) < 0 || url_set(handle, 0, &previous[0], 0) != 0) {
+        if (encoded(ctx, base, &previous[0], true, ex) < 0 || url_set(handle, PART_URL, &previous[0], 0) != 0) {
             ok = false;
         }
     }
-    if (!ok || url_set(handle, 0, &bytes[0], 0) != 0) {
-        fail(ctx, ex, 1, "invalid URL or base URL");
+    if (deref ex != null) {
+        url_free(handle);
+        return undefined(ctx);
+    }
+    if (!ok || url_set(handle, PART_URL, &bytes[0], 0) != 0) {
+        invalid_url(ctx, ex, "invalid URL or base URL");
+    } else if (base != null && input_length == 0) {
+        // An empty reference resolves to the base without its fragment.
+        url_set(handle, PART_FRAGMENT, null, 0);
     }
     var result: ptr<u8> = undefined(ctx);
     if (deref ex == null) {
@@ -198,12 +286,18 @@ pub fun change_url(ctx: ptr<u8>, href: ptr<u8>, part: i32, value: ptr<u8>, remov
     if (remove) {
         data = null;
     }
-    if (url_set(handle, 0, &bytes[0], 0) != 0 || url_set(handle, part, data, 0) != 0) {
-        fail(ctx, ex, 1, "invalid URL component");
+    if (url_set(handle, PART_URL, &bytes[0], 0) != 0 || url_set(handle, part, data, 0) != 0) {
+        invalid_url(ctx, ex, "invalid URL component");
     }
     var result: ptr<u8> = undefined(ctx);
     if (deref ex == null) {
         result = canonical(ctx, handle, ex);
+    }
+    if (deref ex == null && !remove) {
+        protect(ctx, result);
+        var restored: ptr<u8> = restore_part_case(ctx, handle, part, &next[0], result, ex);
+        unprotect(ctx, result);
+        result = restored;
     }
     url_free(handle);
     return result;

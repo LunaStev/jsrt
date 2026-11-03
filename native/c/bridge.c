@@ -321,6 +321,7 @@ extern JSValue jsrt_buffer_to_json(const void *, void *, void *, size_t, const J
                                    JSValue *);
 extern JSValue jsrt_buffer_compare_static(const void *, void *, void *, size_t, const JSValue *,
                                           JSValue *);
+extern JSValue jsrt_buffer_write(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 JSCallback jsrt_buffer_callback(int32_t kind) {
     switch (kind) {
     case 0:
@@ -351,6 +352,8 @@ JSCallback jsrt_buffer_callback(int32_t kind) {
         return jsrt_buffer_to_json;
     case 13:
         return jsrt_buffer_compare_static;
+    case 14:
+        return jsrt_buffer_write;
     default:
         return NULL;
     }
@@ -369,6 +372,7 @@ extern JSValue jsrt_event_once(const void *, void *, void *, size_t, const JSVal
 extern JSValue jsrt_event_settle_value(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 extern JSValue jsrt_event_settle_error(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 extern JSValue jsrt_event_static_count(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+extern JSValue jsrt_event_max(const void *, void *, void *, size_t, const JSValue *, JSValue *);
 JSCallback jsrt_event_callback(int32_t kind) {
     switch (kind) {
     case 0:
@@ -389,6 +393,8 @@ JSCallback jsrt_event_callback(int32_t kind) {
         return jsrt_event_settle_error;
     case 8:
         return jsrt_event_static_count;
+    case 9:
+        return jsrt_event_max;
     default:
         return NULL;
     }

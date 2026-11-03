@@ -16,6 +16,7 @@ extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
 extern(c, "wr_equal") fun equal(ctx: ptr<u8>, left: ptr<u8>, right: ptr<u8>) -> bool;
 extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
 extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_to_number") fun to_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
 extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
 extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
 extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, value: ptr<u8>, parent: ptr<u8>);
@@ -77,6 +78,21 @@ pub fun add_listener(ctx: ptr<u8>, receiver: ptr<u8>, name: ptr<u8>, fn: ptr<u8>
         fail(ctx, ex, 2, "EventEmitter listener limit exceeded");
         return;
     }
+    // Node emits 'newListener' before the listener is added. A handler may add listeners itself, so
+    // the list is read again afterwards.
+    if (has_named_listeners(ctx, receiver, "newListener")) {
+        var notice: array<ptr<u8>, 2> = [name, fn];
+        emit_event(ctx, receiver, text(ctx, "newListener"), 2, &notice[0], ex);
+        if (deref ex != null) {
+            return;
+        }
+        old = get(ctx, state, "listeners", ex);
+        n = length(ctx, old, ex);
+        if (n >= EVENT_LISTENER_LIMIT) {
+            fail(ctx, ex, 2, "EventEmitter listener limit exceeded");
+            return;
+        }
+    }
     var entry: ptr<u8> = plain(ctx);
     protect(ctx, entry);
     put(ctx, entry, "name", name, ex);
@@ -124,6 +140,8 @@ pub fun remove_listener(ctx: ptr<u8>, receiver: ptr<u8>, name: ptr<u8>, fn: ptr<
     if (found < 0) {
         return;
     }
+    var removed: ptr<u8> = at(ctx, old, found, ex);
+    protect(ctx, removed);
     var next: ptr<u8> = list(ctx, ex);
     protect(ctx, next);
     for (var i: i64 = 0; i < n && deref ex == null; i++) {
@@ -133,6 +151,16 @@ pub fun remove_listener(ctx: ptr<u8>, receiver: ptr<u8>, name: ptr<u8>, fn: ptr<
     }
     put(ctx, state, "listeners", next, ex);
     unprotect(ctx, next);
+    // Node emits 'removeListener' after the listener is gone, with its name and function.
+    if (deref ex == null && has_named_listeners(ctx, receiver, "removeListener")) {
+        var notice: array<ptr<u8>, 2> = [get(ctx, removed, "name", ex), get(ctx, removed, "fn", ex)];
+        protect(ctx, notice[0]);
+        protect(ctx, notice[1]);
+        emit_event(ctx, receiver, text(ctx, "removeListener"), 2, &notice[0], ex);
+        unprotect(ctx, notice[1]);
+        unprotect(ctx, notice[0]);
+    }
+    unprotect(ctx, removed);
 }
 
 pub fun emit_event(ctx: ptr<u8>, receiver: ptr<u8>, name: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> bool {
@@ -327,8 +355,13 @@ const INTRINSIC_ONCE: i64 = 13;
 const INTRINSIC_SETTLE_VALUE: i64 = 14;
 const INTRINSIC_SETTLE_ERROR: i64 = 15;
 const INTRINSIC_STATIC_COUNT: i64 = 16;
-const INTRINSIC_LAST: i64 = 17;
-const EVENTS_STATE_BYTES: i64 = 144;
+// setMaxListeners/getMaxListeners share one C callback (code 9).
+const INTRINSIC_SET_MAX: i64 = 17;
+const INTRINSIC_GET_MAX: i64 = 18;
+const INTRINSIC_LAST: i64 = 19;
+const DEFAULT_MAX_LISTENERS: f64 = 10.0;
+const JS_NUMBER: i32 = 3;
+const EVENTS_STATE_BYTES: i64 = 160;
 const JS_OBJECT: i32 = 5;
 
 // Marks the record settled and removes both listeners. False when it already settled.
@@ -453,6 +486,37 @@ export(c) fun jsrt_event_static_count(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u
     return call(ctx, method, args[0], 1, &name[0], ex);
 }
 
+
+// emitter.setMaxListeners(n) / emitter.getMaxListeners(). The value is stored and reported for
+// compatibility; jsrt does not print Node's leak warning, and EVENT_LISTENER_LIMIT stays the hard cap.
+export(c) fun jsrt_event_max(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<u8> = event_state(ctx, receiver, ex);
+    if (state == null) {
+        return undefined(ctx);
+    }
+    if (equal(ctx, fn, deref intrinsic(ctx, INTRINSIC_SET_MAX))) {
+        if (count < 1 || kind(ctx, args[0]) != JS_NUMBER) {
+            fail(ctx, ex, 1, "setMaxListeners requires a number");
+            return undefined(ctx);
+        }
+        var limit: f64 = to_number(ctx, args[0], ex);
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        if (limit != limit || limit < 0.0) {
+            fail(ctx, ex, 2, "setMaxListeners requires a non-negative number");
+            return undefined(ctx);
+        }
+        put(ctx, state, "max", args[0], ex);
+        return receiver;
+    }
+    var stored: ptr<u8> = get(ctx, state, "max", ex);
+    if (deref ex == null && kind(ctx, stored) == JS_NUMBER) {
+        return stored;
+    }
+    return get(ctx, deref intrinsic(ctx, 1), "defaultMaxListeners", ex);
+}
 pub fun install_events(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     if (!allocate_context_slot(ctx, EVENTS_SLOT, EVENTS_STATE_BYTES)) {
         return false;
@@ -487,6 +551,17 @@ pub fun install_events(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     }
     define(ctx, deref intrinsic(ctx, 1), "once", deref intrinsic(ctx, INTRINSIC_ONCE), ex, true);
     define(ctx, deref intrinsic(ctx, 1), "listenerCount", deref intrinsic(ctx, INTRINSIC_STATIC_COUNT), ex, true);
+    var max_names: array<str, 2> = ["setMaxListeners", "getMaxListeners"];
+    for (var i: i64 = 0; i < 2; i++) {
+        var max_name: ptr<u8> = utf8(max_names[i]);
+        deref intrinsic(ctx, INTRINSIC_SET_MAX + i) = function(ctx, max_name, callback(9));
+        release(max_name);
+        protect(ctx, deref intrinsic(ctx, INTRINSIC_SET_MAX + i));
+        define(ctx, deref intrinsic(ctx, 2), max_names[i], deref intrinsic(ctx, INTRINSIC_SET_MAX + i), ex, false);
+    }
+    // rawListeners returns the registered functions; jsrt stores once listeners unwrapped.
+    define(ctx, deref intrinsic(ctx, 2), "rawListeners", deref intrinsic(ctx, 3 + (7)), ex, false);
+    define(ctx, deref intrinsic(ctx, 1), "defaultMaxListeners", number(ctx, DEFAULT_MAX_LISTENERS), ex, true);
     return deref ex == null;
 }
 

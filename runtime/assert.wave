@@ -5,6 +5,9 @@ struct AssertState {
     methods: array<ptr<u8>, 9>;
     same: ptr<u8>;
     deep: DeepIntrinsics;
+    // Captured for exception matchers: isPrototypeOf, RegExp.prototype.exec, RegExp.prototype,
+    // Object.keys, String, Error, Reflect.get and String.prototype.concat.
+    matcher: array<ptr<u8>, 8>;
 }
 
 // Method slots: 0 ok, 1 strictEqual, 2 notStrictEqual, 3 fail, 4 throws, 5 doesNotThrow,
@@ -12,13 +15,30 @@ struct AssertState {
 const METHOD_COUNT: i64 = 9;
 const METHOD_DEEP_EQUAL: i64 = 7;
 const METHOD_NOT_DEEP_EQUAL: i64 = 8;
+const METHOD_THROWS: i64 = 4;
+const METHOD_DOES_NOT_THROW: i64 = 5;
+const M_IS_PROTOTYPE_OF: i64 = 0;
+const M_REGEXP_EXEC: i64 = 1;
+const M_REGEXP_PROTO: i64 = 2;
+const M_KEYS: i64 = 3;
+const M_STRING: i64 = 4;
+const M_ERROR: i64 = 5;
+const M_REFLECT_GET: i64 = 6;
+const M_CONCAT: i64 = 7;
+const MATCHER_COUNT: i64 = 8;
+const TYPE_UNDEFINED: i32 = 0;
+const TYPE_NULL: i32 = 1;
+const TYPE_BOOLEAN: i32 = 2;
+const TYPE_STRING: i32 = 4;
+const TYPE_OBJECT: i32 = 5;
 
 fun assert_storage(ctx: ptr<u8>) -> ptr<AssertState> {
     return owned_context_slot(ctx, 9, size_of<AssertState>() as i64) as ptr<AssertState>;
 }
 
 // A strict assertion subset. Preserve original exceptions and inspect no values implicitly.
-import("./values")::{get, text, define, capture, fail};
+import("./values")::{get, text, define, capture, fail, plain};
+import("./collections")::{length, at};
 extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
 extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
 extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
@@ -33,6 +53,7 @@ extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
 extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
     ex: ptr<ptr<u8>>) -> ptr<u8>;
 extern(c, "jsrt_assert_callback") fun callback() -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
 
 fun assertion(ctx: ptr<u8>, actual: ptr<u8>, expected: ptr<u8>, message: ptr<u8>, operation: str, ex: ptr<ptr<u8>>) {
     var error: ptr<u8> = null;
@@ -43,6 +64,7 @@ fun assertion(ctx: ptr<u8>, actual: ptr<u8>, expected: ptr<u8>, message: ptr<u8>
     define(ctx, error, "actual", actual, ex, true);
     define(ctx, error, "expected", expected, ex, true);
     define(ctx, error, "operator", text(ctx, operation), ex, true);
+    define(ctx, error, "generatedMessage", boolean(ctx, kind(ctx, message) != TYPE_STRING), ex, true);
     if (kind(ctx, message) == 4) {
         define(ctx, error, "message", message, ex, false);
     }
@@ -52,6 +74,242 @@ fun assertion(ctx: ptr<u8>, actual: ptr<u8>, expected: ptr<u8>, message: ptr<u8>
     unprotect(ctx, error);
 }
 
+
+fun matcher_fn(state: ptr<AssertState>, index: i64) -> ptr<u8> {
+    return (deref state.matcher)[index];
+}
+
+fun is_prototype_of(ctx: ptr<u8>, state: ptr<AssertState>, prototype: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (kind(ctx, prototype) != TYPE_OBJECT || kind(ctx, value) != TYPE_OBJECT) {
+        return false;
+    }
+    var argument: array<ptr<u8>, 1> = [value];
+    var result: ptr<u8> = call(ctx, matcher_fn(state, M_IS_PROTOTYPE_OF), prototype, 1, &argument[0], ex);
+    return deref ex == null && truth(ctx, result);
+}
+
+fun is_regexp(ctx: ptr<u8>, state: ptr<AssertState>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    return is_prototype_of(ctx, state, matcher_fn(state, M_REGEXP_PROTO), value, ex);
+}
+
+// Runs the captured RegExp.prototype.exec so a replaced exec cannot change the result.
+fun regexp_matches(ctx: ptr<u8>, state: ptr<AssertState>, pattern: ptr<u8>, subject: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var argument: array<ptr<u8>, 1> = [subject];
+    var text_value: ptr<u8> = call(ctx, matcher_fn(state, M_STRING), null, 1, &argument[0], ex);
+    if (deref ex != null) {
+        return false;
+    }
+    protect(ctx, text_value);
+    var exec_argument: array<ptr<u8>, 1> = [text_value];
+    var result: ptr<u8> = call(ctx, matcher_fn(state, M_REGEXP_EXEC), pattern, 1, &exec_argument[0], ex);
+    unprotect(ctx, text_value);
+    return deref ex == null && kind(ctx, result) != TYPE_NULL && kind(ctx, result) != TYPE_UNDEFINED;
+}
+
+// Every own enumerable key of the expected object must match the error: RegExp values are tested
+// against string properties, everything else is compared with deepStrictEqual.
+fun object_matches(ctx: ptr<u8>, state: ptr<AssertState>, error: ptr<u8>, expected: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (kind(ctx, error) != TYPE_OBJECT) {
+        return false;
+    }
+    var argument: array<ptr<u8>, 1> = [expected];
+    var keys: ptr<u8> = call(ctx, matcher_fn(state, M_KEYS), null, 1, &argument[0], ex);
+    if (deref ex != null) {
+        return false;
+    }
+    protect(ctx, keys);
+    var result: bool = true;
+    var total: i64 = length(ctx, keys, ex);
+    for (var i: i64 = 0; result && deref ex == null && i < total; i++) {
+        var key: ptr<u8> = at(ctx, keys, i, ex);
+        var expected_pair: array<ptr<u8>, 2> = [expected, key];
+        var wanted: ptr<u8> = call(ctx, matcher_fn(state, M_REFLECT_GET), null, 2, &expected_pair[0], ex);
+        protect(ctx, wanted);
+        var actual_pair: array<ptr<u8>, 2> = [error, key];
+        var present: ptr<u8> = call(ctx, matcher_fn(state, M_REFLECT_GET), null, 2, &actual_pair[0], ex);
+        protect(ctx, present);
+        if (deref ex == null) {
+            if (kind(ctx, present) == TYPE_STRING && is_regexp(ctx, state, wanted, ex)) {
+                result = regexp_matches(ctx, state, wanted, present, ex);
+            } else if (deref ex == null) {
+                result = deep_equal(ctx, &(deref state.deep), present, wanted, ex);
+            }
+        }
+        unprotect(ctx, present);
+        unprotect(ctx, wanted);
+    }
+    unprotect(ctx, keys);
+    return result && deref ex == null;
+}
+
+// Node's matcher rules for assert.throws/doesNotThrow: a class matches by instanceof, an Error
+// subclass that does not match fails, any other function is a validator that must return true,
+// a RegExp is tested against String(error) and an object is compared key by key.
+fun error_matches(ctx: ptr<u8>, state: ptr<AssertState>, error: ptr<u8>, expected: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (is_regexp(ctx, state, expected, ex)) {
+        return regexp_matches(ctx, state, expected, error, ex);
+    }
+    if (deref ex != null) {
+        return false;
+    }
+    if (callable(ctx, expected)) {
+        var prototype: ptr<u8> = get(ctx, expected, "prototype", ex);
+        if (deref ex == null && is_prototype_of(ctx, state, prototype, error, ex)) {
+            return true;
+        }
+        var error_ctor: ptr<u8> = matcher_fn(state, M_ERROR);
+        if (deref ex == null && (equal(ctx, expected, error_ctor) || is_prototype_of(ctx, state, error_ctor, expected, ex))) {
+            return false;
+        }
+        if (deref ex != null) {
+            return false;
+        }
+        var receiver: ptr<u8> = plain(ctx);
+        protect(ctx, receiver);
+        var argument: array<ptr<u8>, 1> = [error];
+        var verdict: ptr<u8> = call(ctx, expected, receiver, 1, &argument[0], ex);
+        unprotect(ctx, receiver);
+        return deref ex == null && kind(ctx, verdict) == TYPE_BOOLEAN && truth(ctx, verdict);
+    }
+    return object_matches(ctx, state, error, expected, ex);
+}
+
+
+// Joins up to four JS values with the captured String.prototype.concat.
+fun join_text(ctx: ptr<u8>, state: ptr<AssertState>, head: ptr<u8>, count: i64, parts: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var result: ptr<u8> = call(ctx, matcher_fn(state, M_CONCAT), head, count, parts, ex);
+    if (deref ex != null || result == null) {
+        return undefined(ctx);
+    }
+    return result;
+}
+
+// Node's wording: "<base> (MatcherName): message" or "<base> (MatcherName)." The name part appears
+// only for a function matcher with a non-empty name.
+fun compose_message(ctx: ptr<u8>, state: ptr<AssertState>, base: str, matcher: ptr<u8>, message: ptr<u8>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var result: ptr<u8> = text(ctx, base);
+    protect(ctx, result);
+    if (kind(ctx, matcher) == TYPE_OBJECT && callable(ctx, matcher)) {
+        var name: ptr<u8> = get(ctx, matcher, "name", ex);
+        if (deref ex == null && kind(ctx, name) == TYPE_STRING && truth(ctx, name)) {
+            var named: array<ptr<u8>, 3> = [text(ctx, " ("), name, text(ctx, ")")];
+            var next: ptr<u8> = join_text(ctx, state, result, 3, &named[0], ex);
+            unprotect(ctx, result);
+            result = next;
+            protect(ctx, result);
+        }
+    }
+    var tail: array<ptr<u8>, 2> = [text(ctx, "."), undefined(ctx)];
+    var tail_count: i64 = 1;
+    if (kind(ctx, message) == TYPE_STRING) {
+        tail[0] = text(ctx, ": ");
+        tail[1] = message;
+        tail_count = 2;
+    }
+    var finished: ptr<u8> = join_text(ctx, state, result, tail_count, &tail[0], ex);
+    unprotect(ctx, result);
+    return finished;
+}
+
+// 'The error is expected to be an instance of "Expected". Received "Actual"' for class mismatches.
+fun instance_message(ctx: ptr<u8>, state: ptr<AssertState>, error: ptr<u8>, matcher: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var expected_name: ptr<u8> = get(ctx, matcher, "name", ex);
+    protect(ctx, expected_name);
+    var actual_name: ptr<u8> = text(ctx, "undefined");
+    if (deref ex == null && kind(ctx, error) == TYPE_OBJECT) {
+        var ctor: ptr<u8> = get(ctx, error, "constructor", ex);
+        if (deref ex == null && kind(ctx, ctor) == TYPE_OBJECT) {
+            actual_name = get(ctx, ctor, "name", ex);
+        }
+    }
+    protect(ctx, actual_name);
+    var parts: array<ptr<u8>, 4> = [expected_name, text(ctx, "\". Received \""), actual_name, text(ctx, "\"")];
+    var result: ptr<u8> = join_text(ctx, state, text(ctx, "The error is expected to be an instance of \""), 4,
+        &parts[0], ex);
+    unprotect(ctx, actual_name);
+    unprotect(ctx, expected_name);
+    return result;
+}
+
+// True for a function matcher that is an Error class, the case Node reports with instance_message.
+fun is_error_class(ctx: ptr<u8>, state: ptr<AssertState>, matcher: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (kind(ctx, matcher) != TYPE_OBJECT || !callable(ctx, matcher)) {
+        return false;
+    }
+    var error_ctor: ptr<u8> = matcher_fn(state, M_ERROR);
+    return equal(ctx, matcher, error_ctor) || is_prototype_of(ctx, state, error_ctor, matcher, ex);
+}
+// assert.throws(fn[, matcher][, message]) and assert.doesNotThrow(fn[, matcher][, message]).
+fun run_throws(ctx: ptr<u8>, state: ptr<AssertState>, fn: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) {
+    if (count == 0 || kind(ctx, args[0]) != TYPE_OBJECT || !callable(ctx, args[0])) {
+        fail(ctx, ex, 1, "assertion requires a function");
+        return;
+    }
+    var matcher: ptr<u8> = undefined(ctx);
+    var message: ptr<u8> = undefined(ctx);
+    if (count > 1 && kind(ctx, args[1]) == TYPE_STRING) {
+        message = args[1];
+    } else if (count > 1 && kind(ctx, args[1]) != TYPE_UNDEFINED) {
+        matcher = args[1];
+        if (count > 2) {
+            message = args[2];
+        }
+        if (kind(ctx, matcher) != TYPE_OBJECT) {
+            fail(ctx, ex, 1, "the error matcher must be a function, RegExp or object");
+            return;
+        }
+    }
+    var has_matcher: bool = kind(ctx, matcher) == TYPE_OBJECT;
+    var problem: ptr<u8> = null;
+    call(ctx, args[0], null, 0, null, &problem);
+    var throws_method: bool = equal(ctx, fn, (deref state.methods)[METHOD_THROWS]);
+    if (throws_method && problem == null) {
+        var missing: ptr<u8> = compose_message(ctx, state, "Missing expected exception", matcher, message, ex);
+        if (deref ex == null) {
+            protect(ctx, missing);
+            assertion(ctx, undefined(ctx), matcher, missing, "throws", ex);
+            unprotect(ctx, missing);
+        }
+        return;
+    }
+    if (problem == null) {
+        return;
+    }
+    protect(ctx, problem);
+    var matched: bool = true;
+    if (has_matcher) {
+        matched = error_matches(ctx, state, problem, matcher, ex);
+    }
+    if (deref ex == null) {
+        if (throws_method && !matched) {
+            // A caller-supplied message replaces Node's generated text entirely here.
+            if (kind(ctx, message) != TYPE_STRING) {
+                if (is_error_class(ctx, state, matcher, ex)) {
+                    message = instance_message(ctx, state, problem, matcher, ex);
+                } else {
+                    message = text(ctx, "The error did not match the expected matcher.");
+                }
+            }
+            protect(ctx, message);
+            if (deref ex == null) {
+                assertion(ctx, problem, matcher, message, "throws", ex);
+            }
+            unprotect(ctx, message);
+        } else if (!throws_method && has_matcher && !matched) {
+            // doesNotThrow only reports errors it was asked about; others propagate unchanged.
+            deref ex = problem;
+        } else if (!throws_method) {
+            var unwanted: ptr<u8> = compose_message(ctx, state, "Got unwanted exception", undefined(ctx), message, ex);
+            if (deref ex == null) {
+                protect(ctx, unwanted);
+                assertion(ctx, problem, matcher, unwanted, "doesNotThrow", ex);
+                unprotect(ctx, unwanted);
+            }
+        }
+    }
+    unprotect(ctx, problem);
+}
 export(c) fun jsrt_assert_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
     ex: ptr<ptr<u8>>) -> ptr<u8> {
     var host_state: ptr<AssertState> = assert_storage(ctx);
@@ -69,7 +327,8 @@ export(c) fun jsrt_assert_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, coun
     }
     if (equal(ctx, fn, (deref host_state.methods)[0])) {
         if (!truth(ctx, actual)) {
-            assertion(ctx, actual, expected, expected, "ok", ex);
+            // Node reports ok() failures as actual == true with the second argument as the message.
+            assertion(ctx, actual, boolean(ctx, true), expected, "==", ex);
         }
     } else if (equal(ctx, fn, (deref host_state.methods)[1]) || equal(ctx, fn, (deref host_state.methods)[2])) {
         if (count < 2) {
@@ -111,21 +370,7 @@ export(c) fun jsrt_assert_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, coun
             assertion(ctx, actual, undefined(ctx), undefined(ctx), "ifError", ex);
         }
     } else {
-        if (count == 0 || kind(ctx, actual) != 5 || !callable(ctx, actual)) {
-            fail(ctx, ex, 1, "assertion requires a function");
-            return undefined(ctx);
-        }
-        if (count > 1 && kind(ctx, expected) != 4) {
-            fail(ctx, ex, 1, "exception matchers are not implemented; use a message string");
-            return undefined(ctx);
-        }
-        var problem: ptr<u8> = null;
-        call(ctx, actual, null, 0, null, &problem);
-        if (equal(ctx, fn, (deref host_state.methods)[4]) && problem == null) {
-            assertion(ctx, undefined(ctx), undefined(ctx), expected, "throws", ex);
-        } else if (equal(ctx, fn, (deref host_state.methods)[5]) && problem != null) {
-            deref ex = problem;
-        }
+        run_throws(ctx, host_state, fn, count, args, ex);
     }
     return undefined(ctx);
 }
@@ -133,6 +378,21 @@ export(c) fun jsrt_assert_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, coun
 pub fun install_assert(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     var host_state: ptr<AssertState> = assert_storage(ctx);
     (deref host_state.same) = capture(ctx, get(ctx, global(ctx), "Object", ex), "is", ex);
+    // Matcher intrinsics are captured before user code runs, so replacing them later cannot change results.
+    var root: ptr<u8> = global(ctx);
+    var object_ctor: ptr<u8> = get(ctx, root, "Object", ex);
+    var regexp_ctor: ptr<u8> = get(ctx, root, "RegExp", ex);
+    (deref host_state.matcher)[M_IS_PROTOTYPE_OF] = capture(ctx, get(ctx, object_ctor, "prototype", ex), "isPrototypeOf", ex);
+    (deref host_state.matcher)[M_REGEXP_EXEC] = capture(ctx, get(ctx, regexp_ctor, "prototype", ex), "exec", ex);
+    (deref host_state.matcher)[M_REGEXP_PROTO] = capture(ctx, regexp_ctor, "prototype", ex);
+    (deref host_state.matcher)[M_KEYS] = capture(ctx, object_ctor, "keys", ex);
+    (deref host_state.matcher)[M_STRING] = capture(ctx, root, "String", ex);
+    (deref host_state.matcher)[M_ERROR] = capture(ctx, root, "Error", ex);
+    (deref host_state.matcher)[M_REFLECT_GET] = capture(ctx, get(ctx, root, "Reflect", ex), "get", ex);
+    (deref host_state.matcher)[M_CONCAT] = capture(ctx, get(ctx, get(ctx, root, "String", ex), "prototype", ex), "concat", ex);
+    if (deref ex != null) {
+        return false;
+    }
     var names: array<str, 9> = ["ok", "strictEqual", "notStrictEqual", "fail", "throws", "doesNotThrow",
         "ifError", "deepStrictEqual", "notDeepStrictEqual"];
     if (!deep_install(ctx, &(deref host_state.deep), ex)) {
@@ -168,6 +428,12 @@ pub fun shutdown_assert(ctx: ptr<u8>) {
         (deref host_state.same) = null;
     }
     deep_release(ctx, &(deref host_state.deep));
+    for (var i: i64 = 0; i < MATCHER_COUNT; i++) {
+        if ((deref host_state.matcher)[i] != null) {
+            unprotect(ctx, (deref host_state.matcher)[i]);
+            (deref host_state.matcher)[i] = null;
+        }
+    }
     for (var i: i64 = 0; i < METHOD_COUNT; i++) {
         if ((deref host_state.methods)[i] != null) {
             unprotect(ctx, (deref host_state.methods)[i]);
