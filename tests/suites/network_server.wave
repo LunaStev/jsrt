@@ -1,0 +1,660 @@
+// HTTP parsing, responses, dispatch and conditional live TCP fixtures.
+import("jsrt::tools::support")::{join, spawn, wait};
+import("jsrt::runtime::http_headers")::{install_response_headers};
+import("jsrt::runtime::http_values")::{http_native};
+import("jsrt::runtime::http_state")::{free_connection_bytes};
+import("jsrt::runtime::http_protocol")::{HttpRequest, HttpHeader, new_request, feed_request, free_request,
+    request_method, header_index};
+import("jsrt::runtime::http_response_bytes")::{HttpOutput, encode_response, encode_head_connection};
+import("jsrt::runtime::http_protocol")::{request_keep_alive};
+import("jsrt::runtime::http_state")::{HttpConnection, http_state_storage, HttpHostState};
+import("jsrt::runtime::http_server")::{dispatch_http};
+import("jsrt::runtime::host")::{install_host, shutdown_host};
+import("jsrt::runtime::event_loop")::{run_event_loop};
+import("jsrt::runtime::streams")::{create_stream, stream_invoke};
+import("jsrt::runtime::values")::{plain, put};
+import("jsrt::runtime::values")::{text};
+import("jsrt::runtime::body_collect")::{attach_body};
+import("jsrt::runtime::buffer_core")::{buffer_from_bytes};
+import("std::mem::layout")::{size_of};
+import("std::fs::file")::{create, fs_read_all, remove};
+import("std::io::fd")::{io_close, io_write_all};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::ops")::{mem_eq, mem_copy, mem_zero};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("std::net::socket_base")::{net_socket_tcp_v4, net_connect_socket_v4, net_send_once, net_recv_once,
+    net_close};
+import("std::net::socketopt")::{net_set_nonblock};
+import("std::net::address")::{socket_addr_v4_loopback};
+import("std::net::poll")::{net_wait_connected, net_wait_readable, net_wait_writable};
+import("std::time::clock")::{time_now_monotonic_ns};
+import("std::time::sleep")::{time_sleep_ms};
+import("std::process::core")::{proc_kill};
+import("./contexts")::{context_result};
+import("./harness")::{async_case, check, contains, expect, test, TestState, test_state};
+extern(c, "llhttp_get_error_reason") fun http_error_reason(parser: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_context_create") fun wr_context_create(cls: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_context_release") fun wr_context_release(ctx: ptr<u8>);
+extern(c, "wr_checkpoint") fun checkpoint(ctx: ptr<u8>, ex: ptr<ptr<u8>>);
+extern(c, "wr_string_utf8") fun wr_string_utf8(text: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun wr_string_release(text: ptr<u8>);
+extern(c, "wr_string_copy_utf8") fun wr_string_copy_utf8(text: ptr<u8>, data: ptr<u8>, cap: i64) -> i64;
+extern(c, "wr_evaluate") fun wr_evaluate(ctx: ptr<u8>, source: ptr<u8>, receiver: ptr<u8>, url: ptr<u8>, line: i32,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_to_string") fun wr_to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_context_global") fun wr_context_global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_null") fun wr_null(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_number") fun wr_number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_protect") fun wr_protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun wr_unprotect(ctx: ptr<u8>, value: ptr<u8>);
+
+fun live_request_bytes(port: u16, message: ptr<u8>, size: i64) -> i64 {
+    var suite: ptr<TestState> = test_state();
+    var fd: i64 = net_socket_tcp_v4();
+    if (fd < 0) {
+        return -1;
+    }
+    if (net_set_nonblock(fd, 1) < 0) {
+        net_close(fd);
+        return -1;
+    }
+    var status: i64 = net_connect_socket_v4(fd, socket_addr_v4_loopback(port));
+    if (status != 0 && status != -115 && status != -11) {
+        net_close(fd);
+        return -1;
+    }
+    if (net_wait_connected(fd, 3000) <= 0) {
+        net_close(fd);
+        return -1;
+    }
+    var sent: i64 = 0;
+    while (sent < size) {
+        if (net_wait_writable(fd, 3000) <= 0) {
+            net_close(fd);
+            return -1;
+        }
+        var n: i64 = net_send_once(fd, message + sent, size - sent, 0);
+        if (n == -4 || n == -11) {
+            continue;
+        }
+        if (n <= 0) {
+            net_close(fd);
+            return -1;
+        }
+        sent += n;
+    }
+    var received: i64 = 0;
+    while (received < 65536) {
+        if (net_wait_readable(fd, 3000) <= 0) {
+            net_close(fd);
+            return -1;
+        }
+        var n: i64 = net_recv_once(fd, (deref suite.output) + received, 65536 - received, 0);
+        if (n == -4 || n == -11) {
+            continue;
+        }
+        if (n < 0) {
+            net_close(fd);
+            return -1;
+        }
+        if (n == 0) {
+            net_close(fd);
+            return received;
+        }
+        received += n;
+    }
+    net_close(fd);
+    return -1;
+}
+
+fun live_request(port: u16, message: str) -> i64 {
+    return live_request_bytes(port, message as ptr<u8>, mem_len_cstr(message));
+}
+
+fun http_live_tests() {
+    var suite: ptr<TestState> = test_state();
+    var probe: i64 = net_socket_tcp_v4();
+    if (probe == -1 || probe == -13) {
+        if ((deref suite.require_tcp)) {
+            check("required live TCP socket capability", false);
+            println("  socket() returned errno {}; actual TCP tests could not run", probe);
+            return;
+        }
+        deref suite.skipped += 1;
+        println("SKIP actual HTTP TCP suite: socket creation is denied");
+        return;
+    }
+    if (probe < 0) {
+        check("HTTP TCP capability probe", false);
+        return;
+    }
+    async_case("SIGTERM dispatch drains HTTP and pending file work before owned child exit", "const fs=require('fs'),p=process.argv[2];fs.writeFileSync(p,'starting');const source=\"const fs=require('fs'),h=require('http').createServer((q,r)=>r.end('ok'));h.listen(0,'127.0.0.1',()=>{process.once('SIGTERM',()=>{fs.promises.writeFile(process.argv[2],'done').then(()=>h.close(()=>console.log('drained')))});fs.writeFileSync(process.argv[2],'ready')});process.on('exit',c=>console.log('exited',c));\";const c=require('child_process').spawn(process.execPath,['-e',source,'--',p],{stdio:'inherit'});const t=setInterval(()=>{if(fs.existsSync(p)&&fs.readFileSync(p,'utf8')==='ready'){clearInterval(t);c.kill('SIGTERM')}},2);c.on('exit',(code,signal)=>console.log(code,signal,fs.readFileSync(p,'utf8')));",
+        "drained\nexited 0\n0 null done\n", 0, "");
+    net_close(probe);
+    var ready_path: str = join((deref suite.directory) as str, "http-ready") as str;
+    var out_path: str = join((deref suite.directory) as str, "http-out") as str;
+    var err_path: str = join((deref suite.directory) as str, "http-err") as str;
+    var out_fd: i64 = create(out_path);
+    var err_fd: i64 = create(err_path);
+    var pid: i64 = -1;
+    if (out_fd >= 0 && err_fd >= 0) {
+        var command: array<str, 3> = [(deref suite.binary) as str, "tests/http_server.js", ready_path];
+        pid = spawn(&command[0], 3, out_fd, err_fd);
+    }
+    if (out_fd >= 0) {
+        io_close(out_fd);
+    }
+    if (err_fd >= 0) {
+        io_close(err_fd);
+    }
+    var port: i64 = 0;
+    var start: i64 = time_now_monotonic_ns();
+    while (pid >= 0 && start >= 0) {
+        var length: i64 = fs_read_all(ready_path, (deref suite.output), 64);
+        if (length > 0) {
+            for (var i: i64 = 0; i < length; i++) {
+                if ((deref suite.output)[i] < 48 || (deref suite.output)[i] > 57) {
+                    port = -1;
+                    break;
+                }
+                port = port * 10 + ((deref suite.output)[i] - 48) as i64;
+            }
+            break;
+        }
+        var now: i64 = time_now_monotonic_ns();
+        if (now < 0 || now - start > 3000000000) {
+            break;
+        }
+        time_sleep_ms(2);
+    }
+    var ready: bool = port > 0 && port <= 65535;
+    check("HTTP binds ephemeral port and reports it from listen callback", ready);
+    if (ready) {
+        var n: i64 = live_request(port as u16, "GET /utf8 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        check("HTTP real UTF-8 response and validated replacement headers", n > 0 && contains((deref suite.output),
+            n, "HTTP/1.1 201 ") && contains((deref suite.output), n, "x-test: two\r\n") && !contains((deref suite.output), n, "x-test: one") && contains((deref suite.output),
+            n, "Content-Length: 6\r\n") && contains((deref suite.output), n, "\r\n\r\n한글"));
+        n = live_request(port as u16, "POST /chunked HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n");
+        check("HTTP real chunked request is decoded", n > 0 && contains((deref suite.output), n, "\r\n\r\nabcde"));
+        n = live_request(port as u16, "HEAD /head HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        check("HTTP real HEAD response omits its body", n > 0 && contains((deref suite.output), n, "Content-Length: 6\r\n") && !contains((deref suite.output),
+            n, "한글"));
+        n = live_request(port as u16, "GET /empty HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        check("HTTP real 204 response omits framing and body", n > 0 && contains((deref suite.output), n, "HTTP/1.1 204 ") && !contains((deref suite.output),
+            n, "Content-Length") && !contains((deref suite.output), n, "suppressed"));
+        n = live_request(port as u16, "GET /reentrant HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        check("HTTP response rejects recursive end from status getter", n > 0 && contains((deref suite.output), n,
+            "HTTP/1.1 202 ") && contains((deref suite.output), n, "\r\n\r\nouter") && !contains((deref suite.output), n, "recursive"));
+        n = live_request(port as u16, "GET /async HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        check("HTTP and async file completions and timers make progress", n > 0 && contains((deref suite.output), n,
+            "\r\n\r\nasync"));
+        var header: str = "POST /binary HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\n";
+        var header_length: i64 = mem_len_cstr(header);
+        var message: array<u8, 256>;
+        mem_copy(&message[0], header as ptr<u8>, header_length);
+        var payload: array<u8, 5> = [255, 128, 0, 195, 40];
+        mem_copy(&message[0] + header_length, &payload[0], 5);
+        n = live_request_bytes(port as u16, &message[0], header_length + 5);
+        check("HTTP real binary request and offset response preserve NUL and invalid UTF-8", n >= 5 && contains((deref suite.output),
+            n, "Content-Length: 5\r\n") && mem_eq((deref suite.output) + n - 5, &payload[0], 5));
+    }
+    if (!ready && pid >= 0) {
+        proc_kill(pid, 9);
+    }
+    var status: i32 = wait(pid, 4000);
+    var n: i64 = fs_read_all(out_path, (deref suite.output), 65536);
+    check("HTTP close drains active responses and exits without live handles", ready && status == 0 && contains((deref suite.output),
+        n, "closed after seven requests"));
+    if (status != 0) {
+        n = fs_read_all(err_path, (deref suite.errors), 65536);
+        if (n > 0) {
+            io_write_all(2, (deref suite.errors), n);
+        }
+    }
+    remove(ready_path);
+    remove(out_path);
+    remove(err_path);
+    keep_alive_live_tests();
+}
+
+fun keep_alive_live_tests() {
+    var suite: ptr<TestState> = test_state();
+    var ready_path: str = join((deref suite.directory) as str, "keepalive-ready") as str;
+    var out_path: str = join((deref suite.directory) as str, "keepalive-out") as str;
+    var err_path: str = join((deref suite.directory) as str, "keepalive-err") as str;
+    var out_fd: i64 = create(out_path);
+    var err_fd: i64 = create(err_path);
+    var command: array<str, 3> = [(deref suite.binary) as str, "tests/http_keepalive.js", ready_path];
+    var pid: i64 = -1;
+    if (out_fd >= 0 && err_fd >= 0) {
+        pid = spawn(&command[0], 3, out_fd, err_fd);
+    }
+    if (out_fd >= 0) {
+        io_close(out_fd);
+    }
+    if (err_fd >= 0) {
+        io_close(err_fd);
+    }
+    var port: i64 = 0;
+    var start: i64 = time_now_monotonic_ns();
+    while (pid >= 0 && time_now_monotonic_ns() - start < 3000000000) {
+        var n: i64 = fs_read_all(ready_path, (deref suite.output), 65536);
+        if (n > 0) {
+            for (var i: i64 = 0; i < n; i++) {
+                if ((deref suite.output)[i] < 48 || (deref suite.output)[i] > 57) {
+                    port = -1;
+                    break;
+                }
+                port = port * 10 + ((deref suite.output)[i] - 48) as i64;
+            }
+            break;
+        }
+        time_sleep_ms(2);
+    }
+    var ready: bool = port > 0 && port <= 65535;
+    check("keep-alive fixture binds a real TCP socket", ready);
+    if (ready) {
+        var n: i64 = live_request(port as u16, "GET /one HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\nGET /two HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        check("real keep-alive orders pipelined responses and honors final close", n > 0 && contains((deref suite.output),
+            n, "Connection: keep-alive\r\n") && contains((deref suite.output), n, "Connection: close\r\n") && contains((deref suite.output),
+            n, "\r\n\r\n/oneHTTP/1.1") && contains((deref suite.output), n, "\r\n\r\n/two"));
+    }
+    if (!ready && pid >= 0) {
+        proc_kill(pid, 9);
+    }
+    var status: i32 = wait(pid, 4000);
+    if (status != 0 && pid >= 0) {
+        proc_kill(pid, 9);
+        wait(pid, 1000);
+    }
+    var n: i64 = fs_read_all(out_path, (deref suite.output), 65536);
+    check("keep-alive rejects stale responses and drains server close", ready && status == 0 && contains((deref suite.output),
+        n, "keep-alive fixture closed"));
+    if (status != 0) {
+        n = fs_read_all(err_path, (deref suite.errors), 65536);
+        if (n > 0) {
+            io_write_all(2, (deref suite.errors), n);
+        }
+    }
+    remove(ready_path);
+    remove(out_path);
+    remove(err_path);
+}
+
+fun protocol_case(name: str, message: str, step: i64, status: i32, expected_body: str) {
+    var request: ptr<HttpRequest> = new_request();
+    if (request == null) {
+        check(name, false);
+        return;
+    }
+    var length: i64 = mem_len_cstr(message);
+    var at: i64 = 0;
+    var accepted: bool = true;
+    while (at < length && accepted) {
+        var count: i64 = step;
+        if (count > length - at) {
+            count = length - at;
+        }
+        accepted = feed_request(request, (message as ptr<u8>) + at, count);
+        at += count;
+        if (deref request.complete) {
+            break;
+        }
+    }
+    var ok: bool = deref request.status == status;
+    if (status == 0) {
+        var expected: i64 = mem_len_cstr(expected_body);
+        ok = ok && accepted && deref request.complete && deref request.body_length == expected;
+        if (expected > 0) {
+            ok = ok && mem_eq(deref request.body, expected_body as ptr<u8>, expected);
+        }
+    } else {
+        ok = ok && !accepted;
+    }
+    check(name, ok);
+    if (!ok) {
+        println("  HTTP status {}, complete {}, body bytes {}", deref request.status, deref request.complete,
+            deref request.body_length);
+        var reason: ptr<u8> = http_error_reason(deref request.parser);
+        if (reason != null) {
+            println("  llhttp: {}", reason as str);
+        }
+    }
+    free_request(request);
+}
+
+pub fun body_case(name: str, payload: ptr<u8>, length: i64, source: str, expected: str) {
+    var suite: ptr<TestState> = test_state();
+    var ctx: ptr<u8> = wr_context_create(null);
+    var ex: ptr<u8> = null;
+    var ok: bool = install_host(ctx, 0, true, "<eval>", &ex);
+    var body: ptr<u8> = null;
+    var response: ptr<u8> = null;
+    if (ok) {
+        body = create_stream(ctx, 1, &ex);
+        wr_protect(ctx, body);
+        response = plain(ctx);
+        wr_protect(ctx, response);
+        attach_body(ctx, response, body, &ex);
+        put(ctx, wr_context_global(ctx), "bodyResponse", response, &ex);
+        var code: ptr<u8> = wr_string_utf8(source);
+        wr_evaluate(ctx, code, null, null, 1, &ex);
+        wr_string_release(code);
+        var chunk: ptr<u8> = buffer_from_bytes(ctx, payload, length, &ex);
+        wr_protect(ctx, chunk);
+        var args: array<ptr<u8>, 1> = [chunk];
+        stream_invoke(ctx, body, 0, 1, &args[0], &ex);
+        wr_unprotect(ctx, chunk);
+        args[0] = wr_null(ctx);
+        stream_invoke(ctx, body, 0, 1, &args[0], &ex);
+        ok = ex == null && run_event_loop(ctx, &ex);
+        if (ok) {
+            code = wr_string_utf8("globalThis.result");
+            var value: ptr<u8> = wr_evaluate(ctx, code, null, null, 1, &ex);
+            wr_string_release(code);
+            var text: ptr<u8> = wr_to_string(ctx, value, &ex);
+            if (text == null) {
+                ok = false;
+            } else {
+                var size: i64 = wr_string_copy_utf8(text, (deref suite.output), 65536) - 1;
+                wr_string_release(text);
+                ok = ex == null && size == mem_len_cstr(expected) && mem_eq((deref suite.output), expected as ptr<u8>,
+                    size);
+            }
+        }
+    }
+    if (body != null) {
+        wr_unprotect(ctx, body);
+    }
+    if (response != null) {
+        wr_unprotect(ctx, response);
+    }
+    ok = shutdown_host(ctx) && ok;
+    wr_context_release(ctx);
+    check(name, ok);
+}
+
+pub fun http_dispatch_tests() {
+    var ctx: ptr<u8> = wr_context_create(null);
+    if (ctx == null) {
+        check("HTTP dispatch audit context", false);
+        return;
+    }
+    var ex: ptr<u8> = null;
+    var ok: bool = install_host(ctx, 2, true, "<http-dispatch-audit>", &ex);
+    if (ok) {
+        var roots: ptr<HttpHostState> = http_state_storage(ctx);
+        var client: ptr<HttpConnection> = deref roots.connections;
+        var response: ptr<u8> = plain(ctx);
+        wr_protect(ctx, response);
+        deref client.response = response;
+        deref client.kind = 2;
+        deref client.request = new_request();
+        put(ctx, wr_context_global(ctx), "response", response, &ex);
+        put(ctx, response, "statusCode", wr_number(ctx, 200.0), &ex);
+        put(ctx, response, "setHeader", http_native(ctx, "setHeader", 5), &ex);
+        install_response_headers(ctx, response, &ex);
+        check("HTTP array audit setup", ex == null && deref client.request != null);
+        check("header arrays preserve repeated values and return independent snapshots", context_result(ctx,
+            "response.setHeader('Set-Cookie',['a=1','b=2']);const copy=response.getHeader('SET-cookie');copy[0]='changed';response.getHeader('set-cookie').join('|')",
+            "a=1|b=2"));
+        check("header array first getter error preserves the prior header and stops reads", context_result(ctx,
+            "(()=>{let later=false;const marker=Error('first');const a=[1,2];Object.defineProperty(a,0,{get(){throw marker}});Object.defineProperty(a,1,{get(){later=true;return 'late'}});try{response.setHeader('set-cookie',a)}catch(e){return e===marker&&!later&&response.getHeader('set-cookie').join('|')==='a=1|b=2'}return false})()",
+            "true"));
+        check("header getters cannot reenter response mutation", context_result(ctx,
+            "(()=>{let blocked=false;const a=['safe'];Object.defineProperty(a,0,{get(){try{response.removeHeader('set-cookie')}catch(e){blocked=true}return 'safe'}});response.setHeader('x-array',a);return blocked&&response.hasHeader('set-cookie')})()",
+            "true"));
+        check("header arrays reject injection without replacing existing values", context_result(ctx,
+            "(()=>{try{response.setHeader('set-cookie',['ok','bad\\r\\nx: yes'])}catch(e){return e instanceof TypeError&&response.getHeader('set-cookie')[0]==='a=1'}return false})()",
+            "true"));
+        check("empty header arrays can be inspected and removed", context_result(ctx,
+            "response.setHeader('x-empty',[]);const empty=response.getHeaders()['x-empty'];response.removeHeader('x-empty');Array.isArray(empty)&&empty.length===0&&!response.hasHeader('x-empty')",
+            "true"));
+        check("HTTP array limits and unsupported values preserve prior headers", context_result(ctx,
+            "(()=>{let rejected=0;for(const values of [Array(65).fill('v'),['x'.repeat(16384)],Array(64).fill('v'),[Symbol()]]){try{response.setHeader('x-limit',values)}catch(e){rejected++}}return rejected===4&&!response.hasHeader('x-limit')&&response.getHeader('set-cookie')[0]==='a=1'})()",
+            "true"));
+        check("raw writeHead stages odd arrays and throwing getters before mutation", context_result(ctx,
+            "(()=>{let a=false,b=false;try{response.writeHead(200,['x'])}catch(e){a=e instanceof TypeError}const marker=Error('raw');const h=['x','v'];Object.defineProperty(h,1,{get(){throw marker}});try{response.writeHead(200,h)}catch(e){b=e===marker}return a&&b&&!response.headersSent&&!response.hasHeader('x')})()",
+            "true"));
+        check("raw writeHead groups duplicate names without losing cookies", context_result(ctx,
+            "response.writeHead(201,['Set-Cookie','a=3','set-cookie','b=4','x-raw','yes']);response.getHeader('set-cookie').join('|')",
+            "a=3|b=4"));
+        check("native HTTP head emits each cookie on its own line", deref client.prepared &&
+            contains(deref client.head, deref client.head_length, "set-cookie: a=3\r\nset-cookie: b=4\r\n") &&
+            contains(deref client.head, deref client.head_length, "x-raw: yes\r\n"));
+        free_connection_bytes(client);
+        deref client.response = null;
+        wr_unprotect(ctx, response);
+        mem_zero(client as ptr<u8>, size_of<HttpConnection>() as i64);
+        var code: ptr<u8> = wr_string_utf8("(()=>{})");
+        var done: ptr<u8> = wr_evaluate(ctx, code, null, null, 1, &ex);
+        wr_string_release(code);
+        var http_state_roots: ptr<HttpHostState> = http_state_storage(ctx);
+        var first: ptr<HttpConnection> = (deref http_state_roots.connections);
+        var second: ptr<HttpConnection> = (deref http_state_roots.connections) + 1;
+        var closed: ptr<HttpConnection> = (deref http_state_roots.connections) + 2;
+        deref first.kind = 2;
+        deref second.kind = 2;
+        deref closed.kind = 2;
+        deref closed.closed = true;
+        deref first.write_done = done;
+        wr_protect(ctx, done);
+        deref second.write_done = done;
+        wr_protect(ctx, done);
+        deref first.write_complete = true;
+        deref second.write_complete = true;
+        dispatch_http(ctx, &ex);
+        check("HTTP write completions cannot starve another connection's completion", ex == null && !deref first.write_complete && !deref second.write_complete);
+        check("HTTP write completions cannot postpone collecting closed resources", ex == null && deref closed.kind == 0);
+        if (deref first.write_done != null) {
+            wr_unprotect(ctx, deref first.write_done);
+        }
+        if (deref second.write_done != null) {
+            wr_unprotect(ctx, deref second.write_done);
+        }
+        mem_zero(first as ptr<u8>, 3 * (size_of<HttpConnection>() as i64));
+        // Dispatch a parsed request without a socket. Replace only transport hooks
+        // so EOF/finish run through the real stream lifecycle without native I/O.
+        var lifetime_ready: bool = context_result(ctx,
+            "globalThis.httpLifeDestroy=0;globalThis.httpLifeEnds=0;globalThis.httpLifeFinishes=0;globalThis.httpLifeServer=require('http').createServer({keepAlive:true},(req,res)=>{globalThis.httpLifeReq=req;globalThis.httpLifeRes=res;req._destroy=(e,done)=>{httpLifeDestroy++;done(e)};res._destroy=(e,done)=>{httpLifeDestroy++;done(e)};res._write=(b,e,done)=>done();res._final=done=>done();req.on('end',()=>{httpLifeEnds++;require('stream').Writable.prototype.end.call(res,'ok')});res.on('finish',()=>httpLifeFinishes++);req.resume()});true",
+            "true");
+        deref first.kind = 2;
+        deref first.server = deref http_state_roots.servers;
+        deref first.request = new_request();
+        var message: str = "GET /lifetime HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        lifetime_ready = lifetime_ready && deref first.request != null;
+        if (lifetime_ready) {
+            lifetime_ready = feed_request(deref first.request, message as ptr<u8>, mem_len_cstr(message));
+        }
+        if (lifetime_ready) {
+            lifetime_ready = dispatch_http(ctx, &ex) == 1 && ex == null;
+            if (ex == null) {
+                checkpoint(ctx, &ex);
+            }
+        }
+        check("HTTP stream lifetime fixture dispatches a complete request without TCP", lifetime_ready && ex == null);
+        check("HTTP request EOF does not automatically destroy the shared transport", lifetime_ready && ex == null &&
+            context_result(ctx, "httpLifeEnds===1&&!httpLifeReq.destroyed&&httpLifeDestroy===0", "true"));
+        check("HTTP response finish leaves keep-alive transport ownership with the server", lifetime_ready && ex == null &&
+            context_result(ctx, "httpLifeFinishes===1&&!httpLifeRes.destroyed&&httpLifeDestroy===0", "true"));
+        var explicit_destroy: bool = lifetime_ready && ex == null && context_result(ctx,
+            "httpLifeReq.destroy();httpLifeRes.destroy();true", "true");
+        if (ex == null) {
+            checkpoint(ctx, &ex);
+        }
+        check("HTTP stream lifetime policy preserves explicit request and response destruction", explicit_destroy && ex == null &&
+            context_result(ctx, "httpLifeDestroy===2&&httpLifeReq.destroyed&&httpLifeRes.destroyed", "true"));
+        if (deref first.incoming != null) {
+            wr_unprotect(ctx, deref first.incoming);
+        }
+        if (deref first.response != null) {
+            wr_unprotect(ctx, deref first.response);
+        }
+        free_connection_bytes(first);
+        mem_zero(first as ptr<u8>, size_of<HttpConnection>() as i64);
+    } else {
+        check("HTTP dispatch audit initialization", false);
+    }
+    check("HTTP dispatch audit cleans its context", shutdown_host(ctx));
+    wr_context_release(ctx);
+}
+
+pub fun http_tests() {
+    var suite: ptr<TestState> = test_state();
+    test("HTTP keep-alive options validate booleans and idle deadlines", "const h=require('http');console.log(typeof h.createServer({keepAlive:true,keepAliveTimeout:50}).listen);for(const o of [{keepAlive:1},{keepAliveTimeout:0},{keepAliveTimeout:'5'}]){try{h.createServer(o)}catch(e){console.log(e instanceof TypeError||e instanceof RangeError)}}",
+        "function\ntrue\ntrue\ntrue\n", 0, "");
+    var syntax_keepalive: array<str, 3> = [(deref suite.binary) as str, "--check", "tests/http_keepalive.js"];
+    expect("keep-alive live fixture syntax uses JSC", &syntax_keepalive[0], 3, "" as ptr<u8>, 0, 0, "");
+    var pipeline_request: ptr<HttpRequest> = new_request();
+    if (pipeline_request == null) {
+        check("keep-alive parser preserves pipelined bytes", false);
+    } else {
+        deref pipeline_request.allow_pipeline = true;
+        var messages: str = "GET /one HTTP/1.1\r\nHost: localhost\r\n\r\nGET /two HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        var accepted: bool = feed_request(pipeline_request, messages as ptr<u8>, mem_len_cstr(messages));
+        var next: ptr<HttpRequest> = new_request();
+        var valid: bool = false;
+        if (next != null) {
+            deref next.allow_pipeline = true;
+            valid = feed_request(next, deref pipeline_request.trailing, deref pipeline_request.trailing_length) && deref next.complete && mem_eq_cstr(deref next.url as str,
+                "/two") && !request_keep_alive(next);
+            free_request(next);
+        }
+        check("keep-alive parser preserves pipelined bytes and final close semantics", accepted && request_keep_alive(pipeline_request) && valid);
+        free_request(pipeline_request);
+    }
+    var persistent_head: HttpOutput = encode_head_connection(200, null, 0, 4, false, true);
+    check("keep-alive response retains explicit body framing", persistent_head.bytes != null && contains(persistent_head.bytes,
+        persistent_head.length, "Connection: keep-alive\r\n") && contains(persistent_head.bytes, persistent_head.length,
+        "Content-Length: 4\r\n"));
+    if (persistent_head.bytes != null) {
+        mem_free(persistent_head.bytes, persistent_head.capacity);
+    }
+    var binary_request: ptr<HttpRequest> = new_request();
+    if (binary_request == null) {
+        check("HTTP parser preserves binary body", false);
+    } else {
+        var prefix: str = "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\n";
+        var payload: array<u8, 5> = [255, 128, 0, 195, 40];
+        var accepted: bool = feed_request(binary_request, prefix as ptr<u8>, mem_len_cstr(prefix));
+        accepted = accepted && feed_request(binary_request, &payload[0], 5);
+        check("HTTP parser preserves binary body", accepted && deref binary_request.complete && deref binary_request.body_length == 5 && mem_eq(deref binary_request.body,
+            &payload[0], 5));
+        free_request(binary_request);
+    }
+    protocol_case("HTTP uppercase chunked without OWS", "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: CHUNKED\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        1, 0, "x");
+    protocol_case("llhttp strict mode rejects trailing chunked HTAB when split", "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked \t\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        1, 400, "");
+    protocol_case("llhttp strict mode rejects trailing chunked HTAB in one buffer", "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: CHUNKED \t\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        1000, 400, "");
+    protocol_case("HTTP accepts optional trailing header whitespace", "POST / HTTP/1.1\r\nHost: localhost \t\r\nContent-Length: 1 \t\r\n\r\nx",
+        1, 0, "x");
+    protocol_case("HTTP chunked accepts ordinary trailing spaces", "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: CHUNKED  \r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        1, 0, "x");
+    protocol_case("HTTP rejects unsupported transfer codings", "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+        1, 501, "");
+    protocol_case("HTTP rejects folded header lines", "GET / HTTP/1.1\r\nHost: a\r\nX-Test: first\r\n second\r\n\r\n",
+        1, 400, "");
+    protocol_case("llhttp accepts a request byte by byte", "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        1, 0, "");
+    protocol_case("llhttp decodes split chunked bodies", "POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
+        2, 0, "abcde");
+    protocol_case("llhttp preserves UTF-8 body bytes", "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 6\r\n\r\n한글",
+        1, 0, "한글");
+    protocol_case("HTTP 1.0 can omit Host", "GET / HTTP/1.0\r\n\r\n", 3, 0, "");
+    protocol_case("HTTP rejects missing Host", "GET / HTTP/1.1\r\n\r\n", 1, 400, "");
+    protocol_case("HTTP rejects duplicate Host", "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", 3, 400,
+        "");
+    protocol_case("HTTP rejects conflicting request framing", "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        3, 400, "");
+    protocol_case("HTTP rejects duplicate content lengths", "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
+        2, 400, "");
+    protocol_case("HTTP rejects bare LF", "GET / HTTP/1.1\nHost: a\n\n", 2, 400, "");
+    protocol_case("HTTP rejects whitespace before header colon", "GET / HTTP/1.1\r\nHost : a\r\n\r\n",
+        4, 400, "");
+    protocol_case("HTTP bounds declared body before reading it", "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4194305\r\n\r\n",
+        1, 413, "");
+    protocol_case("HTTP rejects unsupported expectations", "POST / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\n\r\n",
+        4, 417, "");
+    protocol_case("HTTP rejects protocol upgrades", "GET / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+        3, 400, "");
+    protocol_case("HTTP rejects proxy request targets", "GET http://example.com/ HTTP/1.1\r\nHost: a\r\n\r\n",
+        3, 400, "");
+    protocol_case("HTTP rejects request trailers", "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Trailer: no\r\n\r\n",
+        3, 400, "");
+    protocol_case("HTTP rejects malformed chunk sizes", "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\nz\r\n",
+        1, 400, "");
+    var request: ptr<HttpRequest> = new_request();
+    var message: str = "GET / HTTP/1.1\r\nHost: a\r\nX-Custom: preserved\r\n\r\n";
+    var ok: bool = request != null && feed_request(request, message as ptr<u8>, mem_len_cstr(message));
+    if (ok) {
+        var index: i64 = header_index(request, "x-custom");
+        ok = index >= 0 && mem_eq_cstr(request_method(request), "GET");
+        if (ok) {
+            var field: ptr<HttpHeader> = deref request.fields + index;
+            ok = mem_eq_cstr((deref request.headers + deref field.value) as str, "preserved");
+        }
+    }
+    check("HTTP stores lowercase headers and original values", ok);
+    free_request(request);
+    var limit_buffer: ptr<u8> = mem_alloc(20000);
+    var prefix: str = "GET / HTTP/1.1\r\nHost: a\r\nX-Pad: ";
+    var prefix_length: i64 = mem_len_cstr(prefix);
+    mem_copy(limit_buffer, prefix as ptr<u8>, prefix_length);
+    for (var i: i64 = prefix_length; i < 17000; i++) {
+        limit_buffer[i] = 32;
+    }
+    request = new_request();
+    ok = request != null && !feed_request(request, limit_buffer, 17000) && deref request.status == 431;
+    check("HTTP raw header limit also covers padding", ok);
+    free_request(request);
+    mem_copy(limit_buffer, "GET /" as ptr<u8>, 5);
+    for (var i: i64 = 5; i < 9000; i++) {
+        limit_buffer[i] = 97;
+    }
+    request = new_request();
+    ok = request != null && !feed_request(request, limit_buffer, 9000) && deref request.status == 414;
+    check("HTTP bounds request target bytes", ok);
+    free_request(request);
+    mem_free(limit_buffer, 20000);
+    request = new_request();
+    var prefix_body: str = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\n";
+    var body_bytes: array<u8, 3> = [65, 0, 66];
+    ok = request != null && feed_request(request, prefix_body as ptr<u8>, mem_len_cstr(prefix_body)) && feed_request(request,
+        &body_bytes[0], 3);
+    check("HTTP body is length-delimited and preserves NUL", ok && deref request.complete && deref request.body_length == 3 && mem_eq(deref request.body,
+        &body_bytes[0], 3));
+    free_request(request);
+    var result: HttpOutput = encode_response(200, null, 0, "한글" as ptr<u8>, 6, false);
+    check("HTTP response length counts UTF-8 bytes", result.bytes != null && contains(result.bytes, result.length,
+        "Content-Length: 6\r\n") && contains(result.bytes, result.length, "\r\n\r\n한글"));
+    if (result.bytes != null) {
+        mem_free(result.bytes, result.capacity);
+    }
+    result = encode_response(200, null, 0, "hidden" as ptr<u8>, 6, true);
+    check("HEAD retains entity length and suppresses body", result.bytes != null && contains(result.bytes,
+        result.length, "Content-Length: 6\r\n") && !contains(result.bytes, result.length, "hidden"));
+    if (result.bytes != null) {
+        mem_free(result.bytes, result.capacity);
+    }
+    result = encode_response(204, null, 0, "hidden" as ptr<u8>, 6, false);
+    check("204 omits Content-Length and body", result.bytes != null && !contains(result.bytes, result.length,
+        "Content-Length") && !contains(result.bytes, result.length, "hidden"));
+    if (result.bytes != null) {
+        mem_free(result.bytes, result.capacity);
+    }
+    test("HTTP builtin identity and inactive lifecycle", "const a=require('http'),b=require('node:http');const s=a.createServer();console.log(a===b,typeof a.createServer,s.listening,s.address()===null,typeof globalThis.http);",
+        "true function false true undefined\n", 0, "");
+    test("HTTP validates callback and numeric port without coercion", "const h=require('http');for(const f of [()=>h.createServer(1),()=>h.createServer(()=>{},{}),()=>h.createServer().listen('80'),()=>h.createServer().listen({valueOf(){throw 9}}),()=>h.createServer().listen(0,'localhost'),()=>h.createServer().listen(0,'127.0.0.1',1)]){try{f();throw 'wrong'}catch(e){if(!(e instanceof TypeError))throw e}}console.log('validated');",
+        "validated\n", 0, "");
+    test("HTTP rejects invalid port ranges", "const s=require('http').createServer();for(const p of [-1,65536,NaN,Infinity,0.5]){try{s.listen(p);throw 'wrong'}catch(e){if(!(e instanceof RangeError))throw e}}console.log('validated');",
+        "validated\n", 0, "");
+    test("HTTP rejects invalid receivers and inactive close", "const s=require('http').createServer();for(const f of [()=>s.address.call({}),()=>s.listen.call({},0),()=>s.close.call({})]){try{f();throw 'wrong'}catch(e){if(!(e instanceof TypeError))throw e}}try{s.close();throw 'wrong'}catch(e){if(!(e instanceof Error))throw e}console.log('validated');",
+        "validated\n", 0, "");
+    test("HTTP server records have an explicit lifetime budget", "const h=require('http');for(let i=0;i<16;i++)h.createServer();try{h.createServer();throw 'wrong'}catch(e){console.log(e instanceof RangeError)}",
+        "true\n", 0, "");
+    test("HTTP listen succeeds or preserves structured OS denial", "const s=require('http').createServer();try{s.listen(0,'127.0.0.1',()=>{const a=s.address();if(!s.listening||a.port<=0||a.family!=='IPv4')throw Error('bad address');s.close(()=>console.log('socket path checked'));})}catch(e){if(!['EPERM','EACCES'].includes(e.code)||e.errno>=0||typeof e.syscall!=='string')throw e;console.error('SKIP live HTTP: environment denies sockets');console.log('socket path checked')}",
+        "socket path checked\n", 0, "");
+    http_live_tests();
+}

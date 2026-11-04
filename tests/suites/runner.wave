@@ -1,0 +1,127 @@
+// Test selection and ordered execution; child fixture modes precede host setup.
+import("jsrt::tools::support")::{argc, arg, private_directory, cleanup};
+import("jsrt::runtime::config")::{engine_supported};
+import("std::mem::alloc")::{mem_alloc};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("std::sys::fs")::{Stat, stat};
+import("jsrt::runtime::worker_run")::{worker_runtime_link};
+import("./contexts")::{context_isolation_tests, full_host_isolation_tests, host_stability_tests};
+import("./deployment")::{release_signature_tests};
+import("./engine")::{core_tests, info_tests, json_tests, native_addon_tests, worker_tests};
+import("./files_process")::{async_directory_tests, async_tests, child_process_tests, file_tests, system_tests};
+import("./harness")::{check, contains, expect, TestState, test_state};
+import("./modules")::{esm_interop_tests, esm_tests, module_tests, test_command_tests};
+import("./network_client")::{client_tests, extended_network_tests};
+import("./network_server")::{http_tests};
+import("./package_install")::{package_dependency_tests, package_tests, workspace_tests};
+import("./package_recovery")::{package_recovery_tests, package_replace_recovery_tests, transaction_fixture};
+import("./package_registry")::{npm_download_tests};
+import("./package_versions")::{cache_capacity_tests};
+import("./timers")::{timer_tests};
+import("./web_streams")::{binary_io_tests, buffer_tests, crypto_tests, event_tests, io_stream_tests,
+    stream_tests, url_tests};
+extern(c, "jsrt_test_explicit_termination") fun test_explicit_termination() -> i32;
+extern(c, "wr_engine_name") fun wr_engine_name() -> str;
+
+pub fun run_tests() -> i32 {
+    var suite: ptr<TestState> = test_state();
+    worker_runtime_link();
+    if (argc() == 2 && mem_eq_cstr(arg(1), "--termination-only")) {
+        if (test_explicit_termination() == 1) {
+            return 0;
+        }
+        return 1;
+    }
+    if (argc() == 4 && mem_eq_cstr(arg(1), "--transaction-fixture")) {
+        return transaction_fixture(arg(2), arg(3));
+    }
+    deref suite.binary = "target/native/jsrt" as ptr<u8>;
+    var supplied_binary: bool = false;
+    var npm_only: bool = false;
+    for (var i: i32 = 1; i < argc(); i++) {
+        var option: str = arg(i);
+        if (mem_eq_cstr(option, "--require-tcp")) {
+            deref suite.require_tcp = true;
+        } else if (mem_eq_cstr(option, "--npm-only")) {
+            npm_only = true;
+        } else if (!supplied_binary && (mem_len_cstr(option) == 0 || option[0] != 45)) {
+            deref suite.binary = option as ptr<u8>;
+            supplied_binary = true;
+        } else {
+            println("Usage: temporary test runner [runtime executable] [--require-tcp] [--npm-only]");
+            return 2;
+        }
+    }
+    deref suite.directory = private_directory("target/tools", "test 한글 ");
+    deref suite.output = mem_alloc(65536);
+    deref suite.errors = mem_alloc(65536);
+    if ((deref suite.directory) == null || (deref suite.output) == null || (deref suite.errors) == null) {
+        println("cannot initialize tests");
+        if ((deref suite.directory) != null) {
+            cleanup((deref suite.directory) as str);
+        }
+        return 1;
+    }
+    var permissions: Stat;
+    check("private test directory", stat((deref suite.directory) as str, &permissions) == 0 && ((permissions.mode as i32) & 511) == 448);
+    if (npm_only) {
+        npm_download_tests();
+        check("public npm test directory removed", cleanup((deref suite.directory) as str));
+        println("{} tests, {} failures, public npm HTTPS suite", (deref suite.total), (deref suite.failures));
+        if ((deref suite.failures) != 0) {
+            return 1;
+        }
+        return 0;
+    }
+    check("JSC engine version policy", !engine_supported(2, 52, 6, 0) && !engine_supported(2, 54, 0,
+        0) && engine_supported(2, 54, 1, 0) && engine_supported(2, 55, 0, 0));
+    var version: array<str, 2> = [(deref suite.binary) as str, "--version"];
+    expect("runtime version command", &version[0], 2, null, -1, 0, "");
+    check("actual engine name visible", contains((deref suite.output), (deref suite.output_count), wr_engine_name()));
+    info_tests();
+    worker_tests();
+    json_tests();
+    context_isolation_tests();
+    full_host_isolation_tests();
+    host_stability_tests();
+    child_process_tests();
+    native_addon_tests();
+    esm_tests();
+    esm_interop_tests();
+    test_command_tests();
+
+    core_tests();
+    timer_tests();
+    system_tests();
+    release_signature_tests();
+    cache_capacity_tests();
+    module_tests();
+    async_tests();
+    buffer_tests();
+    binary_io_tests();
+    event_tests();
+    stream_tests();
+    io_stream_tests();
+    client_tests();
+    crypto_tests();
+    url_tests();
+    package_tests();
+    workspace_tests();
+    package_dependency_tests();
+    package_recovery_tests();
+    package_replace_recovery_tests();
+    async_directory_tests();
+    http_tests();
+    extended_network_tests();
+    file_tests();
+    var help: array<str, 2> = [(deref suite.binary) as str, "--help"];
+    expect("help", &help[0], 2, null, -1, 0, "");
+    help[1] = "run";
+    expect("missing script argument", &help[0], 2, "" as ptr<u8>, 0, 2, "expected one script");
+    check("owned test output directory removed", cleanup((deref suite.directory) as str));
+    println("{} tests, {} failures, {} skipped network suites", (deref suite.total), (deref suite.failures), (deref suite.skipped));
+    if ((deref suite.failures) != 0) {
+        return 1;
+    }
+    return 0;
+}

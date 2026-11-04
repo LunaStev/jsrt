@@ -1,0 +1,159 @@
+// Optional public npm HTTPS downloads and package compatibility fixtures.
+import("jsrt::tools::support")::{join, concat, absolute, private_directory};
+import("jsrt::tools::private_files")::{clean_private_directory};
+import("jsrt::runtime::package_io")::{Blob, read_blob, free_blob};
+import("wjson")::{JsonDoc, Json, json_parse_bytes, json_ok, json_root, json_free, json_str_eq, json_len,
+    json_get, JSON_STRICT};
+import("std::fs::file")::{write, remove};
+import("std::mem::ops")::{mem_eq};
+import("std::mem::cstr")::{mem_len_cstr};
+import("std::sys::fs")::{mkdir, rmdir};
+import("./harness")::{check, expect, TestState, test_state};
+import("./package_install")::{cached_fixture_cleanup};
+
+fun npm_fixture_cleanup(root: str) {
+    var base: str = join(root, "node_modules/is-number") as str;
+    var files: array<str, 4> = ["package.json", "index.js", "LICENSE", "README.md"];
+    for (var i: i64 = 0; i < 4; i++) {
+        remove(join(base, files[i]) as str);
+    }
+    rmdir(base);
+    remove(join(root, "node_modules/.jsrt-install-proof") as str);
+    rmdir(join(root, "node_modules") as str);
+}
+
+pub fun npm_download_tests() {
+    var suite: ptr<TestState> = test_state();
+    var root: str = absolute(join((deref suite.directory) as str, "npm-https") as str) as str;
+    var manifest: str = "{\"dependencies\":{\"is-number\":\"^7.0.0 <=7.0.0\"}}";
+    var ready: bool = (root as ptr<u8>) != null && mkdir(root, 448) == 0 && write(join(root, "package.json") as str,
+        manifest as ptr<u8>, mem_len_cstr(manifest)) == mem_len_cstr(manifest);
+    check("prepare isolated public npm HTTPS installation", ready);
+    if (!ready) {
+        return;
+    }
+    var command: array<str, 5> = [(deref suite.binary) as str, "install", "--project", root, "--frozen-lockfile"];
+    var expected: str = "Installed 1 packages; lifecycle scripts disabled\n";
+    var before_download: i64 = (deref suite.failures);
+    expect("installer resolves semver and downloads npm metadata and tarball over verified HTTPS", &command[0],
+        4, expected as ptr<u8>, mem_len_cstr(expected), 0, "");
+    if ((deref suite.failures) != before_download) {
+        npm_fixture_cleanup(root);
+        remove(join(root, "jsrt.lock.wjson") as str);
+        remove(join(root, "package.json") as str);
+        check("failed public npm download cleans its private fixture", rmdir(root) == 0);
+        println("Public npm dependent checks not run: HTTPS installation failed");
+        return;
+    }
+    var lock_path: str = join(root, "jsrt.lock.wjson") as str;
+    var lock: Blob = read_blob(lock_path, 4194304);
+    var doc: JsonDoc = json_parse_bytes(lock.bytes, lock.length, 64, JSON_STRICT);
+    var entry: Json = json_get(json_get(json_root(doc), "packages"), "node_modules/is-number");
+    // Pin the immutable package's published SHA512 independently of the installer.
+    check("npm lock pins package identity HTTPS URL and known SHA512 SRI", lock.bytes != null && json_ok(doc) && json_str_eq(json_get(entry,
+        "name"), "is-number") && json_str_eq(json_get(entry, "version"), "7.0.0") && json_len(json_get(json_root(doc),
+        "packages")) == 1 && json_str_eq(json_get(entry, "resolved"), "https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz") && json_str_eq(json_get(entry,
+        "integrity"), "sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng=="));
+    json_free(&doc);
+    var run: array<str, 5> = [(deref suite.binary) as str, "-e", "const n=require(process.argv[2]+'/node_modules/is-number');console.log(n(42),n('42'),n('x'));",
+        "--", root];
+    var answer: str = "true true false\n";
+    expect("HTTPS-installed npm package executes on JavaScriptCore", &run[0], 5, answer as ptr<u8>, mem_len_cstr(answer),
+        0, "");
+    expect("online reinstall preserves an existing dependency tree", &command[0], 4, "" as ptr<u8>, 0,
+        1, "node_modules already exists");
+    npm_fixture_cleanup(root);
+    expect("frozen installer reuses verified HTTPS archive cache", &command[0], 5, expected as ptr<u8>,
+        mem_len_cstr(expected), 0, "");
+    var after: Blob = read_blob(lock_path, 4194304);
+    check("frozen HTTPS installation preserves lockfile bytes", lock.bytes != null && after.bytes != null && lock.length == after.length && mem_eq(lock.bytes,
+        after.bytes, lock.length));
+    free_blob(&after);
+    free_blob(&lock);
+    expect("frozen HTTPS-installed package executes on JavaScriptCore", &run[0], 5, answer as ptr<u8>,
+        mem_len_cstr(answer), 0, "");
+    npm_fixture_cleanup(root);
+    command[4] = "--offline";
+    expect("offline frozen install reuses the npm HTTPS archive cache", &command[0], 5, expected as ptr<u8>,
+        mem_len_cstr(expected), 0, "");
+    expect("offline cached npm package executes on JavaScriptCore", &run[0], 5, answer as ptr<u8>, mem_len_cstr(answer),
+        0, "");
+    npm_fixture_cleanup(root);
+    var peer_manifest: str = "{\"peerDependencies\":{\"is-number\":\"^7.0.0 <=7.0.0\"}}";
+    write(join(root, "package.json") as str, peer_manifest as ptr<u8>, mem_len_cstr(peer_manifest));
+    remove(lock_path);
+    expect("npm root peer auto-installs a real package with verified HTTPS", &command[0], 4,
+        expected as ptr<u8>, mem_len_cstr(expected), 0, "");
+    expect("automatically installed npm peer executes on JSC", &run[0], 5, answer as ptr<u8>, mem_len_cstr(answer), 0, "");
+    npm_fixture_cleanup(root);
+    var optional_manifest: str = "{\"optionalDependencies\":{\"is-number\":\"<0.0.0\"}}";
+    write(join(root, "package.json") as str, optional_manifest as ptr<u8>, mem_len_cstr(optional_manifest));
+    remove(lock_path);
+    var skipped_expected: str = "Installed 0 packages; lifecycle scripts disabled\n";
+    expect("npm optional no-matching-version failure is reported and safely skipped", &command[0], 4,
+        skipped_expected as ptr<u8>, mem_len_cstr(skipped_expected), 0, "Skipping optional dependency is-number");
+    var skipped_lock: Blob = read_blob(lock_path, 4194304);
+    var skipped_doc: JsonDoc = json_parse_bytes(skipped_lock.bytes, skipped_lock.length, 64, JSON_STRICT);
+    var skip: Json = json_get(json_get(json_root(skipped_doc), "optionalSkips"), "node_modules/is-number");
+    check("npm lock records the exact optional skip and no phantom package",
+        json_ok(skipped_doc) && json_len(json_get(json_root(skipped_doc), "packages")) == 0 &&
+        json_str_eq(json_get(skip, "range"), "<0.0.0") && json_str_eq(json_get(skip, "name"), "is-number"));
+    json_free(&skipped_doc);
+    npm_fixture_cleanup(root);
+    expect("actual npm optional skip replays offline without registry access", &command[0], 5,
+        skipped_expected as ptr<u8>, mem_len_cstr(skipped_expected), 0, "");
+    var replayed_lock: Blob = read_blob(lock_path, 4194304);
+    check("offline optional replay preserves lock bytes", skipped_lock.bytes != null && replayed_lock.bytes != null &&
+        skipped_lock.length == replayed_lock.length && mem_eq(skipped_lock.bytes, replayed_lock.bytes, skipped_lock.length));
+    free_blob(&skipped_lock);
+    free_blob(&replayed_lock);
+    npm_fixture_cleanup(root);
+    cached_fixture_cleanup(root, "sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==",
+        "sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==");
+    remove(lock_path);
+    remove(join(root, "package.json") as str);
+    check("public npm test removes downloaded files and staging artifacts", rmdir(root) == 0);
+    npm_compatibility_tests();
+}
+
+fun npm_compatibility_tests() {
+    var suite: ptr<TestState> = test_state();
+    var root: ptr<u8> = private_directory((deref suite.directory) as str, "compat-");
+    check("reserve owned npm compatibility workspace", root != null);
+    if (root == null) {
+        return;
+    }
+    var manifest: Blob = read_blob("tests/npm_compat.package.json", 4194304);
+    var ready: bool = manifest.bytes != null && write(join(root as str, "package.json") as str,
+        manifest.bytes, manifest.length) == manifest.length;
+    free_blob(&manifest);
+    var lock: Blob = read_blob("tests/npm_compat.lock.wjson", 4194304);
+    ready = ready && lock.bytes != null && write(join(root as str, "jsrt.lock.wjson") as str,
+        lock.bytes, lock.length) == lock.length;
+    free_blob(&lock);
+    check("prepare pinned real package compatibility manifest", ready);
+    var command: array<str, 5> = [(deref suite.binary) as str, "install", "--project", absolute(root as str) as str, "--frozen-lockfile"];
+    var before: i64 = (deref suite.failures);
+    if (ready) {
+        expect("install pinned compatibility graph using verified npm HTTPS", &command[0], 5,
+            null, -1, 0, "");
+    }
+    if (ready && before == (deref suite.failures)) {
+        var names: array<str, 14> = ["cookie", "eventemitter3", "fast-querystring", "get-stream", "kleur",
+            "lodash", "lodash-es", "minimatch", "minimist", "ms", "picomatch", "semver", "polka", "application"];
+        var run: array<str, 4> = [(deref suite.binary) as str, "tests/npm_compat.js", absolute(root as str) as str, ""];
+        for (var i: i64 = 0; i < 14; i++) {
+            run[3] = names[i];
+            var message: str = concat("compatible ", names[i]) as str;
+            var expected: str = concat(message, "\n") as str;
+            expect(concat("real npm compatibility: ", names[i]) as str, &run[0], 4,
+                expected as ptr<u8>, mem_len_cstr(expected), 0, "");
+        }
+        var cli: array<str, 9> = [(deref suite.binary) as str, "tests/npm_compat.js", absolute(root as str) as str,
+            "cli-application", "--input", "tests/app_input.json", "--select", "data.message", "--pretty"];
+        var answer: str = "compatible cli-application\n";
+        expect("package-based CLI reads JSON and applies parsed arguments", &cli[0], 9,
+            answer as ptr<u8>, mem_len_cstr(answer), 0, "");
+    }
+    check("remove all owned package matrix archives cache and source inputs", clean_private_directory(root as str));
+}

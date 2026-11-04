@@ -1,0 +1,641 @@
+// Package installation, workspaces and dependency policy regressions.
+import("jsrt::tools::support")::{join, concat, absolute};
+import("jsrt::tools::private_files")::{clean_private_directory};
+import("jsrt::runtime::package_cache")::{cache_filename, read_cached_archive, store_cached_archive,
+    prune_archive_cache};
+import("jsrt::runtime::package_io")::{Blob, read_blob, free_blob, integrity, begin_install, ensure_directory,
+    create_file, end_install, install_checkpoint, rollback_install};
+import("jsrt::runtime::package_transaction")::{open_transaction, start_transaction_stage, close_transaction};
+import("wjson")::{JsonWriter, json_writer_new, json_writer_free, json_writer_finish, json_writer_len,
+    json_begin_object, json_end_object, json_key, json_field_str, json_field_i64, json_field_bool};
+import("std::fs::file")::{create, write, remove};
+import("std::io::fd")::{io_close};
+import("std::mem::ops")::{mem_copy};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("std::sys::fs")::{Stat, stat, ftruncate, mkdir, rmdir};
+import("./harness")::{check, expect, TestState, test_state};
+import("./modules")::{module_case};
+import("./package_versions")::{semver_tests};
+extern(c, "symlink") fun symlink(target: str, link_path: str) -> i32;
+extern(c, "link") fun hardlink(target: str, link_path: str) -> i32;
+extern(c, "utimensat") fun test_file_times(fd: i32, path: str, times: ptr<i64>, flags: i32) -> i32;
+
+fun install_lock_sources(root: str, main_sri: str, dep_sri: str, extra: bool, cached: bool,
+    development: bool) -> bool {
+    var manifest: Blob = read_blob(join(root, "package.json") as str, 4194304);
+    if (manifest.bytes == null) {
+        return false;
+    }
+    var hash: array<u8, 96>;
+    var ok: bool = integrity(manifest.bytes, manifest.length, &hash[0]);
+    free_blob(&manifest);
+    var writer: JsonWriter = json_writer_new(2);
+    ok = ok && json_begin_object(&writer) && json_field_i64(&writer, "lockfileVersion", 1) && json_field_str(&writer,
+        "manifestIntegrity", &hash[0] as str) && json_field_bool(&writer, "includeDev", development) &&
+        json_key(&writer, "packages") && json_begin_object(&writer);
+    var locations: array<str, 2> = ["node_modules/demo-install", "node_modules/demo-install/node_modules/nested"];
+    var names: array<str, 2> = ["demo-install", "nested"];
+    var versions: array<str, 2> = ["1.0.0", "2.0.0"];
+    var sources: array<str, 2> = ["file:main.tgz", "file:nested.tgz"];
+    if (cached) {
+        sources[0] = "https://registry.npmjs.org/demo-install/-/demo-install-1.0.0.tgz";
+        sources[1] = "https://registry.npmjs.org/nested/-/nested-2.0.0.tgz";
+    }
+    for (var i: i64 = 0; i < 2; i++) {
+        var sri: str = main_sri;
+        if (i == 1) {
+            sri = dep_sri;
+        }
+        ok = ok && json_key(&writer, locations[i]) && json_begin_object(&writer) && json_field_str(&writer,
+            "name", names[i]) && json_field_str(&writer, "version", versions[i]) && json_field_str(&writer,
+            "resolved", sources[i]) && json_field_str(&writer, "integrity", sri) && json_end_object(&writer);
+    }
+    if (extra) {
+        ok = ok && json_key(&writer, "node_modules/unused") && json_begin_object(&writer) && json_field_str(&writer,
+            "name", "unused") && json_end_object(&writer);
+    }
+    ok = ok && json_end_object(&writer) && json_end_object(&writer);
+    var source: str = json_writer_finish(&writer);
+    if (ok) {
+        ok = write(join(root, "jsrt.lock.wjson") as str, source as ptr<u8>, json_writer_len(&writer)) == json_writer_len(&writer);
+    }
+    json_writer_free(&writer);
+    return ok;
+}
+
+fun install_lock(root: str, main_sri: str, dep_sri: str, extra: bool) -> bool {
+    return install_lock_sources(root, main_sri, dep_sri, extra, false, false);
+}
+
+fun cached_fixture_path(root: str, sri: str) -> str {
+    var name: array<u8, 104>;
+    if (!cache_filename(sri, &name[0])) {
+        return join(root, "invalid-cache-key") as str;
+    }
+    return join(join(root, ".jsrt-cache") as str, &name[0] as str) as str;
+}
+
+pub fun cached_fixture_cleanup(root: str, a: str, b: str) {
+    remove(cached_fixture_path(root, a));
+    remove(cached_fixture_path(root, b));
+    rmdir(join(root, ".jsrt-cache") as str);
+}
+
+fun installed_fixture_cleanup(root: str) {
+    var locations: array<str, 2> = ["node_modules/demo-install/node_modules/nested", "node_modules/demo-install"];
+    for (var i: i64 = 0; i < 2; i++) {
+        var base: str = join(root, locations[i]) as str;
+        remove(join(base, "package.json") as str);
+        remove(join(base, "index.js") as str);
+        rmdir(join(base, "node_modules") as str);
+        rmdir(base);
+    }
+    remove(join(root, "node_modules/.jsrt-install-proof") as str);
+    rmdir(join(root, "node_modules") as str);
+}
+
+pub fun package_tests() {
+    var suite: ptr<TestState> = test_state();
+    semver_tests();
+    var known_sri: array<u8, 96>;
+    check("SHA512 SRI matches independent OpenSSL known answer", integrity("abc" as ptr<u8>, 3, &known_sri[0]) && mem_eq_cstr(&known_sri[0] as str,
+        "sha512-3a81oZNherrMQXNJriBBMRLm+k6JqX6iCp7u5ktV05ohkpkqJ0/BqDa6PCOj/uu9RU1EI2Q86A4qmslPpUyknw=="));
+    var root: str = join((deref suite.directory) as str, "install") as str;
+    var main: str = join(root, "main") as str;
+    var dep: str = join(root, "dep") as str;
+    var ok: bool = mkdir(root, 448) == 0 && mkdir(main, 448) == 0 && mkdir(dep, 448) == 0 && mkdir(join(main,
+        "package") as str, 448) == 0 && mkdir(join(dep, "package") as str, 448) == 0;
+    var manifest: str = "{\"dependencies\":{\"demo-install\":\"1.0.0\"}}";
+    var main_manifest: str = "{\"name\":\"demo-install\",\"version\":\"1.0.0\",\"dependencies\":{\"nested\":\"2.0.0\"},\"scripts\":{\"install\":\"touch install-script-ran\"}}";
+    var dep_manifest: str = "{\"name\":\"nested\",\"version\":\"2.0.0\"}";
+    ok = ok && write(join(root, "package.json") as str, manifest as ptr<u8>, mem_len_cstr(manifest)) > 0 && write(join(main,
+        "package/package.json") as str, main_manifest as ptr<u8>, mem_len_cstr(main_manifest)) > 0 && write(join(dep,
+        "package/package.json") as str, dep_manifest as ptr<u8>, mem_len_cstr(dep_manifest)) > 0;
+    var source: str = "module.exports=require('nested')+1;";
+    ok = ok && write(join(main, "package/index.js") as str, source as ptr<u8>, mem_len_cstr(source)) > 0;
+    source = "module.exports=42;";
+    ok = ok && write(join(dep, "package/index.js") as str, source as ptr<u8>, mem_len_cstr(source)) > 0;
+    check("package installation fixture files", ok);
+    if (!ok) {
+        return;
+    }
+    var pack: array<str, 7> = ["/usr/bin/tar", "-czf", join(root, "main.tgz") as str, "-C", main, "package",
+        ""];
+    expect("generate pinned npm tarball fixture", &pack[0], 6, "" as ptr<u8>, -1, 0, "");
+    pack[2] = join(root, "nested.tgz") as str;
+    pack[4] = dep;
+    expect("generate nested npm dependency fixture", &pack[0], 6, "" as ptr<u8>, -1, 0, "");
+    var main_blob: Blob = read_blob(join(root, "main.tgz") as str, 33554432);
+    var dep_blob: Blob = read_blob(join(root, "nested.tgz") as str, 33554432);
+    var main_sri: array<u8, 96>;
+    var dep_sri: array<u8, 96>;
+    ok = main_blob.bytes != null && dep_blob.bytes != null && integrity(main_blob.bytes, main_blob.length,
+        &main_sri[0]) && integrity(dep_blob.bytes, dep_blob.length, &dep_sri[0]);
+    free_blob(&main_blob);
+    free_blob(&dep_blob);
+    ok = ok && install_lock(root, &main_sri[0] as str, &dep_sri[0] as str, false);
+    check("wjson lockfile records exact identities and SHA512", ok);
+    var command: array<str, 5> = [(deref suite.binary) as str, "install", "--offline", "--project", root];
+    var expected: str = "Installed 2 packages; lifecycle scripts disabled\n";
+    expect("offline frozen install verifies and publishes nested dependencies", &command[0], 5, expected as ptr<u8>,
+        mem_len_cstr(expected), 0, "");
+    module_case(root, "installed CommonJS dependency graph executes on JSC", "console.log(require('demo-install'));",
+        "43\n", 0, "");
+    var info: Stat;
+    check("package lifecycle scripts never execute", stat(join(root, "install-script-ran") as str, &info) < 0);
+    expect("install preserves an existing node_modules tree", &command[0], 5, "" as ptr<u8>, 0, 1, "node_modules already exists");
+    module_case(root, "existing dependency bytes survive rejected reinstall", "console.log(require('demo-install'));",
+        "43\n", 0, "");
+    var replacement: array<str, 6> = [(deref suite.binary) as str, "install", "--offline", "--project", root, "--replace"];
+    write(join(root, "node_modules/demo-install/index.js") as str, "module.exports=-1;" as ptr<u8>, 18);
+    expect("explicit offline replacement restores a managed tree from its pinned lock", &replacement[0], 6,
+        expected as ptr<u8>, mem_len_cstr(expected), 0, "");
+    module_case(root, "replaced dependency graph executes restored archive bytes on JSC", "console.log(require('demo-install'));",
+        "43\n", 0, "");
+    check("managed replacement removes its private backups and recovery journal", stat(join(root,
+        ".jsrt-transaction") as str, &info) < 0);
+    main_blob = read_blob(join(root, "main.tgz") as str, 33554432);
+    write(join(root, "main.tgz") as str, "corrupt" as ptr<u8>, 7);
+    expect("replacement archive failure preserves the previous installed generation", &replacement[0], 6,
+        "" as ptr<u8>, 0, 1, "SHA512 integrity mismatch");
+    module_case(root, "failed replacement leaves the prior dependency graph executable", "console.log(require('demo-install'));",
+        "43\n", 0, "");
+    check("failed replacement removes only its uncommitted staging data", stat(join(root,
+        ".jsrt-transaction") as str, &info) < 0);
+    if (main_blob.bytes != null) {
+        write(join(root, "main.tgz") as str, main_blob.bytes, main_blob.length);
+    }
+    free_blob(&main_blob);
+    installed_fixture_cleanup(root);
+    var development_manifest: str = "{\"devDependencies\":{\"demo-install\":\"^1\"}}";
+    write(join(root, "package.json") as str, development_manifest as ptr<u8>, mem_len_cstr(development_manifest));
+    check("development lock records root dependency selection", install_lock_sources(root,
+        &main_sri[0] as str, &dep_sri[0] as str, false, false, true));
+    var development_command: array<str, 6> = [(deref suite.binary) as str, "install", "--offline", "--project", root,
+        "--include-dev"];
+    expect("offline install includes explicitly selected development graph", &development_command[0], 6,
+        expected as ptr<u8>, mem_len_cstr(expected), 0, "");
+    module_case(root, "development dependency graph executes with JSC", "console.log(require('demo-install'));",
+        "43\n", 0, "");
+    installed_fixture_cleanup(root);
+    expect("production mode rejects a development lock before publication", &command[0], 5,
+        "" as ptr<u8>, 0, 1, "lockfile is invalid");
+    check("development lock mismatch leaves destination absent", stat(join(root, "node_modules") as str,
+        &info) < 0);
+    write(join(root, "package.json") as str, manifest as ptr<u8>, mem_len_cstr(manifest));
+    install_lock(root, &main_sri[0] as str, &dep_sri[0] as str, false);
+    check("cache fixture opens a locked transaction", open_transaction(root));
+    var cached_blob: Blob;
+    check("absent archive cache is a miss without creating a directory", read_cached_archive(&main_sri[0] as str,
+        &cached_blob) == 0 && stat(join(root, ".jsrt-cache") as str, &info) < 0);
+    free_blob(&cached_blob);
+    check("cache writes use the owned recovery staging directory", start_transaction_stage());
+    main_blob = read_blob(join(root, "main.tgz") as str, 33554432);
+    dep_blob = read_blob(join(root, "nested.tgz") as str, 33554432);
+    check("archive cache publishes verified bytes atomically", store_cached_archive(main_blob, &main_sri[0] as str) && store_cached_archive(dep_blob,
+        &dep_sri[0] as str));
+    check("archive cache preserves an existing verified entry", store_cached_archive(main_blob, &main_sri[0] as str));
+    var unknown_cache: str = join(root, ".jsrt-cache/keep-user-data") as str;
+    write(unknown_cache, "preserve" as ptr<u8>, 8);
+    check("cache pruning rejects invalid bounds without deleting archives", !prune_archive_cache(-1, 1) &&
+        stat(cached_fixture_path(root, &main_sri[0] as str), &info) == 0);
+    var main_times: array<i64, 4> = [100, 0, 100, 0];
+    var dep_times: array<i64, 4> = [200, 0, 200, 0];
+    check("prepare deterministic cache publication order", test_file_times(-100,
+        cached_fixture_path(root, &main_sri[0] as str), &main_times[0], 256) == 0 &&
+        test_file_times(-100, cached_fixture_path(root, &dep_sri[0] as str), &dep_times[0], 256) == 0);
+    check("cache byte pressure removes the oldest publication first", prune_archive_cache(dep_blob.length, 1024) &&
+        stat(cached_fixture_path(root, &main_sri[0] as str), &info) < 0 &&
+        stat(cached_fixture_path(root, &dep_sri[0] as str), &info) == 0);
+    check("cache restores evicted archive with verified bytes", store_cached_archive(main_blob, &main_sri[0] as str));
+    remove(cached_fixture_path(root, &main_sri[0] as str));
+    check("prepare symlink cache pruning boundary", symlink("../main.tgz", cached_fixture_path(root, &main_sri[0] as str)) == 0);
+    check("cache pruning validates all entries before deleting any archive", !prune_archive_cache(0, 0) &&
+        stat(cached_fixture_path(root, &dep_sri[0] as str), &info) == 0 && stat(unknown_cache, &info) == 0);
+    remove(cached_fixture_path(root, &main_sri[0] as str));
+    check("prepare hardlink cache pruning boundary", hardlink(join(root, "main.tgz") as str,
+        cached_fixture_path(root, &main_sri[0] as str)) == 0);
+    check("cache pruning rejects hardlinks and preserves other entries", !prune_archive_cache(0, 0) &&
+        stat(cached_fixture_path(root, &dep_sri[0] as str), &info) == 0);
+    remove(cached_fixture_path(root, &main_sri[0] as str));
+    check("cache repopulates after refusing unsafe entries", store_cached_archive(main_blob, &main_sri[0] as str));
+    check("cache byte budget evicts old archives and preserves unrelated names", prune_archive_cache(0, 1024) &&
+        stat(cached_fixture_path(root, &main_sri[0] as str), &info) < 0 &&
+        stat(cached_fixture_path(root, &dep_sri[0] as str), &info) < 0 && stat(unknown_cache, &info) == 0 && info.size == 8);
+    check("cache can repopulate after complete eviction", store_cached_archive(main_blob, &main_sri[0] as str) &&
+        store_cached_archive(dep_blob, &dep_sri[0] as str));
+    check("cache entry budget keeps only one archive", prune_archive_cache(268435456, 1) &&
+        ((stat(cached_fixture_path(root, &main_sri[0] as str), &info) == 0) as i32 +
+        (stat(cached_fixture_path(root, &dep_sri[0] as str), &info) == 0) as i32) == 1);
+    check("cache repopulation preserves offline graph", store_cached_archive(main_blob, &main_sri[0] as str) &&
+        store_cached_archive(dep_blob, &dep_sri[0] as str));
+    var prune: array<str, 9> = [(deref suite.binary) as str, "cache", "prune", "--project", root,
+        "--max-mb", "256", "--max-entries", "1024"];
+    expect("cache maintenance serializes against an active installer", &prune[0], 9, "" as ptr<u8>, 0,
+        1, "another package installer holds the project lock");
+    remove(unknown_cache);
+    free_blob(&main_blob);
+    free_blob(&dep_blob);
+    check("cached archives survive transaction staging cleanup", close_transaction());
+    expect("cache maintenance CLI respects compiled budgets", &prune[0], 9,
+        "Archive cache pruned\n" as ptr<u8>, 21, 0, "");
+    prune[6] = "257";
+    expect("cache maintenance rejects oversized limits before opening a project", &prune[0], 9,
+        "" as ptr<u8>, 0, 2, "invalid cache limit");
+    install_lock_sources(root, &main_sri[0] as str, &dep_sri[0] as str, false, true, false);
+    expect("offline frozen HTTPS sources use verified content cache", &command[0], 5, expected as ptr<u8>,
+        mem_len_cstr(expected), 0, "");
+    module_case(root, "cached CommonJS graph executes on JSC", "console.log(require('demo-install'));",
+        "43\n", 0, "");
+    installed_fixture_cleanup(root);
+    write(cached_fixture_path(root, &main_sri[0] as str), "corrupt" as ptr<u8>, 7);
+    expect("corrupt cached archive fails closed before publication", &command[0], 5, "" as ptr<u8>, 0,
+        1, "cached archive read or SHA512 verification failed");
+    check("corrupt archive cache leaves dependency destination absent", stat(join(root, "node_modules") as str,
+        &info) < 0);
+    remove(cached_fixture_path(root, &main_sri[0] as str));
+    symlink("../main.tgz", cached_fixture_path(root, &main_sri[0] as str));
+    expect("archive cache refuses a symlink entry", &command[0], 5, "" as ptr<u8>, 0, 1, "without symlinks");
+    cached_fixture_cleanup(root, &main_sri[0] as str, &dep_sri[0] as str);
+    check("prepare hostile symlink in place of archive cache directory",symlink("main",join(root,".jsrt-cache") as str) == 0);
+    expect("archive cache refuses a symlink directory",&command[0],5,"" as ptr<u8>,0,1,"without following links");
+    check("archive cache denial preserves the symlink target",stat(join(main,"package/index.js") as str,&info) == 0 && info.size > 0);
+    remove(join(root,".jsrt-cache") as str);
+    install_lock(root, &main_sri[0] as str, &dep_sri[0] as str, false);
+    var wrong: array<u8, 96>;
+    integrity("wrong" as ptr<u8>, 5, &wrong[0]);
+    install_lock(root, &wrong[0] as str, &dep_sri[0] as str, false);
+    expect("archive integrity mismatch cannot publish dependencies", &command[0], 5, "" as ptr<u8>, 0,
+        1, "integrity mismatch");
+    check("integrity failure leaves no node_modules", stat(join(root, "node_modules") as str, &info) < 0);
+    install_lock(root, &main_sri[0] as str, &dep_sri[0] as str, true);
+    expect("frozen lockfile rejects unreferenced package locations", &command[0], 5, "" as ptr<u8>, 0,
+        1, "unused or duplicate");
+    check("late graph validation rolls back extracted files", stat(join(root, "node_modules") as str,
+        &info) < 0);
+    install_lock(root, &main_sri[0] as str, &dep_sri[0] as str, false);
+    source = "{\"dependencies\":{\"demo-install\":\"^1.0.0\"}}";
+    write(join(root, "package.json") as str, source as ptr<u8>, mem_len_cstr(source));
+    install_lock(root, &main_sri[0] as str, &dep_sri[0] as str, false);
+    expect("offline frozen install accepts matching semver requirement", &command[0], 5, expected as ptr<u8>,
+        mem_len_cstr(expected), 0, "");
+    module_case(root, "semver-locked CommonJS graph executes on JSC", "console.log(require('demo-install'));",
+        "43\n", 0, "");
+    installed_fixture_cleanup(root);
+    source = "{\"dependencies\":{\"demo-install\":\"^2.0.0\"}}";
+    write(join(root, "package.json") as str, source as ptr<u8>, mem_len_cstr(source));
+    install_lock(root, &main_sri[0] as str, &dep_sri[0] as str, false);
+    expect("frozen lock rejects exact version outside semver requirement", &command[0], 5, "" as ptr<u8>,
+        0, 1, "lockfile does not match");
+    write(join(root, "package.json") as str, manifest as ptr<u8>, mem_len_cstr(manifest));
+    install_lock(root, &main_sri[0] as str, &dep_sri[0] as str, false);
+    source = "{ \"dependencies\":{\"demo-install\":\"1.0.0\"}}";
+    write(join(root, "package.json") as str, source as ptr<u8>, mem_len_cstr(source));
+    expect("frozen lockfile detects changed manifest bytes", &command[0], 5, "" as ptr<u8>, 0, 1, "package.json changed");
+    write(join(root, "package.json") as str, manifest as ptr<u8>, mem_len_cstr(manifest));
+    var transform: array<str, 8> = ["/usr/bin/tar", "-czf", join(root, "main.tgz") as str, "--transform=s,package/index.js,package/../escape.js,",
+        "-C", main, "package", ""];
+    expect("generate archive traversal rejection fixture", &transform[0], 7, "" as ptr<u8>, -1, 0, "");
+    main_blob = read_blob(join(root, "main.tgz") as str, 33554432);
+    integrity(main_blob.bytes, main_blob.length, &main_sri[0]);
+    free_blob(&main_blob);
+    install_lock(root, &main_sri[0] as str, &dep_sri[0] as str, false);
+    expect("verified archives still reject traversal paths", &command[0], 5, "" as ptr<u8>, 0, 1, "unsafe corrupt or oversized");
+    check("archive traversal creates no escaped file", stat(join(root, "escape.js") as str, &info) < 0);
+    symlink("../../escape.js", join(main, "package/link") as str);
+    pack[2] = join(root, "main.tgz") as str;
+    pack[4] = main;
+    expect("generate archive symlink rejection fixture", &pack[0], 6, "" as ptr<u8>, -1, 0, "");
+    main_blob = read_blob(pack[2], 33554432);
+    integrity(main_blob.bytes, main_blob.length, &main_sri[0]);
+    free_blob(&main_blob);
+    install_lock(root, &main_sri[0] as str, &dep_sri[0] as str, false);
+    expect("verified archives reject symbolic links", &command[0], 5, "" as ptr<u8>, 0, 1, "unsafe corrupt or oversized");
+    remove(join(main, "package/link") as str);
+    hardlink(join(main, "package/index.js") as str, join(main, "package/hard") as str);
+    expect("generate archive hard link rejection fixture", &pack[0], 6, "" as ptr<u8>, -1, 0, "");
+    main_blob = read_blob(pack[2], 33554432);
+    integrity(main_blob.bytes, main_blob.length, &main_sri[0]);
+    free_blob(&main_blob);
+    install_lock(root, &main_sri[0] as str, &dep_sri[0] as str, false);
+    expect("verified archives reject hard links", &command[0], 5, "" as ptr<u8>, 0, 1, "unsafe corrupt or oversized");
+    remove(join(main, "package/hard") as str);
+    var duplicate_pack: array<str, 9> = ["/usr/bin/tar", "-czf", pack[2], "--hard-dereference", "-C",
+        main, "package/package.json", "package/index.js", "package/index.js"];
+    expect("generate duplicate archive entry rejection fixture", &duplicate_pack[0], 9, "" as ptr<u8>,
+        -1, 0, "");
+    main_blob = read_blob(pack[2], 33554432);
+    integrity(main_blob.bytes, main_blob.length, &main_sri[0]);
+    free_blob(&main_blob);
+    install_lock(root, &main_sri[0] as str, &dep_sri[0] as str, false);
+    expect("verified archives reject duplicate file entries", &command[0], 5, "" as ptr<u8>, 0, 1, "unsafe corrupt or oversized");
+    var rule: array<u8, 8192>;
+    var prefix: str = "--transform=s,package/index.js,package/";
+    var used: i64 = mem_len_cstr(prefix);
+    mem_copy(&rule[0], prefix as ptr<u8>, used);
+    for (var i: i64 = 0; i < 2100; i++) {
+        rule[used] = 113;
+        rule[used+1] = 47;
+        used += 2;
+    }
+    mem_copy(&rule[used], "index.js," as ptr<u8>, 10);
+    transform[3] = &rule[0] as str;
+    expect("generate archive with rollback-unsafe deep path", &transform[0], 7, "" as ptr<u8>, -1, 0,
+        "");
+    main_blob = read_blob(pack[2], 33554432);
+    integrity(main_blob.bytes, main_blob.length, &main_sri[0]);
+    free_blob(&main_blob);
+    install_lock(root, &main_sri[0] as str, &dep_sri[0] as str, false);
+    expect("archive paths stay within descriptor rollback path limits", &command[0], 5, "" as ptr<u8>,
+        0, 1, "unsafe corrupt or oversized");
+    var large: str = join(main, "package/large.bin") as str;
+    var fd: i64 = create(large);
+    ftruncate(fd, 33554433);
+    io_close(fd);
+    expect("generate bounded extraction rejection fixture", &pack[0], 6, "" as ptr<u8>, -1, 0, "");
+    main_blob = read_blob(pack[2], 33554432);
+    integrity(main_blob.bytes, main_blob.length, &main_sri[0]);
+    free_blob(&main_blob);
+    install_lock(root, &main_sri[0] as str, &dep_sri[0] as str, false);
+    expect("verified compressed archives enforce extracted file limits", &command[0], 5, "" as ptr<u8>,
+        0, 1, "unsafe corrupt or oversized");
+    remove(large);
+    remove(join(root, "jsrt.lock.wjson") as str);
+    source = "{}";
+    write(join(root, "package.json") as str, source as ptr<u8>, 2);
+    command[2] = "--frozen-lockfile";
+    expect("frozen installation requires a lockfile", &command[0], 5, "" as ptr<u8>, 0, 1, "requires jsrt.lock.wjson");
+    var empty: array<str, 4> = [(deref suite.binary) as str, "install", "--project", root];
+    expected = "Installed 0 packages; lifecycle scripts disabled\n";
+    expect("empty install creates a wjson lock and publishes a recoverable transaction", &empty[0], 4,
+        expected as ptr<u8>, mem_len_cstr(expected), 0, "");
+    var update: array<str, 5> = [(deref suite.binary) as str, "install", "--update", "--project", root];
+    write(join(root, "node_modules/stale") as str, "old" as ptr<u8>, 3);
+    var changed_manifest: str = "{\"name\":\"updated-empty\",\"dependencies\":{}}";
+    write(join(root, "package.json") as str, changed_manifest as ptr<u8>, mem_len_cstr(changed_manifest));
+    expect("update refreshes a changed manifest and exchanges its managed tree and lock", &update[0], 5,
+        expected as ptr<u8>, mem_len_cstr(expected), 0, "");
+    check("update discards stale managed files only after successful publication", stat(join(root,
+        "node_modules/stale") as str, &info) < 0 && stat(join(root, ".jsrt-transaction") as str, &info) < 0);
+    var incompatible: array<str, 6> = [(deref suite.binary) as str, "install", "--update", "--offline", "--project", root];
+    expect("update rejects offline mode before opening its transaction", &incompatible[0], 6, "" as ptr<u8>,
+        0, 2, "cannot be combined");
+    remove(join(root, "node_modules/.jsrt-install-proof") as str);
+    expect("replacement refuses an unmanaged dependency directory", &update[0], 5, "" as ptr<u8>, 0,
+        1, "jsrt-managed");
+    rmdir(join(root, "node_modules") as str);
+    expect("update can refresh an existing lock while its dependency tree is absent", &update[0], 5,
+        expected as ptr<u8>, mem_len_cstr(expected), 0, "");
+    remove(join(root, "node_modules/.jsrt-install-proof") as str);
+    rmdir(join(root, "node_modules") as str);
+    command[2] = "--offline";
+    expect("generated lock supports reproducible empty offline install", &command[0], 5, expected as ptr<u8>,
+        mem_len_cstr(expected), 0, "");
+    remove(join(root, "node_modules/.jsrt-install-proof") as str);
+    rmdir(join(root, "node_modules") as str);
+    remove(join(root, "entry.js") as str);
+    remove(join(root, "package.json") as str);
+    remove(join(root, "jsrt.lock.wjson") as str);
+    remove(join(root, "main.tgz") as str);
+    remove(join(root, "nested.tgz") as str);
+    var payloads: array<str, 2> = [main, dep];
+    for (var i: i64 = 0; i < 2; i++) {
+        remove(join(payloads[i], "package/package.json") as str);
+        remove(join(payloads[i], "package/index.js") as str);
+        rmdir(join(payloads[i], "package") as str);
+        rmdir(payloads[i]);
+    }
+    check("package transaction cleanup removes every owned staging artifact", rmdir(root) == 0);
+}
+
+pub fun workspace_tests() {
+    var suite: ptr<TestState> = test_state();
+    var root: str = join((deref suite.directory) as str, "workspaces") as str;
+    var parent: str = join(root, "packages") as str;
+    var a: str = join(parent, "a") as str;
+    var b: str = join(parent, "b") as str;
+    var manifest: str = "{\"workspaces\":[\"packages/*\"],\"dependencies\":{\"ws-a\":\"workspace:*\"}}";
+    var manifest_a: str = "{\"name\":\"ws-a\",\"version\":\"1.0.0\",\"dependencies\":{\"ws-b\":\"workspace:^\"}}";
+    var manifest_b: str = "{\"name\":\"ws-b\",\"version\":\"1.0.0\",\"dependencies\":{\"ws-a\":\"^1\"}}";
+    var source_a: str = "module.exports=require('ws-b')+1";
+    var source_b: str = "module.exports=41";
+    var ok: bool = mkdir(root, 448) == 0 && mkdir(parent, 448) == 0 && mkdir(a, 448) == 0 && mkdir(b, 448) == 0 &&
+        write(join(root, "package.json") as str, manifest as ptr<u8>, mem_len_cstr(manifest)) > 0 &&
+        write(join(a, "package.json") as str, manifest_a as ptr<u8>, mem_len_cstr(manifest_a)) > 0 &&
+        write(join(b, "package.json") as str, manifest_b as ptr<u8>, mem_len_cstr(manifest_b)) > 0 &&
+        write(join(a, "index.js") as str, source_a as ptr<u8>, mem_len_cstr(source_a)) > 0 &&
+        write(join(b, "index.js") as str, source_b as ptr<u8>, mem_len_cstr(source_b)) > 0;
+    check("prepare cyclic local workspace graph without registry inputs", ok);
+    if (!ok) {
+        clean_private_directory(root);
+        return;
+    }
+    var install: array<str, 6> = [(deref suite.binary) as str, "install", "--project", root, "--offline", "--replace"];
+    expect("workspace snapshots install before registry resolution and local cycles terminate", &install[0], 4,
+        "Installed 2 packages; lifecycle scripts disabled\n" as ptr<u8>, -1, 0, "");
+    var script: str = concat("console.log(require('", absolute(join(root, "node_modules/ws-a") as str) as str) as str;
+    script = concat(script, "'))") as str;
+    var run: array<str, 3> = [(deref suite.binary) as str, "-e", script];
+    expect("workspace snapshots resolve sibling CommonJS packages", &run[0], 3, "42\n" as ptr<u8>, 3, 0, "");
+    expect("frozen workspace snapshots reinstall offline with identical content", &install[0], 6,
+        "" as ptr<u8>, -1, 0, "");
+    var changed: str = "module.exports=99";
+    check("change a workspace source without changing its manifest", write(join(b, "index.js") as str,
+        changed as ptr<u8>, mem_len_cstr(changed)) > 0);
+    expect("frozen workspace installation detects changed source bytes", &install[0], 6,
+        "" as ptr<u8>, 0, 1, "locked workspace snapshot");
+    expect("workspace integrity failure preserves the previously published graph", &run[0], 3,
+        "42\n" as ptr<u8>, 3, 0, "");
+    write(join(b, "index.js") as str, source_b as ptr<u8>, mem_len_cstr(source_b));
+    var link: str = join(a, "escape") as str;
+    check("prepare a workspace source link escape", symlink("/etc/passwd", link) == 0);
+    expect("workspace snapshots reject symbolic links before publication", &install[0], 6,
+        "" as ptr<u8>, 0, 1, "workspace input must be");
+    remove(link);
+    check("prepare a workspace source hard link", hardlink(join(b, "index.js") as str, link) == 0);
+    expect("workspace snapshots reject hard links before publication", &install[0], 6,
+        "" as ptr<u8>, 0, 1, "workspace input must be");
+    remove(link);
+    var escape: str = "{\"workspaces\":[\"packages/../a\"]}";
+    write(join(root, "package.json") as str, escape as ptr<u8>, mem_len_cstr(escape));
+    expect("workspace paths reject parent traversal", &install[0], 4,
+        "" as ptr<u8>, 0, 1, "workspace paths must remain");
+    check("workspace fixtures remove only their owned project tree", clean_private_directory(root));
+}
+
+fun dependency_fixture_lock(root: str, plugin_sri: str, host_sri: str, plugin: bool, host: bool,
+    skip: bool, skip_range: str) -> bool {
+    var manifest: Blob = read_blob(join(root, "package.json") as str, 4194304);
+    var hash: array<u8, 96>;
+    var ok: bool = manifest.bytes != null && integrity(manifest.bytes, manifest.length, &hash[0]);
+    free_blob(&manifest);
+    var w: JsonWriter = json_writer_new(2);
+    ok = ok && json_begin_object(&w) && json_field_i64(&w, "lockfileVersion", 1) &&
+        json_field_str(&w, "manifestIntegrity", &hash[0] as str) && json_key(&w, "packages") &&
+        json_begin_object(&w);
+    var names: array<str, 2> = ["plugin", "peerhost"];
+    var paths: array<str, 2> = ["node_modules/plugin", "node_modules/peerhost"];
+    var versions: array<str, 2> = ["1.0.0", "2.0.0"];
+    var sources: array<str, 2> = ["file:plugin.tgz", "file:host.tgz"];
+    for (var i: i64 = 0; i < 2; i++) {
+        if ((i == 0 && !plugin) || (i == 1 && !host)) {
+            continue;
+        }
+        var sri: str = plugin_sri;
+        if (i == 1) {
+            sri = host_sri;
+        }
+        ok = ok && json_key(&w, paths[i]) && json_begin_object(&w) && json_field_str(&w, "name", names[i]) &&
+            json_field_str(&w, "version", versions[i]) && json_field_str(&w, "resolved", sources[i]) &&
+            json_field_str(&w, "integrity", sri) && json_end_object(&w);
+    }
+    ok = ok && json_end_object(&w) && json_key(&w, "optionalSkips") && json_begin_object(&w);
+    if (skip) {
+        ok = ok && json_key(&w, "node_modules/plugin") && json_begin_object(&w) &&
+            json_field_str(&w, "name", "plugin") && json_field_str(&w, "range", skip_range) &&
+            json_end_object(&w);
+    }
+    ok = ok && json_end_object(&w) && json_end_object(&w);
+    var bytes: str = json_writer_finish(&w);
+    ok = ok && write(join(root, "jsrt.lock.wjson") as str, bytes as ptr<u8>, json_writer_len(&w)) == json_writer_len(&w);
+    json_writer_free(&w);
+    return ok;
+}
+
+fun dependency_fixture_cleanup(root: str) {
+    var names: array<str, 2> = ["plugin", "peerhost"];
+    for (var i: i64 = 0; i < 2; i++) {
+        var path: str = join(join(root, "node_modules") as str, names[i]) as str;
+        remove(join(path, "index.js") as str);
+        remove(join(path, "package.json") as str);
+        rmdir(path);
+    }
+    remove(join(root, "node_modules/.jsrt-install-proof") as str);
+    rmdir(join(root, "node_modules") as str);
+}
+
+fun dependency_archive(root: str, manifest: str, sri: ptr<u8>) -> bool {
+    var suite: ptr<TestState> = test_state();
+    var path: str = join(root, "plugin-src/package/package.json") as str;
+    if (write(path, manifest as ptr<u8>, mem_len_cstr(manifest)) != mem_len_cstr(manifest)) {
+        return false;
+    }
+    var command: array<str, 6> = ["/usr/bin/tar", "-czf", join(root, "plugin.tgz") as str,
+        "-C", join(root, "plugin-src") as str, "package"];
+    var before: i64 = (deref suite.failures);
+    expect("generate peer/optional package archive", &command[0], 6, "" as ptr<u8>, -1, 0, "");
+    var archive: Blob = read_blob(join(root, "plugin.tgz") as str, 33554432);
+    var ok: bool = before == (deref suite.failures) && archive.bytes != null && integrity(archive.bytes, archive.length, sri);
+    free_blob(&archive);
+    return ok;
+}
+
+pub fun package_dependency_tests() {
+    var suite: ptr<TestState> = test_state();
+    var root: str = join((deref suite.directory) as str, "dependency-kinds") as str;
+    var plugin: str = join(root, "plugin-src") as str;
+    var host: str = join(root, "host-src") as str;
+    var ok: bool = mkdir(root, 448) == 0 && mkdir(plugin, 448) == 0 && mkdir(host, 448) == 0 &&
+        mkdir(join(plugin, "package") as str, 448) == 0 && mkdir(join(host, "package") as str, 448) == 0;
+    var host_manifest: str = "{\"name\":\"peerhost\",\"version\":\"2.0.0\"}";
+    var source: str = "module.exports=()=>require('peerhost');";
+    ok = ok && write(join(plugin, "package/index.js") as str, source as ptr<u8>, mem_len_cstr(source)) > 0;
+    source = "module.exports=42;";
+    ok = ok && write(join(host, "package/index.js") as str, source as ptr<u8>, mem_len_cstr(source)) > 0 &&
+        write(join(host, "package/package.json") as str, host_manifest as ptr<u8>, mem_len_cstr(host_manifest)) > 0;
+    check("prepare isolated optional and peer fixtures", ok);
+    if (!ok) {
+        return;
+    }
+    var pack: array<str, 6> = ["/usr/bin/tar", "-czf", join(root, "host.tgz") as str, "-C", host, "package"];
+    expect("generate peer host archive", &pack[0], 6, "" as ptr<u8>, -1, 0, "");
+    var archive: Blob = read_blob(join(root, "host.tgz") as str, 33554432);
+    var host_sri: array<u8, 96>;
+    var plugin_sri: array<u8, 96>;
+    ok = archive.bytes != null && integrity(archive.bytes, archive.length, &host_sri[0]);
+    free_blob(&archive);
+    var plugin_manifest: str = "{\"name\":\"plugin\",\"version\":\"1.0.0\",\"peerDependencies\":{\"peerhost\":\"^2\"}}";
+    var manifest: str = "{\"dependencies\":{\"plugin\":\"1.0.0\"}}";
+    ok = ok && dependency_archive(root, plugin_manifest, &plugin_sri[0]) &&
+        write(join(root, "package.json") as str, manifest as ptr<u8>, mem_len_cstr(manifest)) > 0 &&
+        dependency_fixture_lock(root, &plugin_sri[0] as str, &host_sri[0] as str, true, true, false, "");
+    check("peer lock pins plugin and visible sibling host", ok);
+    var command: array<str, 5> = [(deref suite.binary) as str, "install", "--offline", "--project", root];
+    var expected: str = "Installed 2 packages; lifecycle scripts disabled\n";
+    expect("missing peer is installed beside its requester from a pinned archive", &command[0], 5,
+        expected as ptr<u8>, mem_len_cstr(expected), 0, "");
+    module_case(root, "peer-installed sibling resolves in actual JSC require", "console.log(require('plugin')());", "42\n", 0, "");
+    dependency_fixture_cleanup(root);
+    plugin_manifest = "{\"name\":\"plugin\",\"version\":\"1.0.0\",\"peerDependencies\":{\"peerhost\":\"^3\"}}";
+    dependency_archive(root, plugin_manifest, &plugin_sri[0]);
+    manifest = "{\"dependencies\":{\"plugin\":\"1.0.0\",\"peerhost\":\"2.0.0\"}}";
+    write(join(root, "package.json") as str, manifest as ptr<u8>, mem_len_cstr(manifest));
+    dependency_fixture_lock(root, &plugin_sri[0] as str, &host_sri[0] as str, true, true, false, "");
+    expect("incompatible visible peer fails instead of silently nesting a replacement", &command[0], 5,
+        "" as ptr<u8>, 0, 1, "peer dependency version conflict");
+    var info: Stat;
+    check("peer conflict publishes neither partial tree nor recovery artifacts",
+        stat(join(root, "node_modules") as str, &info) < 0 && stat(join(root, ".jsrt-transaction") as str, &info) < 0);
+    plugin_manifest = "{\"name\":\"plugin\",\"version\":\"1.0.0\",\"peerDependencies\":{\"peerhost\":\"^2\"},\"peerDependenciesMeta\":{\"peerhost\":{\"optional\":true}}}";
+    dependency_archive(root, plugin_manifest, &plugin_sri[0]);
+    manifest = "{\"dependencies\":{\"plugin\":\"^9\"},\"optionalDependencies\":{\"plugin\":\"1.0.0\"}}";
+    write(join(root, "package.json") as str, manifest as ptr<u8>, mem_len_cstr(manifest));
+    dependency_fixture_lock(root, &plugin_sri[0] as str, &host_sri[0] as str, true, false, false, "");
+    expected = "Installed 1 packages; lifecycle scripts disabled\n";
+    expect("optional dependency overrides production and missing optional peer stays absent", &command[0], 5,
+        expected as ptr<u8>, mem_len_cstr(expected), 0, "");
+    check("optional peer is not auto-installed", stat(join(root, "node_modules/peerhost") as str, &info) < 0);
+    dependency_fixture_cleanup(root);
+    manifest = "{\"optionalDependencies\":{\"plugin\":\"1.0.0\"}}";
+    write(join(root, "package.json") as str, manifest as ptr<u8>, mem_len_cstr(manifest));
+    dependency_fixture_lock(root, &plugin_sri[0] as str, &host_sri[0] as str, false, false, true, "1.0.0");
+    expected = "Installed 0 packages; lifecycle scripts disabled\n";
+    expect("frozen optional skip replays offline without requiring an archive", &command[0], 5,
+        expected as ptr<u8>, mem_len_cstr(expected), 0, "");
+    dependency_fixture_cleanup(root);
+    manifest = "{\"optionalDependencies\":{\"plugin\":\"1.0.0\"},\"peerDependencies\":{\"plugin\":\"^1\"}}";
+    write(join(root, "package.json") as str, manifest as ptr<u8>, mem_len_cstr(manifest));
+    dependency_fixture_lock(root, &plugin_sri[0] as str, &host_sri[0] as str, false, false, true, "1.0.0");
+    expect("required peer cannot contradict a skipped optional location", &command[0], 5,
+        "" as ptr<u8>, 0, 1, "required peer conflicts");
+    manifest = "{\"optionalDependencies\":{\"plugin\":\"1.0.0\"}}";
+    write(join(root, "package.json") as str, manifest as ptr<u8>, mem_len_cstr(manifest));
+    dependency_fixture_lock(root, &plugin_sri[0] as str, &host_sri[0] as str, false, false, true, "^2");
+    expect("frozen optional skip must match the declared requirement", &command[0], 5,
+        "" as ptr<u8>, 0, 1, "optional skip does not match");
+    dependency_fixture_lock(root, &plugin_sri[0] as str, &host_sri[0] as str, true, false, true, "1.0.0");
+    expect("a lock cannot both install and skip the same optional location", &command[0], 5,
+        "" as ptr<u8>, 0, 1, "optional skip does not match");
+    dependency_fixture_lock(root, &plugin_sri[0] as str, &host_sri[0] as str, true, false, false, "");
+    write(join(root, "plugin.tgz") as str, "corrupt" as ptr<u8>, 7);
+    expect("frozen optional integrity failure cannot silently alter the pinned graph", &command[0], 5,
+        "" as ptr<u8>, 0, 1, "SHA512 integrity mismatch");
+    check("optional integrity failure preserves the absent destination", stat(join(root, "node_modules") as str, &info) < 0);
+    check("optional subtree rollback starts an owned transaction", open_transaction(root) && begin_install(root));
+    check("optional rollback preserves earlier staged content", ensure_directory("node_modules/keep"));
+    var checkpoint: i64 = install_checkpoint();
+    var fd: i32 = create_file("node_modules/optional/deep/file");
+    check("optional rollback fixture creates nested staged paths", fd >= 0);
+    if (fd >= 0) {
+        io_close(fd as i64);
+    }
+    check("optional rollback removes only paths created after its checkpoint", rollback_install(checkpoint) &&
+        stat(join(root, ".jsrt-transaction/node_modules/optional") as str, &info) < 0 &&
+        stat(join(root, ".jsrt-transaction/node_modules/keep") as str, &info) == 0);
+    check("optional rollback transaction closes without leftovers", end_install() &&
+        stat(join(root, ".jsrt-transaction") as str, &info) < 0);
+    remove(join(root, "entry.js") as str);
+    remove(join(root, "plugin.tgz") as str);
+    remove(join(root, "host.tgz") as str);
+    remove(join(root, "jsrt.lock.wjson") as str);
+    remove(join(root, "package.json") as str);
+    remove(join(plugin, "package/index.js") as str);
+    remove(join(plugin, "package/package.json") as str);
+    remove(join(host, "package/index.js") as str);
+    remove(join(host, "package/package.json") as str);
+    rmdir(join(plugin, "package") as str);
+    rmdir(join(host, "package") as str);
+    rmdir(plugin);
+    rmdir(host);
+    check("peer and optional fixtures are fully cleaned", rmdir(root) == 0);
+}

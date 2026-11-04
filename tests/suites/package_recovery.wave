@@ -1,0 +1,283 @@
+// Interrupted package transaction and replacement recovery fixtures.
+import("jsrt::tools::support")::{arg, join, spawn, wait};
+import("jsrt::runtime::package_transaction")::{open_transaction, start_transaction_stage, stage_fd,
+    prepare_publication, publish_transaction_lock, publish_transaction_tree, close_transaction,
+    replace_transaction};
+import("std::fs::file")::{fs_read_all, write, remove};
+import("std::io::fd")::{io_close, io_write_all};
+import("std::mem::ops")::{mem_eq};
+import("std::mem::cstr")::{mem_len_cstr, mem_eq_cstr};
+import("std::sys::fs")::{Stat, stat, mkdir, rmdir, rename_path};
+import("./harness")::{check, expect, TestState, test_state};
+extern(c, "symlink") fun symlink(target: str, link_path: str) -> i32;
+extern(c, "link") fun hardlink(target: str, link_path: str) -> i32;
+extern(c, "openat") fun test_open_at(fd: i32, path: str, flags: i32, mode: i32) -> i32;
+extern(c, "mkdirat") fun test_mkdir_at(fd: i32, path: str, mode: i32) -> i32;
+extern(c, "raise") fun test_signal(signal: i32) -> i32;
+
+pub fun transaction_fixture(root: str, phase: str) -> i32 {
+    if (!open_transaction(root)) {
+        return 1;
+    }
+    if (mem_eq_cstr(phase, "recover")) {
+        if (close_transaction()) {
+            return 0;
+        }
+        return 1;
+    }
+    if (mem_eq_cstr(phase, "locked")) {
+        var competitor: array<str, 4> = [arg(0), "--transaction-fixture", root, "recover"];
+        var child: i64 = spawn(&competitor[0], 4, -1, -1);
+        var status: i32 = wait(child, 2000);
+        close_transaction();
+        if (status == 1) {
+            return 0;
+        }
+        return 1;
+    }
+    var replacing: bool = mem_eq_cstr(phase, "replace-building") || mem_eq_cstr(phase, "replace-prepared") ||
+        mem_eq_cstr(phase, "replace-lock") || mem_eq_cstr(phase, "replace-tree");
+    if (replacing && !replace_transaction(true, true)) {
+        close_transaction();
+        return 1;
+    }
+    if (!start_transaction_stage() || test_mkdir_at(stage_fd(), "node_modules", 493) != 0) {
+        close_transaction();
+        return 1;
+    }
+    var fd: i32 = test_open_at(stage_fd(), "node_modules/owned", 655553, 420);
+    if (fd < 0) {
+        close_transaction();
+        return 1;
+    }
+    var ok: bool = io_write_all(fd as i64, "payload" as ptr<u8>, 7) == 7;
+    io_close(fd as i64);
+    fd = test_open_at(stage_fd(), "jsrt.lock.wjson", 655553, 420);
+    if (fd < 0) {
+        close_transaction();
+        return 1;
+    }
+    ok = ok && io_write_all(fd as i64, "owned-lock" as ptr<u8>, 10) == 10;
+    io_close(fd as i64);
+    if (!mem_eq_cstr(phase, "building") && !mem_eq_cstr(phase, "replace-building")) {
+        ok = ok && prepare_publication(true);
+    }
+    if (mem_eq_cstr(phase, "lock") || mem_eq_cstr(phase, "tree") || mem_eq_cstr(phase, "replace-lock") ||
+        mem_eq_cstr(phase, "replace-tree")) {
+        ok = ok && publish_transaction_lock(true);
+    }
+    if (mem_eq_cstr(phase, "tree") || mem_eq_cstr(phase, "replace-tree")) {
+        ok = ok && publish_transaction_tree();
+    }
+    if (!ok) {
+        close_transaction();
+        return 1;
+    }
+    // SIGKILL deliberately skips all normal Wave transaction cleanup.
+    test_signal(9);
+    return 1;
+}
+
+pub fun package_recovery_tests() {
+    var suite: ptr<TestState> = test_state();
+    var root: str = join((deref suite.directory) as str, "recovery") as str;
+    check("prepare isolated package recovery project", mkdir(root, 448) == 0);
+    var phases: array<str, 4> = ["building", "prepared", "lock", "tree"];
+    var info: Stat;
+    for (var i: i64 = 0; i < 4; i++) {
+        var child: array<str, 4> = [arg(0), "--transaction-fixture", root, phases[i]];
+        expect("SIGKILL stops transaction subprocess at publication boundary", &child[0], 4, "" as ptr<u8>,
+            0, 137, "");
+        check("interrupted install retains its recovery directory", stat(join(root, ".jsrt-transaction") as str,
+            &info) == 0);
+        if (i == 1) {
+            write(join(root, ".jsrt-transaction/state.next") as str, "partial" as ptr<u8>, 7);
+        }
+        child[3] = "recover";
+        expect("fresh process recovers interrupted package transaction", &child[0], 4, "" as ptr<u8>,
+            0, 0, "");
+        check("recovery removes its stage and journal", stat(join(root, ".jsrt-transaction") as str,
+            &info) < 0);
+        if (i == 3) {
+            var n: i64 = fs_read_all(join(root, "jsrt.lock.wjson") as str, (deref suite.output), 65536);
+            check("committed recovery preserves the published lock", n == 10 && mem_eq((deref suite.output), "owned-lock" as ptr<u8>,
+                10));
+            n = fs_read_all(join(root, "node_modules/owned") as str, (deref suite.output), 65536);
+            check("committed recovery preserves the published dependency tree", n == 7 && mem_eq((deref suite.output),
+                "payload" as ptr<u8>, 7));
+            remove(join(root, "node_modules/owned") as str);
+            remove(join(root, "node_modules/.jsrt-install-proof") as str);
+            rmdir(join(root, "node_modules") as str);
+            remove(join(root, "jsrt.lock.wjson") as str);
+        } else {
+            check("uncommitted recovery leaves no published tree or lock", stat(join(root, "node_modules") as str,
+                &info) < 0 && stat(join(root, "jsrt.lock.wjson") as str, &info) < 0);
+        }
+    }
+    var child: array<str, 4> = [arg(0), "--transaction-fixture", root, "lock"];
+    expect("SIGKILL leaves an interrupted lock for the real install command", &child[0], 4, "" as ptr<u8>,
+        0, 137, "");
+    write(join(root, "package.json") as str, "{}" as ptr<u8>, 2);
+    var install: array<str, 4> = [(deref suite.binary) as str, "install", "--project", root];
+    var installed: str = "Installed 0 packages; lifecycle scripts disabled\n";
+    expect("real install recovers before reading the interrupted published lock", &install[0], 4, installed as ptr<u8>,
+        mem_len_cstr(installed), 0, "");
+    remove(join(root, "package.json") as str);
+    remove(join(root, "jsrt.lock.wjson") as str);
+    remove(join(root, "node_modules/.jsrt-install-proof") as str);
+    rmdir(join(root, "node_modules") as str);
+    expect("SIGKILL interrupts publication before replacing its lock", &child[0], 4, "" as ptr<u8>, 0,
+        137, "");
+    remove(join(root, "jsrt.lock.wjson") as str);
+    write(join(root, "jsrt.lock.wjson") as str, "foreign" as ptr<u8>, 7);
+    child[3] = "recover";
+    expect("recovery handles a replaced lock without deleting it", &child[0], 4, "" as ptr<u8>, 0, 0,
+        "");
+    var n: i64 = fs_read_all(join(root, "jsrt.lock.wjson") as str, (deref suite.output), 65536);
+    check("foreign lock bytes survive rollback", n == 7 && mem_eq((deref suite.output), "foreign" as ptr<u8>, 7));
+    remove(join(root, "jsrt.lock.wjson") as str);
+    child[3] = "tree";
+    expect("SIGKILL leaves a published tree before recovery cleanup", &child[0], 4, "" as ptr<u8>, 0,
+        137, "");
+    remove(join(root, "node_modules/owned") as str);
+    remove(join(root, "node_modules/.jsrt-install-proof") as str);
+    rmdir(join(root, "node_modules") as str);
+    mkdir(join(root, "node_modules") as str, 493);
+    write(join(root, "node_modules/foreign") as str, "keep" as ptr<u8>, 4);
+    child[3] = "recover";
+    expect("recovery distinguishes a replacement tree by its retained ownership proof", &child[0], 4,
+        "" as ptr<u8>, 0, 0, "");
+    n = fs_read_all(join(root, "node_modules/foreign") as str, (deref suite.output), 65536);
+    check("foreign dependency tree survives and the uncommitted owned lock is removed", n == 4 && mem_eq((deref suite.output),
+        "keep" as ptr<u8>, 4) && stat(join(root, "jsrt.lock.wjson") as str, &info) < 0);
+    remove(join(root, "node_modules/foreign") as str);
+    rmdir(join(root, "node_modules") as str);
+    child[3] = "locked";
+    expect("concurrent installer cannot acquire the project directory lock", &child[0], 4, "" as ptr<u8>,
+        0, 0, "");
+    var outside: str = join(root, "outside") as str;
+    mkdir(outside, 448);
+    write(join(outside, "sentinel") as str, "keep" as ptr<u8>, 4);
+    symlink("outside", join(root, ".jsrt-transaction") as str);
+    child[3] = "recover";
+    expect("recovery refuses a symlink in place of its transaction directory", &child[0], 4, "" as ptr<u8>,
+        0, 1, "");
+    n = fs_read_all(join(outside, "sentinel") as str, (deref suite.output), 65536);
+    check("recovery never follows the transaction symlink", n == 4 && mem_eq((deref suite.output), "keep" as ptr<u8>,
+        4));
+    remove(join(root, ".jsrt-transaction") as str);
+    mkdir(join(root, ".jsrt-transaction") as str, 448);
+    write(join(root, ".jsrt-transaction/unknown") as str, "keep" as ptr<u8>, 4);
+    expect("recovery preserves an unrecognized nonempty reserved directory", &child[0], 4, "" as ptr<u8>,
+        0, 1, "");
+    var malformed: str = "{\"format\":1,\"prepared\":\"wrong\",\"newLock\":false}";
+    write(join(root, ".jsrt-transaction/state.wjson") as str, malformed as ptr<u8>, mem_len_cstr(malformed));
+    expect("recovery rejects incorrectly typed journal fields", &child[0], 4, "" as ptr<u8>, 0, 1, "");
+    n = fs_read_all(join(root, ".jsrt-transaction/unknown") as str, (deref suite.output), 65536);
+    check("invalid journal never authorizes removal of existing data", n == 4 && mem_eq((deref suite.output), "keep" as ptr<u8>,
+        4));
+    remove(join(root, ".jsrt-transaction/state.wjson") as str);
+    remove(join(root, ".jsrt-transaction/unknown") as str);
+    rmdir(join(root, ".jsrt-transaction") as str);
+    remove(join(outside, "sentinel") as str);
+    rmdir(outside);
+    check("recovery regression fixtures remove every owned artifact", rmdir(root) == 0);
+}
+
+fun previous_install(root: str) -> bool {
+    return mkdir(join(root, "node_modules") as str, 493) == 0 &&
+        write(join(root, "node_modules/.jsrt-install-proof") as str, "old" as ptr<u8>, 3) == 3 &&
+        write(join(root, "node_modules/previous") as str, "before" as ptr<u8>, 6) == 6 &&
+        write(join(root, "jsrt.lock.wjson") as str, "previous-lock" as ptr<u8>, 13) == 13;
+}
+
+fun clear_replaced_install(root: str) {
+    var staged: str = join(root, ".jsrt-transaction") as str;
+    var files: array<str, 11> = ["node_modules/previous", "node_modules/owned", "node_modules/.jsrt-install-proof",
+        "old-tree.proof", "old-lock.proof", "tree.proof", "lock.proof", "jsrt.lock.wjson", "state.next", "state.wjson",
+        "cache-archive.tmp"];
+    for (var i: i64 = 0; i < 11; i++) {
+        remove(join(staged, files[i]) as str);
+    }
+    rmdir(join(staged, "node_modules") as str);
+    rmdir(staged);
+    remove(join(root, "node_modules/previous") as str);
+    remove(join(root, "node_modules/owned") as str);
+    remove(join(root, "node_modules/.jsrt-install-proof") as str);
+    rmdir(join(root, "node_modules") as str);
+    remove(join(root, "jsrt.lock.wjson") as str);
+}
+
+pub fun package_replace_recovery_tests() {
+    var suite: ptr<TestState> = test_state();
+    var root: str = join((deref suite.directory) as str, "replacement-recovery") as str;
+    check("prepare managed replacement recovery project", mkdir(root, 448) == 0);
+    var phases: array<str, 4> = ["replace-building", "replace-prepared", "replace-lock", "replace-tree"];
+    var info: Stat;
+    for (var i: i64 = 0; i < 4; i++) {
+        check("prepare previous managed generation", previous_install(root));
+        var child: array<str, 4> = [arg(0), "--transaction-fixture", root, phases[i]];
+        expect("SIGKILL interrupts managed replacement at a real publication boundary", &child[0], 4,
+            "" as ptr<u8>, 0, 137, "");
+        child[3] = "recover";
+        expect("fresh process recovers replacement with retained generation proofs", &child[0], 4,
+            "" as ptr<u8>, 0, 0, "");
+        var n: i64 = fs_read_all(join(root, "jsrt.lock.wjson") as str, (deref suite.output), 65536);
+        if (i == 3) {
+            check("committed replacement retains the new lock", n == 10 && mem_eq((deref suite.output), "owned-lock" as ptr<u8>, 10));
+            n = fs_read_all(join(root, "node_modules/owned") as str, (deref suite.output), 65536);
+            check("committed replacement retains the new dependency generation", n == 7 &&
+                mem_eq((deref suite.output), "payload" as ptr<u8>, 7) && stat(join(root, "node_modules/previous") as str, &info) < 0);
+        } else {
+            check("uncommitted replacement restores the exact old lock", n == 13 &&
+                mem_eq((deref suite.output), "previous-lock" as ptr<u8>, 13));
+            n = fs_read_all(join(root, "node_modules/previous") as str, (deref suite.output), 65536);
+            check("uncommitted replacement preserves the previous dependency generation", n == 6 &&
+                mem_eq((deref suite.output), "before" as ptr<u8>, 6) && stat(join(root, "node_modules/owned") as str, &info) < 0);
+        }
+        check("replacement recovery removes private backups and its journal", stat(join(root,
+            ".jsrt-transaction") as str, &info) < 0);
+        clear_replaced_install(root);
+    }
+    check("prepare lock conflict replacement generation", previous_install(root));
+    var child: array<str, 4> = [arg(0), "--transaction-fixture", root, "replace-lock"];
+    expect("interrupt replacement after lock exchange before tree exchange", &child[0], 4,
+        "" as ptr<u8>, 0, 137, "");
+    remove(join(root, "jsrt.lock.wjson") as str);
+    write(join(root, "jsrt.lock.wjson") as str, "foreign" as ptr<u8>, 7);
+    child[3] = "recover";
+    expect("replacement recovery refuses a foreign lock and retains both generations", &child[0], 4,
+        "" as ptr<u8>, 0, 1, "");
+    var n: i64 = fs_read_all(join(root, "jsrt.lock.wjson") as str, (deref suite.output), 65536);
+    check("replacement conflict preserves foreign lock bytes and old tree", n == 7 &&
+        mem_eq((deref suite.output), "foreign" as ptr<u8>, 7) && stat(join(root, "node_modules/previous") as str, &info) == 0);
+    n = fs_read_all(join(root, ".jsrt-transaction/jsrt.lock.wjson") as str, (deref suite.output), 65536);
+    check("replacement conflict preserves the previous lock backup", n == 13 &&
+        mem_eq((deref suite.output), "previous-lock" as ptr<u8>, 13));
+    remove(join(root, "jsrt.lock.wjson") as str);
+    check("restore test-owned new lock from its retained proof", hardlink(join(root,
+        ".jsrt-transaction/lock.proof") as str, join(root, "jsrt.lock.wjson") as str) == 0);
+    expect("recovery resumes after the test-owned conflict is repaired", &child[0], 4, "" as ptr<u8>, 0, 0, "");
+    clear_replaced_install(root);
+    check("prepare tree conflict replacement generation", previous_install(root));
+    child[3] = "replace-tree";
+    expect("interrupt replacement after dependency tree exchange", &child[0], 4, "" as ptr<u8>, 0, 137, "");
+    check("move only the test-owned published generation aside", rename_path(join(root, "node_modules") as str,
+        join(root, "saved-new") as str) == 0);
+    mkdir(join(root, "node_modules") as str, 493);
+    write(join(root, "node_modules/foreign") as str, "keep" as ptr<u8>, 4);
+    child[3] = "recover";
+    expect("replacement recovery preserves a foreign tree and the previous backup", &child[0], 4,
+        "" as ptr<u8>, 0, 1, "");
+    n = fs_read_all(join(root, "node_modules/foreign") as str, (deref suite.output), 65536);
+    check("tree conflict preserves foreign bytes and the old managed generation", n == 4 &&
+        mem_eq((deref suite.output), "keep" as ptr<u8>, 4) && stat(join(root, ".jsrt-transaction/node_modules/previous") as str, &info) == 0);
+    remove(join(root, "node_modules/foreign") as str);
+    rmdir(join(root, "node_modules") as str);
+    check("restore only the test-owned published generation", rename_path(join(root, "saved-new") as str,
+        join(root, "node_modules") as str) == 0);
+    expect("committed replacement cleanup resumes after restoring its tree", &child[0], 4,
+        "" as ptr<u8>, 0, 0, "");
+    clear_replaced_install(root);
+    check("replacement regression removes its isolated project", rmdir(root) == 0);
+}

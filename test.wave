@@ -1,0 +1,6 @@
+// Thin entry point; orchestration and cases live in tests/suites.
+import("./tests/suites/runner")::{run_tests};
+
+fun main() -> i32 {
+    return run_tests();
+}

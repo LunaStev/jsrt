@@ -1,0 +1,136 @@
+// Shared assertions, output capture, result counts and owned file fixtures.
+import("jsrt::tools::support")::{join, concat, spawn, wait};
+import("std::fs::file")::{create, fs_read_all, remove};
+import("std::io::fd")::{io_close, io_write_all};
+import("std::mem::ops")::{mem_eq};
+import("std::mem::cstr")::{mem_len_cstr};
+import("std::sys::fs")::{rmdir};
+extern(c, "fflush") fun test_flush(stream: ptr<u8>) -> i32;
+
+// One process-owned runner state. Parallel JSC callbacks must not access it.
+pub struct TestState {
+    binary: ptr<u8>;
+    directory: ptr<u8>;
+    output: ptr<u8>;
+    errors: ptr<u8>;
+    output_count: i64;
+    error_count: i64;
+    total: i32;
+    failures: i32;
+    skipped: i32;
+    require_tcp: bool;
+}
+
+static shared: TestState;
+
+pub fun test_state() -> ptr<TestState> {
+    return &shared;
+}
+
+pub fun contains(buffer: ptr<u8>, length: i64, needle: str) -> bool {
+    var size: i64 = mem_len_cstr(needle);
+    if (size == 0) {
+        return true;
+    }
+    for (var i: i64 = 0; i + size <= length; i++) {
+        if (mem_eq(buffer + i, needle as ptr<u8>, size)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fun check(name: str, ok: bool) {
+    var suite: ptr<TestState> = test_state();
+    deref suite.total += 1;
+    if (ok) {
+        println("PASS {}", name);
+    } else {
+        deref suite.failures += 1;
+        println("FAIL {}", name);
+    }
+    test_flush(null);
+}
+
+// Most cases are short in-process scripts. Cases that start an external peer
+// (real TLS, large transfers) pass LONG_COMMAND_TIMEOUT_MS to expect_within.
+pub const DEFAULT_COMMAND_TIMEOUT_MS: i64 = 10000;
+pub const LONG_COMMAND_TIMEOUT_MS: i64 = 60000;
+
+pub fun expect(name: str, arguments: ptr<str>, count: i64, expected: ptr<u8>, expected_length: i64, code: i32,
+    error: str) {
+    expect_within(name, arguments, count, expected, expected_length, code, error, DEFAULT_COMMAND_TIMEOUT_MS);
+}
+
+pub fun expect_within(name: str, arguments: ptr<str>, count: i64, expected: ptr<u8>, expected_length: i64,
+    code: i32, error: str, timeout_ms: i64) {
+    var suite: ptr<TestState> = test_state();
+    var stdout_path: str = join((deref suite.directory) as str, "stdout") as str;
+    var stderr_path: str = join((deref suite.directory) as str, "stderr") as str;
+    var stdout_fd: i64 = create(stdout_path);
+    var stderr_fd: i64 = create(stderr_path);
+    if (stdout_fd < 0 || stderr_fd < 0) {
+        if (stdout_fd >= 0) {
+            io_close(stdout_fd);
+        }
+        if (stderr_fd >= 0) {
+            io_close(stderr_fd);
+        }
+        check(name, false);
+        return;
+    }
+    var pid: i64 = spawn(arguments, count, stdout_fd, stderr_fd);
+    io_close(stdout_fd);
+    io_close(stderr_fd);
+    var status: i32 = wait(pid, timeout_ms);
+    deref suite.output_count = fs_read_all(stdout_path, (deref suite.output), 65536);
+    deref suite.error_count = fs_read_all(stderr_path, (deref suite.errors), 65536);
+    var ok: bool = status == code && (deref suite.output_count) >= 0 && (deref suite.error_count) >= 0;
+    if (expected_length >= 0) {
+        ok = ok && (deref suite.output_count) == expected_length && mem_eq((deref suite.output), expected, expected_length);
+    }
+    ok = ok && contains((deref suite.errors), (deref suite.error_count), error);
+    check(name, ok);
+    if (!ok) {
+        println("  expected exit {}, got {}", code, status);
+        if ((deref suite.output_count) > 0) {
+            io_write_all(2, (deref suite.output), (deref suite.output_count));
+        }
+        if ((deref suite.error_count) > 0) {
+            io_write_all(2, (deref suite.errors), (deref suite.error_count));
+        }
+    }
+}
+
+pub fun test(name: str, source: str, expected: str, code: i32, error: str) {
+    var suite: ptr<TestState> = test_state();
+    var arguments: array<str, 3> = [(deref suite.binary) as str, "-e", source];
+    expect(name, &arguments[0], 3, expected as ptr<u8>, mem_len_cstr(expected), code, error);
+}
+
+pub fun async_case(name: str, source: str, expected: str, code: i32, error: str) {
+    var suite: ptr<TestState> = test_state();
+    var path: str = join((deref suite.directory) as str, "source.js") as str;
+    var command: array<str, 4> = [(deref suite.binary) as str, "-e", source, path];
+    expect(name, &command[0], 4, expected as ptr<u8>, mem_len_cstr(expected), code, error);
+}
+
+pub fun filesystem_case(name: str, source: str, expected: str, code: i32, error: str) {
+    var suite: ptr<TestState> = test_state();
+    var path: str = join((deref suite.directory) as str, "fs-entry") as str;
+    var command: array<str, 4> = [(deref suite.binary) as str, "-e", source, path];
+    expect(name, &command[0], 4, expected as ptr<u8>, mem_len_cstr(expected), code, error);
+    // Only these tests own these paths. Clean them even when an assertion fails.
+    remove(join(path, "a/b/data") as str);
+    remove(join(path, "a/b/moved") as str);
+    remove(join(path, "b") as str);
+    remove(join(path, "a") as str);
+    remove(join(path, ".hidden") as str);
+    remove(join(path, "한글") as str);
+    rmdir(join(path, "b") as str);
+    rmdir(join(path, "a/b") as str);
+    rmdir(join(path, "a") as str);
+    remove(path);
+    rmdir(path);
+    rmdir(concat(path, "-inner") as str);
+}
