@@ -133,6 +133,22 @@ pub fun url_input(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
     return value;
 }
 
+// The URL standard gives an origin only to the "special" network schemes. Everything else, such as
+// file: and unknown hierarchical schemes, has the opaque origin "null".
+fun special_scheme(ctx: ptr<u8>, scheme: ptr<u8>) -> bool {
+    var names: array<str, 5> = ["http", "https", "ws", "wss", "ftp"];
+    for (var i: i64 = 0; i < 5; i++) {
+        var candidate: ptr<u8> = text(ctx, names[i]);
+        protect(ctx, candidate);
+        var same: bool = equal(ctx, scheme, candidate);
+        unprotect(ctx, candidate);
+        if (same) {
+            return true;
+        }
+    }
+    return false;
+}
+
 export(c) fun jsrt_url_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
     ex: ptr<ptr<u8>>) -> ptr<u8> {
     var host_state: ptr<UrlState> = url_storage(ctx);
@@ -285,7 +301,11 @@ export(c) fun jsrt_url_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: 
         if (code == 10) {
             var scheme: ptr<u8> = url_part(ctx, href, 1, ex);
             protect(ctx, scheme);
-            result = join_text(ctx, scheme, "://", authority, ex);
+            if (special_scheme(ctx, scheme)) {
+                result = join_text(ctx, scheme, "://", authority, ex);
+            } else {
+                result = text(ctx, "null");
+            }
             unprotect(ctx, scheme);
         }
         unprotect(ctx, authority);

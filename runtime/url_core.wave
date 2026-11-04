@@ -7,6 +7,8 @@ import("std::mem::ops")::{mem_copy};
 
 // curl_url parts used below.
 const PART_URL: i32 = 0;
+// CURLU_NON_SUPPORT_SCHEME: accept schemes libcurl does not speak, such as file: and ws:.
+const PARSE_ANY_SCHEME: u32 = 8;
 const PART_PATH: i32 = 7;
 const PART_QUERY: i32 = 8;
 const PART_FRAGMENT: i32 = 9;
@@ -87,16 +89,95 @@ fun encoded(ctx: ptr<u8>, value: ptr<u8>, result: ptr<u8>, trim: bool, ex: ptr<p
     return used;
 }
 
+// curl_url already refuses opaque-path schemes (mailto:, data:, about:) when the URL is set with
+// CURLU_NON_SUPPORT_SCHEME, so any scheme that reaches here is hierarchical. Only an empty scheme,
+// which cannot happen for a parsed URL, is rejected defensively.
+fun hierarchical_scheme(scheme: ptr<u8>) -> bool {
+    return scheme != null && mem_len_cstr(scheme as str) > 0;
+}
+
+// libcurl's whole-URL serialization is wrong for file: URLs ("file:///" comes back as "file://(nil)"
+// and "file:a/b" as "file://a/b"), so the canonical form is assembled from the parts instead. Only
+// the normal form with an empty host and an absolute path is accepted: file:///a/b. Relative forms
+// (file:a/b), remote hosts (file://host/a) and drive-letter paths are rejected with ERR_INVALID_URL.
+fun canonical_file(ctx: ptr<u8>, handle: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var path: ptr<u8> = null;
+    var query: ptr<u8> = null;
+    var fragment: ptr<u8> = null;
+    var result: ptr<u8> = undefined(ctx);
+    var assembled: array<u8, 8192>;
+    var used: i64 = 0;
+    if (url_get(handle, PART_PATH, &path, 0) != 0 || path == null || path[0] != 47) {
+        invalid_url(ctx, ex, "invalid file URL");
+    } else {
+        var scheme: str = "file://";
+        mem_copy(&assembled[0], scheme as ptr<u8>, 7);
+        used = 7;
+        var path_length: i64 = mem_len_cstr(path as str);
+        if (path_length >= URL_CAP - 16) {
+            fail(ctx, ex, 2, "URL byte limit exceeded");
+        } else {
+            mem_copy(&assembled[used], path, path_length);
+            used += path_length;
+            if (url_get(handle, PART_QUERY, &query, 0) == 0 && query != null) {
+                var query_length: i64 = mem_len_cstr(query as str);
+                if (used + query_length + 2 >= URL_CAP) {
+                    fail(ctx, ex, 2, "URL byte limit exceeded");
+                } else {
+                    assembled[used] = 63;
+                    mem_copy(&assembled[used + 1], query, query_length);
+                    used += query_length + 1;
+                }
+            }
+            if (deref ex == null && url_get(handle, PART_FRAGMENT, &fragment, 0) == 0 && fragment != null) {
+                var fragment_length: i64 = mem_len_cstr(fragment as str);
+                if (used + fragment_length + 2 >= URL_CAP) {
+                    fail(ctx, ex, 2, "URL byte limit exceeded");
+                } else {
+                    assembled[used] = 35;
+                    mem_copy(&assembled[used + 1], fragment, fragment_length);
+                    used += fragment_length + 1;
+                }
+            }
+            if (deref ex == null) {
+                assembled[used] = 0;
+                result = text(ctx, &assembled[0] as str);
+            }
+        }
+    }
+    if (path != null) {
+        curl_free(path);
+    }
+    if (query != null) {
+        curl_free(query);
+    }
+    if (fragment != null) {
+        curl_free(fragment);
+    }
+    return result;
+}
+
 fun canonical(ctx: ptr<u8>, handle: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
     var scheme: ptr<u8> = null;
     var host: ptr<u8> = null;
     var whole: ptr<u8> = null;
     var result: ptr<u8> = undefined(ctx);
-    if (url_get(handle, 1, &scheme, 0) != 0 || (!mem_eq_cstr(scheme as str, "http") && !mem_eq_cstr(scheme as str,
-        "https"))) {
-        invalid_url(ctx, ex, "URL currently supports HTTP and HTTPS schemes");
-    } else if (url_get(handle, 5, &host, 4096) != 0) {
+    var scheme_status: i32 = url_get(handle, 1, &scheme, 0);
+    var host_status: i32 = 1;
+    if (scheme_status == 0) {
+        host_status = url_get(handle, 5, &host, 4096);
+    }
+    var has_host: bool = host_status == 0;
+    var is_file: bool = scheme_status == 0 && mem_eq_cstr(scheme as str, "file");
+    if (scheme_status != 0) {
+        invalid_url(ctx, ex, "invalid URL");
+    } else if (!hierarchical_scheme(scheme)) {
+        // curl cannot parse opaque-path schemes such as mailto: and data:, so they stay unsupported.
+        invalid_url(ctx, ex, "URL scheme is not supported");
+    } else if (!has_host && !is_file) {
         invalid_url(ctx, ex, "invalid URL hostname");
+    } else if (!has_host) {
+        result = canonical_file(ctx, handle, ex);
     } else {
         var lower: array<u8, 8192>;
         var n: i64 = mem_len_cstr(host as str);
@@ -219,7 +300,7 @@ pub fun parse_url(ctx: ptr<u8>, value: ptr<u8>, base: ptr<u8>, ex: ptr<ptr<u8>>)
     var ok: bool = true;
     if (base != null) {
         var previous: array<u8, 8192>;
-        if (encoded(ctx, base, &previous[0], true, ex) < 0 || url_set(handle, PART_URL, &previous[0], 0) != 0) {
+        if (encoded(ctx, base, &previous[0], true, ex) < 0 || url_set(handle, PART_URL, &previous[0], PARSE_ANY_SCHEME) != 0) {
             ok = false;
         }
     }
@@ -227,7 +308,7 @@ pub fun parse_url(ctx: ptr<u8>, value: ptr<u8>, base: ptr<u8>, ex: ptr<ptr<u8>>)
         url_free(handle);
         return undefined(ctx);
     }
-    if (!ok || url_set(handle, PART_URL, &bytes[0], 0) != 0) {
+    if (!ok || url_set(handle, PART_URL, &bytes[0], PARSE_ANY_SCHEME) != 0) {
         invalid_url(ctx, ex, "invalid URL or base URL");
     } else if (base != null && input_length == 0) {
         // An empty reference resolves to the base without its fragment.
@@ -253,13 +334,13 @@ pub fun url_part(ctx: ptr<u8>, href: ptr<u8>, part: i32, ex: ptr<ptr<u8>>) -> pt
     }
     var data: ptr<u8> = null;
     var result: ptr<u8> = text(ctx, "");
-    if (url_set(handle, 0, &bytes[0], 0) != 0) {
+    if (url_set(handle, PART_URL, &bytes[0], PARSE_ANY_SCHEME) != 0) {
         fail(ctx, ex, 1, "invalid URL");
     } else {
         var status: i32 = url_get(handle, part, &data, 4098);
         if (status == 0) {
             result = text(ctx, data as str);
-        } else if (status != 11 && status != 12 && status != 15 && status != 16 && status != 17) {
+        } else if (status != 11 && status != 12 && status != 14 && status != 15 && status != 16 && status != 17) {
             fail(ctx, ex, 0, "URL component unavailable");
         }
     }
@@ -286,7 +367,7 @@ pub fun change_url(ctx: ptr<u8>, href: ptr<u8>, part: i32, value: ptr<u8>, remov
     if (remove) {
         data = null;
     }
-    if (url_set(handle, PART_URL, &bytes[0], 0) != 0 || url_set(handle, part, data, 0) != 0) {
+    if (url_set(handle, PART_URL, &bytes[0], PARSE_ANY_SCHEME) != 0 || url_set(handle, part, data, 0) != 0) {
         invalid_url(ctx, ex, "invalid URL component");
     }
     var result: ptr<u8> = undefined(ctx);

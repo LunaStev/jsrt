@@ -333,6 +333,11 @@ export(c) fun jsrt_web_construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: 
             if (deref ex == null) {
                 var parsed: ptr<u8> = parse_url(ctx, url, null, ex);
                 protect(ctx, parsed);
+                // URL objects accept more schemes than the network client; a Request must stay HTTP(S).
+                if (deref ex == null && !equal(ctx, url_part(ctx, parsed, 1, ex), text(ctx, "http")) &&
+                    !equal(ctx, url_part(ctx, parsed, 1, ex), text(ctx, "https"))) {
+                    fail(ctx, ex, 1, "Request requires an HTTP URL");
+                }
                 if (deref ex == null && (!equal(ctx, url_part(ctx, parsed, 2, ex), text(ctx, "")) ||
                     !equal(ctx, url_part(ctx, parsed, 3, ex), text(ctx, "")))) {
                     fail(ctx, ex, 1, "Request URL cannot contain credentials");
