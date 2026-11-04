@@ -10,6 +10,7 @@ import("./values")::{get, capture};
 import("./inspect_engine")::{capture_getter};
 import("std::mem::layout")::{size_of};
 extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
 extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
 extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
     ex: ptr<ptr<u8>>) -> ptr<u8>;
@@ -37,6 +38,9 @@ const CHECK_COUNT: i64 = 12;
 
 struct BrandState {
     checks: array<ptr<u8>, 12>;
+    // Function.prototype: a callable that returns undefined, passed as the rejection handler of the
+    // Promise brand probe so the derived promise never reports a rejection of its own.
+    swallow: ptr<u8>;
 }
 
 fun storage(ctx: ptr<u8>) -> ptr<BrandState> {
@@ -84,10 +88,21 @@ pub fun is_regexp(ctx: ptr<u8>, value: ptr<u8>) -> bool {
     return passes(ctx, CHECK_REGEXP, value, false);
 }
 
-// Promise.prototype.then returns a new Promise, so it is only used for its brand check; calling it
-// without a callback has no observable effect beyond the derived promise it returns.
+// Promise.prototype.then is only used for its brand check. The derived promise it returns would
+// report a rejection of the probed promise as unhandled, so a no-op rejection handler is attached.
 pub fun is_promise(ctx: ptr<u8>, value: ptr<u8>) -> bool {
-    return passes(ctx, CHECK_PROMISE, value, false);
+    if (kind(ctx, value) != TYPE_OBJECT) {
+        return false;
+    }
+    var state: ptr<BrandState> = storage(ctx);
+    var check: ptr<u8> = (deref state.checks)[CHECK_PROMISE];
+    if (check == null || deref state.swallow == null) {
+        return false;
+    }
+    var discarded: ptr<u8> = null;
+    var handlers: array<ptr<u8>, 2> = [undefined(ctx), deref state.swallow];
+    call(ctx, check, value, 2, &handlers[0], &discarded);
+    return discarded == null;
 }
 
 // Error.isError is the engine's brand check: it accepts real error objects (including subclasses)
@@ -136,6 +151,8 @@ pub fun install_brands(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     (deref state.checks)[CHECK_WEAK_MAP] = capture(ctx, get(ctx, get(ctx, root, "WeakMap", ex), "prototype", ex), "has", ex);
     (deref state.checks)[CHECK_WEAK_SET] = capture(ctx, get(ctx, get(ctx, root, "WeakSet", ex), "prototype", ex), "has", ex);
     (deref state.checks)[CHECK_PROMISE] = capture(ctx, get(ctx, get(ctx, root, "Promise", ex), "prototype", ex), "then", ex);
+    deref state.swallow = get(ctx, get(ctx, root, "Function", ex), "prototype", ex);
+    protect(ctx, deref state.swallow);
     (deref state.checks)[CHECK_ERROR] = capture(ctx, get(ctx, root, "Error", ex), "isError", ex);
     var wrapper_names: array<str, 5> = ["Number", "String", "Boolean", "BigInt", "Symbol"];
     for (var i: i64 = 0; i < 5; i++) {
@@ -154,6 +171,10 @@ pub fun shutdown_brands(ctx: ptr<u8>) {
     var state: ptr<BrandState> = storage(ctx);
     if (state == null) {
         return;
+    }
+    if (deref state.swallow != null) {
+        unprotect(ctx, deref state.swallow);
+        deref state.swallow = null;
     }
     for (var i: i64 = 0; i < CHECK_COUNT; i++) {
         if ((deref state.checks)[i] != null) {

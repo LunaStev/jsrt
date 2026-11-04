@@ -195,3 +195,30 @@ pub fun shutdown_values(ctx: ptr<u8>) {
     }
     release_context_slot(ctx, VALUES_SLOT, 40);
 }
+
+// Builds an error of the given kind from a JS string value. Returns null with ex set when the
+// engine constructor throws.
+pub fun make_error(ctx: ptr<u8>, kind: i32, message: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var args: array<ptr<u8>, 1> = [message];
+    protect(ctx, args[0]);
+    var result: ptr<u8> = construct(ctx, deref intrinsic(ctx, kind), 1, &args[0], ex);
+    unprotect(ctx, args[0]);
+    return result;
+}
+
+// Like fail_coded(), for messages built at runtime. The message is a JS string value, so the
+// error's stack carries it too.
+pub fun fail_dynamic(ctx: ptr<u8>, ex: ptr<ptr<u8>>, kind: i32, code: str, message: ptr<u8>) {
+    if (deref ex != null) {
+        return;
+    }
+    var nested: ptr<u8> = null;
+    var created: ptr<u8> = make_error(ctx, kind, message, &nested);
+    if (nested != null) {
+        deref ex = nested;
+        return;
+    }
+    deref ex = created;
+    var ignored: ptr<u8> = null;
+    define(ctx, created, "code", text(ctx, code), &ignored, true);
+}

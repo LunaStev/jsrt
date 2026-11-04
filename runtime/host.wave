@@ -30,6 +30,7 @@ import("./util")::{install_util, shutdown_util};
 import("./inspect_engine")::{install_inspect, shutdown_inspect};
 import("./callbacks")::{install_callbacks, finish_callbacks, shutdown_callbacks};
 import("./process_extras")::{install_process_extras, shutdown_process_extras};
+import("./process_warning")::{install_process_warning};
 import("./assert")::{install_assert, shutdown_assert};
 import("./crypto")::{install_crypto, shutdown_crypto};
 import("./url")::{install_url, shutdown_url};
@@ -103,7 +104,7 @@ pub fun install_host(context: ptr<u8>, source_index: i32, eval_mode: bool, path:
     install_next_ticks(context, exception);
     install_process_events(context, get(context, process_global(context), "process", exception), exception);
     return deref exception == null && install_brands(context, exception) && install_clone(context, exception) && install_esm(context, exception) &&
-        install_process_extras(context, exception) && finish_callbacks(context, exception);
+        install_process_extras(context, exception) && install_process_warning(context, exception) && finish_callbacks(context, exception);
 }
 
 pub fun shutdown_host(context: ptr<u8>) -> bool {

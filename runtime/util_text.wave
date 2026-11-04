@@ -1,0 +1,767 @@
+// util.stripVTControlCharacters and util.styleText. Both functions are stateless: one native
+// callback serves them and the function object's name selects the operation, so no context
+// slot is needed. Strings are processed as UTF-16 units and never leave the engine heap
+// except through the temporary builder below.
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::env::environ")::{env_get};
+import("./values")::{get, text, define, fail_coded, fail_dynamic};
+import("./byte_codec")::{encode_bytes};
+import("./config")::{OUTPUT_LIMIT};
+
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_is_array") fun is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_get_index") fun get_index(ctx: ptr<u8>, obj: ptr<u8>, index: u32, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_to_number") fun to_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_to_string") fun to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_utf16") fun string_from_units(units: ptr<u16>, length: i64) -> ptr<u8>;
+extern(c, "wr_string_value") fun string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_characters") fun string_characters(text: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_length") fun string_length(text: ptr<u8>) -> i64;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "isatty") fun libc_isatty(fd: i32) -> i32;
+extern(c, "jsrt_util_text_callback") fun callback() -> ptr<u8>;
+
+// JSValueGetType results.
+const VALUE_UNDEFINED: i32 = 0;
+const VALUE_NULL: i32 = 1;
+const VALUE_BOOLEAN: i32 = 2;
+const VALUE_NUMBER: i32 = 3;
+const VALUE_STRING: i32 = 4;
+const VALUE_OBJECT: i32 = 5;
+const VALUE_SYMBOL: i32 = 6;
+const VALUE_BIGINT: i32 = 7;
+// Error constructor kind used by fail_coded for argument errors.
+const ERROR_TYPE: i32 = 1;
+const STDOUT_FD: i32 = 1;
+const NAME_CAPACITY: i64 = 64;
+const ENV_CAPACITY: i64 = 64;
+
+const ESCAPE: u16 = 27;
+const CSI_8BIT: u16 = 155;
+const BELL: u16 = 7;
+const SEMICOLON: u16 = 59;
+
+// --- UTF-16 builder -------------------------------------------------------------------------
+
+pub struct Builder {
+    data: ptr<u16>;
+    length: i64;
+    capacity: i64;
+}
+
+pub fun builder_reserve(sink: ptr<Builder>, extra: i64) -> bool {
+    var needed: i64 = deref sink.length + extra;
+    if (needed <= deref sink.capacity) {
+        return true;
+    }
+    var capacity: i64 = deref sink.capacity * 2;
+    if (capacity < needed) {
+        capacity = needed;
+    }
+    if (capacity < 64) {
+        capacity = 64;
+    }
+    var data: ptr<u16> = mem_alloc(capacity * 2) as ptr<u16>;
+    if (data == null) {
+        return false;
+    }
+    for (var i: i64 = 0; i < deref sink.length; i++) {
+        data[i] = (deref sink.data)[i];
+    }
+    if (deref sink.data != null) {
+        mem_free(deref sink.data as ptr<u8>, deref sink.capacity * 2);
+    }
+    deref sink.data = data;
+    deref sink.capacity = capacity;
+    return true;
+}
+
+pub fun builder_units(sink: ptr<Builder>, units: ptr<u16>, from: i64, to: i64) -> bool {
+    if (to <= from) {
+        return true;
+    }
+    if (!builder_reserve(sink, to - from)) {
+        return false;
+    }
+    for (var i: i64 = from; i < to; i++) {
+        (deref sink.data)[deref sink.length] = units[i];
+        deref sink.length += 1;
+    }
+    return true;
+}
+
+pub fun builder_ascii(sink: ptr<Builder>, value: str) -> bool {
+    var bytes: ptr<u8> = value as ptr<u8>;
+    var i: i64 = 0;
+    while (bytes[i] != 0) {
+        if (!builder_reserve(sink, 1)) {
+            return false;
+        }
+        (deref sink.data)[deref sink.length] = bytes[i] as u16;
+        deref sink.length += 1;
+        i += 1;
+    }
+    return true;
+}
+
+pub fun builder_number(sink: ptr<Builder>, value: i64) -> bool {
+    var digits: array<u8, 24>;
+    var count: i64 = 0;
+    if (value == 0) {
+        digits[0] = 48;
+        count = 1;
+    }
+    while (value > 0) {
+        digits[count] = (48 + value % 10) as u8;
+        value = value / 10;
+        count += 1;
+    }
+    for (var i: i64 = count - 1; i >= 0; i--) {
+        if (!builder_reserve(sink, 1)) {
+            return false;
+        }
+        (deref sink.data)[deref sink.length] = digits[i] as u16;
+        deref sink.length += 1;
+    }
+    return true;
+}
+
+pub fun builder_finish(ctx: ptr<u8>, sink: ptr<Builder>) -> ptr<u8> {
+    var data: ptr<u16> = deref sink.data;
+    var raw: ptr<u8> = string_from_units(data, deref sink.length);
+    var result: ptr<u8> = string_value(ctx, raw);
+    release(raw);
+    return result;
+}
+
+pub fun builder_free(sink: ptr<Builder>) {
+    if (deref sink.data != null) {
+        mem_free(deref sink.data as ptr<u8>, deref sink.capacity * 2);
+        deref sink.data = null;
+    }
+    deref sink.length = 0;
+    deref sink.capacity = 0;
+}
+
+// --- argument descriptions ----------------------------------------------------------------
+
+pub fun builder_engine_text(ctx: ptr<u8>, sink: ptr<Builder>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var js: ptr<u8> = to_string(ctx, value, ex);
+    if (js == null) {
+        return false;
+    }
+    var ok: bool = builder_units(sink, string_characters(js), 0, string_length(js));
+    release(js);
+    return ok;
+}
+
+// Node's "Received ..." suffix for ERR_INVALID_ARG_TYPE messages.
+pub fun received_suffix(ctx: ptr<u8>, sink: ptr<Builder>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var type_code: i32 = kind(ctx, value);
+    if (type_code == VALUE_UNDEFINED) {
+        return builder_ascii(sink, "Received undefined");
+    }
+    if (type_code == VALUE_NULL) {
+        return builder_ascii(sink, "Received null");
+    }
+    if (type_code == VALUE_OBJECT) {
+        if (callable(ctx, value)) {
+            var label: ptr<u8> = get(ctx, value, "name", ex);
+            if (deref ex == null && kind(ctx, label) == VALUE_STRING && string_length_of(ctx, label) > 0) {
+                return builder_ascii(sink, "Received function ") && builder_engine_text(ctx, sink, label, ex);
+            }
+            return builder_ascii(sink, "Received function ");
+        }
+        var constructor: ptr<u8> = get(ctx, value, "constructor", ex);
+        if (deref ex == null && kind(ctx, constructor) == VALUE_OBJECT) {
+            var constructor_name: ptr<u8> = get(ctx, constructor, "name", ex);
+            if (deref ex == null && kind(ctx, constructor_name) == VALUE_STRING &&
+                string_length_of(ctx, constructor_name) > 0) {
+                return builder_ascii(sink, "Received an instance of ") &&
+                    builder_engine_text(ctx, sink, constructor_name, ex);
+            }
+        }
+        deref ex = null;
+        return builder_ascii(sink, "Received [object]");
+    }
+    var type_name: str = "string";
+    if (type_code == VALUE_BOOLEAN) {
+        type_name = "boolean";
+    }
+    if (type_code == VALUE_NUMBER) {
+        type_name = "number";
+    }
+    if (type_code == VALUE_SYMBOL) {
+        type_name = "symbol";
+    }
+    if (type_code == VALUE_BIGINT) {
+        type_name = "bigint";
+    }
+    if (!builder_ascii(sink, "Received type ") || !builder_ascii(sink, type_name) || !builder_ascii(sink, " (")) {
+        return false;
+    }
+    if (type_code == VALUE_STRING) {
+        if (!builder_ascii(sink, "'") || !builder_engine_text(ctx, sink, value, ex) || !builder_ascii(sink, "'")) {
+            return false;
+        }
+    } else if (type_code == VALUE_SYMBOL) {
+        if (!builder_ascii(sink, "Symbol()")) {
+            return false;
+        }
+    } else {
+        if (!builder_engine_text(ctx, sink, value, ex)) {
+            return false;
+        }
+        if (type_code == VALUE_BIGINT && !builder_ascii(sink, "n")) {
+            return false;
+        }
+    }
+    return builder_ascii(sink, ")");
+}
+
+pub fun string_length_of(ctx: ptr<u8>, value: ptr<u8>) -> i64 {
+    var ignored: ptr<u8> = null;
+    var js: ptr<u8> = to_string(ctx, value, &ignored);
+    if (js == null) {
+        return 0;
+    }
+    var length: i64 = string_length(js);
+    release(js);
+    return length;
+}
+
+// Throws TypeError ERR_INVALID_ARG_TYPE: `The "<name>" argument must be <expected>. Received ...`.
+pub fun invalid_argument_type(ctx: ptr<u8>, ex: ptr<ptr<u8>>, prefix: str, expected: str, value: ptr<u8>) {
+    var sink: Builder;
+    deref sink.data = null;
+    deref sink.length = 0;
+    deref sink.capacity = 0;
+    var ignored: ptr<u8> = null;
+    var ok: bool = builder_ascii(&sink, prefix) && builder_ascii(&sink, " must be ") && builder_ascii(&sink, expected) &&
+        builder_ascii(&sink, ". ") && received_suffix(ctx, &sink, value, &ignored);
+    if (!ok) {
+        builder_free(&sink);
+        fail_coded(ctx, ex, ERROR_TYPE, "ERR_INVALID_ARG_TYPE", "Invalid argument type");
+        return;
+    }
+    var message: ptr<u8> = builder_finish(ctx, &sink);
+    builder_free(&sink);
+    fail_dynamic(ctx, ex, ERROR_TYPE, "ERR_INVALID_ARG_TYPE", message);
+}
+
+// --- stripVTControlCharacters ---------------------------------------------------------------
+
+fun is_digit(unit: u16) -> bool {
+    return unit >= 48 && unit <= 57;
+}
+
+fun is_alnum(unit: u16) -> bool {
+    return is_digit(unit) || (unit >= 65 && unit <= 90) || (unit >= 97 && unit <= 122);
+}
+
+// [-a-zA-Z\d\/#&.:=?%@~_]
+fun is_link_character(unit: u16) -> bool {
+    if (is_alnum(unit)) {
+        return true;
+    }
+    var extra: str = "-/#&.:=?%@~_";
+    var bytes: ptr<u8> = extra as ptr<u8>;
+    var i: i64 = 0;
+    while (bytes[i] != 0) {
+        if (bytes[i] as u16 == unit) {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+// [\dA-PR-TZcf-ntqry=><~]
+fun is_final_character(unit: u16) -> bool {
+    if (is_digit(unit) || (unit >= 65 && unit <= 80) || (unit >= 82 && unit <= 84) || unit == 90) {
+        return true;
+    }
+    if (unit == 99 || (unit >= 102 && unit <= 110) || unit == 116 || unit == 113 || unit == 114 || unit == 121) {
+        return true;
+    }
+    return unit == 61 || unit == 62 || unit == 60 || unit == 126;
+}
+
+fun is_intro_character(unit: u16) -> bool {
+    var intro: str = "[]()#;?";
+    var bytes: ptr<u8> = intro as ptr<u8>;
+    var i: i64 = 0;
+    while (bytes[i] != 0) {
+        if (bytes[i] as u16 == unit) {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+// Matches the ansi-regex pattern Node uses, anchored at `start`. Returns the index after the
+// sequence or -1. The BEL-terminated (OSC) alternative is tried before the CSI alternative,
+// as in the regular expression; every sub-pattern is deterministic because ';' is not part of
+// the link character class.
+fun match_sequence(units: ptr<u16>, length: i64, start: i64) -> i64 {
+    var at: i64 = start + 1;
+    while (at < length && is_intro_character(units[at])) {
+        at += 1;
+    }
+    // Alternative 1a: (;[link]+)* BEL
+    var cursor: i64 = at;
+    while (cursor + 1 < length && units[cursor] == SEMICOLON && is_link_character(units[cursor + 1])) {
+        cursor += 1;
+        while (cursor < length && is_link_character(units[cursor])) {
+            cursor += 1;
+        }
+    }
+    if (cursor < length && units[cursor] == BELL) {
+        return cursor + 1;
+    }
+    // Alternative 1b: [alnum]+ (;[link]*)* BEL
+    cursor = at;
+    while (cursor < length && is_alnum(units[cursor])) {
+        cursor += 1;
+    }
+    if (cursor > at) {
+        while (cursor < length && units[cursor] == SEMICOLON) {
+            cursor += 1;
+            while (cursor < length && is_link_character(units[cursor])) {
+                cursor += 1;
+            }
+        }
+        if (cursor < length && units[cursor] == BELL) {
+            return cursor + 1;
+        }
+    }
+    // Alternative 2: (\d{1,4}(;\d{0,4})*)? final. The group is parsed greedily, then shortened
+    // until a final character follows, mirroring regular expression backtracking.
+    var group_end: i64 = at;
+    var run: i64 = 0;
+    while (group_end < length && is_digit(units[group_end]) && run < 4) {
+        group_end += 1;
+        run += 1;
+    }
+    if (run > 0) {
+        while (group_end < length && units[group_end] == SEMICOLON) {
+            group_end += 1;
+            run = 0;
+            while (group_end < length && is_digit(units[group_end]) && run < 4) {
+                group_end += 1;
+                run += 1;
+            }
+        }
+    }
+    var end: i64 = group_end;
+    while (end >= at) {
+        if (end < length && is_final_character(units[end])) {
+            return end + 1;
+        }
+        end -= 1;
+    }
+    return -1;
+}
+
+fun strip_controls(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0 || kind(ctx, args[0]) != VALUE_STRING) {
+        var subject: ptr<u8> = undefined(ctx);
+        if (count > 0) {
+            subject = args[0];
+        }
+        invalid_argument_type(ctx, ex, "The \"str\" argument", "of type string", subject);
+        return undefined(ctx);
+    }
+    var js: ptr<u8> = to_string(ctx, args[0], ex);
+    if (js == null) {
+        return undefined(ctx);
+    }
+    var units: ptr<u16> = string_characters(js);
+    var length: i64 = string_length(js);
+    var sink: Builder;
+    deref sink.data = null;
+    deref sink.length = 0;
+    deref sink.capacity = 0;
+    var ok: bool = true;
+    var at: i64 = 0;
+    var copied: i64 = 0;
+    while (at < length && ok) {
+        if (units[at] == ESCAPE || units[at] == CSI_8BIT) {
+            var end: i64 = match_sequence(units, length, at);
+            if (end > 0) {
+                ok = builder_units(&sink, units, copied, at);
+                copied = end;
+                at = end;
+                continue;
+            }
+        }
+        at += 1;
+    }
+    if (ok) {
+        ok = builder_units(&sink, units, copied, length);
+    }
+    var result: ptr<u8> = undefined(ctx);
+    if (ok) {
+        result = builder_finish(ctx, &sink);
+    } else {
+        fail_coded(ctx, ex, 2, "ERR_STRING_TOO_LONG", "Cannot create a string longer than the output limit");
+    }
+    builder_free(&sink);
+    release(js);
+    return result;
+}
+
+// --- styleText ----------------------------------------------------------------------------------
+
+const STYLE_COUNT: i64 = 56;
+// "none" is accepted by Node and applies no style.
+const STYLE_NONE: i64 = -2;
+const CLOSE_BOLD_DIM: i32 = 22;
+
+fun style_names() -> array<str, 56> {
+    return ["reset", "bold", "dim", "italic", "underline", "blink", "inverse", "hidden", "strikethrough",
+        "doubleunderline", "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white", "bgBlack", "bgRed",
+        "bgGreen", "bgYellow", "bgBlue", "bgMagenta", "bgCyan", "bgWhite", "framed", "overlined", "gray", "redBright",
+        "greenBright", "yellowBright", "blueBright", "magentaBright", "cyanBright", "whiteBright", "bgGray",
+        "bgRedBright", "bgGreenBright", "bgYellowBright", "bgBlueBright", "bgMagentaBright", "bgCyanBright",
+        "bgWhiteBright", "grey", "blackBright", "bgGrey", "bgBlackBright", "faint", "crossedout", "strikeThrough",
+        "crossedOut", "conceal", "swapColors", "swapcolors", "doubleUnderline"];
+}
+
+fun style_opens() -> array<i32, 56> {
+    return [0, 1, 2, 3, 4, 5, 7, 8, 9, 21, 30, 31, 32, 33, 34, 35, 36, 37, 40, 41, 42, 43, 44, 45, 46, 47, 51, 53, 90,
+        91, 92, 93, 94, 95, 96, 97, 100, 101, 102, 103, 104, 105, 106, 107, 90, 90, 100, 100, 2, 9, 9, 9, 8, 7, 7, 21];
+}
+
+fun style_closes() -> array<i32, 56> {
+    return [0, 22, 22, 23, 24, 25, 27, 28, 29, 24, 39, 39, 39, 39, 39, 39, 39, 39, 49, 49, 49, 49, 49, 49, 49, 49, 54,
+        55, 39, 39, 39, 39, 39, 39, 39, 39, 49, 49, 49, 49, 49, 49, 49, 49, 39, 39, 49, 49, 22, 29, 29, 29, 28, 27, 27,
+        24];
+}
+
+fun same_text(units: ptr<u16>, length: i64, name: str) -> bool {
+    var bytes: ptr<u8> = name as ptr<u8>;
+    var i: i64 = 0;
+    while (bytes[i] != 0) {
+        if (i >= length || units[i] != bytes[i] as u16) {
+            return false;
+        }
+        i += 1;
+    }
+    return i == length;
+}
+
+// Index into the style table or -1.
+fun style_index(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64 {
+    if (kind(ctx, value) != VALUE_STRING) {
+        return -1;
+    }
+    var js: ptr<u8> = to_string(ctx, value, ex);
+    if (js == null) {
+        return -1;
+    }
+    var names: array<str, 56> = style_names();
+    var found: i64 = -1;
+    var units: ptr<u16> = string_characters(js);
+    var length: i64 = string_length(js);
+    if (same_text(units, length, "none")) {
+        release(js);
+        return STYLE_NONE;
+    }
+    for (var i: i64 = 0; i < STYLE_COUNT && found < 0; i++) {
+        if (same_text(units, length, names[i])) {
+            found = i;
+        }
+    }
+    release(js);
+    return found;
+}
+
+fun invalid_format(ctx: ptr<u8>, ex: ptr<ptr<u8>>, value: ptr<u8>) {
+    var sink: Builder;
+    deref sink.data = null;
+    deref sink.length = 0;
+    deref sink.capacity = 0;
+    var names: array<str, 56> = style_names();
+    var ok: bool = builder_ascii(&sink, "The argument 'format' must be one of: ");
+    for (var i: i64 = 0; i < STYLE_COUNT && ok; i++) {
+        if (i > 0) {
+            ok = builder_ascii(&sink, ", ");
+        }
+        ok = ok && builder_ascii(&sink, "'") && builder_ascii(&sink, names[i]) && builder_ascii(&sink, "'");
+    }
+    var ignored: ptr<u8> = null;
+    ok = ok && builder_ascii(&sink, ". Received ");
+    if (ok && kind(ctx, value) == VALUE_STRING) {
+        ok = builder_ascii(&sink, "'") && builder_engine_text(ctx, &sink, value, &ignored) && builder_ascii(&sink, "'");
+    } else if (ok) {
+        ok = builder_engine_text(ctx, &sink, value, &ignored);
+    }
+    if (!ok) {
+        builder_free(&sink);
+        fail_coded(ctx, ex, ERROR_TYPE, "ERR_INVALID_ARG_VALUE", "The argument 'format' is invalid");
+        return;
+    }
+    var message: ptr<u8> = builder_finish(ctx, &sink);
+    builder_free(&sink);
+    fail_dynamic(ctx, ex, ERROR_TYPE, "ERR_INVALID_ARG_VALUE", message);
+}
+
+fun environment_set(name: str, value_out: ptr<u8>) -> bool {
+    return env_get(name, value_out, ENV_CAPACITY) >= 0;
+}
+
+// Mirrors Node's shouldColorize(process.stdout): FORCE_COLOR wins, NO_COLOR and
+// NODE_DISABLE_COLORS disable, otherwise stdout must be a terminal.
+fun stdout_wants_color() -> bool {
+    var value: array<u8, 64>;
+    value[0] = 0;
+    if (environment_set("FORCE_COLOR", &value[0])) {
+        var forced_off: bool = value[0] == 48 && value[1] == 0;
+        var word_off: bool = value[0] == 102 && value[1] == 97 && value[2] == 108 && value[3] == 115 &&
+            value[4] == 101 && value[5] == 0;
+        return !forced_off && !word_off;
+    }
+    value[0] = 0;
+    if (environment_set("NO_COLOR", &value[0]) || environment_set("NODE_DISABLE_COLORS", &value[0])) {
+        return false;
+    }
+    return libc_isatty(STDOUT_FD) == 1;
+}
+
+fun style_text(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var format: ptr<u8> = undefined(ctx);
+    if (count > 0) {
+        format = args[0];
+    }
+    var indexes: array<i64, 16>;
+    var format_count: i64 = 0;
+    if (is_array(ctx, format)) {
+        var length_value: ptr<u8> = get(ctx, format, "length", ex);
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        var length: f64 = to_number(ctx, length_value, ex);
+        if (length > 16.0) {
+            invalid_format(ctx, ex, format);
+            return undefined(ctx);
+        }
+        for (var i: i64 = 0; i < (length as i64); i++) {
+            var item: ptr<u8> = get_index(ctx, format, i as u32, ex);
+            if (deref ex != null) {
+                return undefined(ctx);
+            }
+            var index: i64 = style_index(ctx, item, ex);
+            if (index == -1) {
+                invalid_format(ctx, ex, item);
+                return undefined(ctx);
+            }
+            if (index != STYLE_NONE) {
+                indexes[format_count] = index;
+                format_count += 1;
+            }
+        }
+    } else {
+        var index: i64 = style_index(ctx, format, ex);
+        if (index == -1) {
+            invalid_format(ctx, ex, format);
+            return undefined(ctx);
+        }
+        if (index != STYLE_NONE) {
+            indexes[0] = index;
+            format_count = 1;
+        }
+    }
+    var subject: ptr<u8> = undefined(ctx);
+    if (count > 1) {
+        subject = args[1];
+    }
+    if (kind(ctx, subject) != VALUE_STRING) {
+        invalid_argument_type(ctx, ex, "The \"text\" argument", "of type string", subject);
+        return undefined(ctx);
+    }
+    var validate_stream: bool = true;
+    if (count > 2 && kind(ctx, args[2]) != VALUE_UNDEFINED) {
+        if (kind(ctx, args[2]) != VALUE_OBJECT || callable(ctx, args[2]) || is_array(ctx, args[2])) {
+            invalid_argument_type(ctx, ex, "The \"options\" argument", "of type object", args[2]);
+            return undefined(ctx);
+        }
+        var flag: ptr<u8> = get(ctx, args[2], "validateStream", ex);
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        if (kind(ctx, flag) != VALUE_UNDEFINED) {
+            if (kind(ctx, flag) != VALUE_BOOLEAN) {
+                invalid_argument_type(ctx, ex, "The \"options.validateStream\" property", "of type boolean", flag);
+                return undefined(ctx);
+            }
+            validate_stream = truth(ctx, flag);
+        }
+    }
+    if (validate_stream && !stdout_wants_color()) {
+        return subject;
+    }
+    return apply_styles(ctx, subject, &indexes[0], format_count, ex);
+}
+
+// Wraps the text in each style's open/close pair. A close code already present inside the text
+// is replaced with the open code (kept in front of it for bold/dim, which share code 22) so
+// the style resumes after nested sequences.
+fun apply_styles(ctx: ptr<u8>, subject: ptr<u8>, indexes: ptr<i64>, format_count: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var opens: array<i32, 56> = style_opens();
+    var closes: array<i32, 56> = style_closes();
+    var js: ptr<u8> = to_string(ctx, subject, ex);
+    if (js == null) {
+        return undefined(ctx);
+    }
+    var body: ptr<u16> = string_characters(js);
+    var body_length: i64 = string_length(js);
+    var current: Builder;
+    deref current.data = null;
+    deref current.length = 0;
+    deref current.capacity = 0;
+    var ok: bool = builder_units(&current, body, 0, body_length);
+    // Styles apply innermost-last: the first format ends up outermost, as in Node.
+    for (var n: i64 = format_count - 1; n >= 0 && ok; n--) {
+        var open: i32 = opens[indexes[n]];
+        var close: i32 = closes[indexes[n]];
+        var next: Builder;
+        deref next.data = null;
+        deref next.length = 0;
+        deref next.capacity = 0;
+        ok = builder_open(&next) && builder_number(&next, open as i64) && builder_ascii(&next, "m");
+        var at: i64 = 0;
+        var copied: i64 = 0;
+        var units: ptr<u16> = deref current.data;
+        var length: i64 = deref current.length;
+        while (ok && at < length) {
+            if (units[at] == ESCAPE && matches_close(units, length, at, close)) {
+                ok = builder_units(&next, units, copied, at);
+                if (close == CLOSE_BOLD_DIM) {
+                    ok = ok && write_sequence(&next, close);
+                }
+                ok = ok && write_sequence(&next, open);
+                at += sequence_length(close);
+                copied = at;
+                continue;
+            }
+            at += 1;
+        }
+        ok = ok && builder_units(&next, units, copied, length);
+        ok = ok && write_sequence(&next, close);
+        builder_free(&current);
+        current = next;
+    }
+    release(js);
+    var result: ptr<u8> = undefined(ctx);
+    if (ok) {
+        result = builder_finish(ctx, &current);
+    } else {
+        fail_coded(ctx, ex, 2, "ERR_STRING_TOO_LONG", "Cannot create a string longer than the output limit");
+    }
+    builder_free(&current);
+    return result;
+}
+
+fun write_sequence(sink: ptr<Builder>, code: i32) -> bool {
+    return builder_open(sink) && builder_number(sink, code as i64) && builder_ascii(sink, "m");
+}
+
+fun sequence_length(code: i32) -> i64 {
+    if (code >= 100) {
+        return 6;
+    }
+    if (code >= 10) {
+        return 5;
+    }
+    return 4;
+}
+
+fun matches_close(units: ptr<u16>, length: i64, at: i64, code: i32) -> bool {
+    var width: i64 = sequence_length(code);
+    if (at + width > length) {
+        return false;
+    }
+    if (units[at + 1] != 91) {
+        return false;
+    }
+    var scratch: Builder;
+    deref scratch.data = null;
+    deref scratch.length = 0;
+    deref scratch.capacity = 0;
+    var written: bool = write_sequence(&scratch, code);
+    var same: bool = written && deref scratch.length == width;
+    for (var i: i64 = 0; same && i < width; i++) {
+        if (units[at + i] != (deref scratch.data)[i]) {
+            same = false;
+        }
+    }
+    builder_free(&scratch);
+    return same;
+}
+
+// --- native entry and installation -------------------------------------------------------
+
+export(c) fun jsrt_util_text_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var label: ptr<u8> = get(ctx, fn, "name", ex);
+    var name_bytes: array<u8, 64>;
+    if (deref ex != null || kind(ctx, label) != VALUE_STRING) {
+        return undefined(ctx);
+    }
+    var length: i64 = encode_bytes(ctx, label, 0, &name_bytes[0], NAME_CAPACITY - 1, ex);
+    if (length <= 0 || deref ex != null) {
+        return undefined(ctx);
+    }
+    // stripVTControlCharacters is the only name starting with 's' followed by 't' 'r' 'i'.
+    if (name_bytes[0] == 115 && name_bytes[1] == 116 && name_bytes[2] == 114) {
+        return strip_controls(ctx, count, args, ex);
+    }
+    return style_text(ctx, count, args, ex);
+}
+
+pub fun install_util_text(ctx: ptr<u8>, exports: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var names: array<str, 2> = ["stripVTControlCharacters", "styleText"];
+    for (var i: i64 = 0; i < 2; i++) {
+        var key: ptr<u8> = utf8(names[i]);
+        var created: ptr<u8> = function(ctx, key, callback());
+        release(key);
+        define(ctx, exports, names[i], created, ex, false);
+    }
+    return deref ex == null;
+}
+
+// ESC followed by '[': the control sequence introducer written without string escapes.
+pub fun builder_open(sink: ptr<Builder>) -> bool {
+    if (!builder_reserve(sink, 1)) {
+        return false;
+    }
+    (deref sink.data)[deref sink.length] = ESCAPE;
+    deref sink.length += 1;
+    return builder_ascii(sink, "[");
+}
+
+// "type number (5)" style text for a value, the part of Node's argument errors after "Received ".
+pub fun received_description(ctx: ptr<u8>, value: ptr<u8>) -> ptr<u8> {
+    var sink: Builder;
+    deref sink.data = null;
+    deref sink.length = 0;
+    deref sink.capacity = 0;
+    var ignored: ptr<u8> = null;
+    if (!received_suffix(ctx, &sink, value, &ignored) || deref sink.length < 9) {
+        builder_free(&sink);
+        return text(ctx, "an unknown value");
+    }
+    var raw: ptr<u8> = string_from_units((deref sink.data) + 9, deref sink.length - 9);
+    var result: ptr<u8> = string_value(ctx, raw);
+    release(raw);
+    builder_free(&sink);
+    return result;
+}

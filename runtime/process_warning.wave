@@ -1,0 +1,355 @@
+// process.umask and process.emitWarning. Both are stateless native functions selected by the
+// function object's name. emitWarning delivers on the next tick through process.nextTick, so
+// listeners registered in the same turn still see the warning, as in Node.
+import("std::env::environ")::{env_get};
+import("std::process::core")::{proc_getpid};
+import("std::mem::cstr")::{mem_len_cstr};
+import("./values")::{get, put, define, text, fail_coded, fail_dynamic, make_error};
+import("./byte_codec")::{encode_bytes};
+import("./brands")::{is_native_error};
+import("./events")::{emit_named};
+import("./output")::{write_text};
+import("./util_text")::{Builder, builder_ascii, builder_units, builder_number, builder_finish, builder_free,
+    builder_reserve, invalid_argument_type, string_length_of};
+
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_to_number") fun to_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_to_string") fun to_string(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_string_characters") fun string_characters(text: ptr<u8>) -> ptr<u16>;
+extern(c, "wr_string_length") fun string_length(text: ptr<u8>) -> i64;
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_copy_utf8") fun copy_utf8(text: ptr<u8>, output: ptr<u8>, capacity: i64) -> i64;
+extern(c, "wr_string_utf8_capacity") fun utf8_capacity(text: ptr<u8>) -> i64;
+extern(c, "umask") fun libc_umask(mask: u32) -> u32;
+extern(c, "jsrt_process_warning_callback") fun callback() -> ptr<u8>;
+
+const VALUE_UNDEFINED: i32 = 0;
+const VALUE_STRING: i32 = 4;
+const VALUE_NUMBER: i32 = 3;
+const VALUE_OBJECT: i32 = 5;
+const ERROR_BASE: i32 = 0;
+const ERROR_TYPE: i32 = 1;
+const ERROR_RANGE: i32 = 2;
+const STDERR_FD: i64 = 2;
+const MAX_UMASK: f64 = 4294967295.0;
+const NAME_CAPACITY: i64 = 64;
+const ENV_CAPACITY: i64 = 64;
+const WARNING_LIMIT: i64 = 65536;
+
+fun invalid_mask_value(ctx: ptr<u8>, ex: ptr<ptr<u8>>, value: ptr<u8>) {
+    var sink: Builder;
+    deref sink.data = null;
+    deref sink.length = 0;
+    deref sink.capacity = 0;
+    var ignored: ptr<u8> = null;
+    var js: ptr<u8> = to_string(ctx, value, &ignored);
+    var ok: bool = js != null && builder_ascii(&sink,
+        "The argument 'mask' must be a 32-bit unsigned integer or an octal string. Received '");
+    ok = ok && builder_units(&sink, string_characters(js), 0, string_length(js)) && builder_ascii(&sink, "'");
+    if (js != null) {
+        release(js);
+    }
+    if (!ok) {
+        builder_free(&sink);
+        fail_coded(ctx, ex, ERROR_TYPE, "ERR_INVALID_ARG_VALUE", "The argument 'mask' is invalid");
+        return;
+    }
+    var message: ptr<u8> = builder_finish(ctx, &sink);
+    builder_free(&sink);
+    fail_dynamic(ctx, ex, ERROR_TYPE, "ERR_INVALID_ARG_VALUE", message);
+}
+
+fun mask_range_error(ctx: ptr<u8>, ex: ptr<ptr<u8>>, tail: str, value: ptr<u8>) {
+    var sink: Builder;
+    deref sink.data = null;
+    deref sink.length = 0;
+    deref sink.capacity = 0;
+    var ignored: ptr<u8> = null;
+    var js: ptr<u8> = to_string(ctx, value, &ignored);
+    var ok: bool = js != null && builder_ascii(&sink, "The value of \"mask\" is out of range. It must be ") &&
+        builder_ascii(&sink, tail) && builder_ascii(&sink, ". Received ");
+    ok = ok && builder_units(&sink, string_characters(js), 0, string_length(js));
+    if (js != null) {
+        release(js);
+    }
+    if (!ok) {
+        builder_free(&sink);
+        fail_coded(ctx, ex, ERROR_RANGE, "ERR_OUT_OF_RANGE", "The value of \"mask\" is out of range");
+        return;
+    }
+    var message: ptr<u8> = builder_finish(ctx, &sink);
+    builder_free(&sink);
+    fail_dynamic(ctx, ex, ERROR_RANGE, "ERR_OUT_OF_RANGE", message);
+}
+
+// Parses an octal string such as "077". Returns -1 for anything else.
+fun parse_octal(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64 {
+    var js: ptr<u8> = to_string(ctx, value, ex);
+    if (js == null) {
+        return -1.0;
+    }
+    var units: ptr<u16> = string_characters(js);
+    var length: i64 = string_length(js);
+    var result: f64 = 0.0;
+    if (length == 0) {
+        result = -1.0;
+    }
+    for (var i: i64 = 0; i < length && result >= 0.0; i++) {
+        if (units[i] < 48 || units[i] > 55) {
+            result = -1.0;
+        } else {
+            result = result * 8.0 + ((units[i] - 48) as f64);
+        }
+    }
+    release(js);
+    if (result > MAX_UMASK) {
+        return -1.0;
+    }
+    return result;
+}
+
+fun process_umask(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0 || kind(ctx, args[0]) == VALUE_UNDEFINED) {
+        // The kernel only offers set-and-return-old, so the old mask is written straight back.
+        var current: u32 = libc_umask(0);
+        libc_umask(current);
+        return number(ctx, current as f64);
+    }
+    var mask: f64 = 0.0;
+    var type_code: i32 = kind(ctx, args[0]);
+    if (type_code == VALUE_STRING) {
+        mask = parse_octal(ctx, args[0], ex);
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        if (mask < 0.0) {
+            invalid_mask_value(ctx, ex, args[0]);
+            return undefined(ctx);
+        }
+    } else if (type_code == VALUE_NUMBER) {
+        mask = to_number(ctx, args[0], ex);
+        if (mask != mask || mask - (mask as i64) as f64 != 0.0) {
+            mask_range_error(ctx, ex, "an integer", args[0]);
+            return undefined(ctx);
+        }
+        if (mask < 0.0 || mask > MAX_UMASK) {
+            mask_range_error(ctx, ex, ">= 0 && <= 4294967295", args[0]);
+            return undefined(ctx);
+        }
+    } else {
+        invalid_argument_type(ctx, ex, "The \"mask\" argument", "of type number", args[0]);
+        return undefined(ctx);
+    }
+    return number(ctx, libc_umask(mask as u32) as f64);
+}
+
+// --- emitWarning ------------------------------------------------------------------------------
+
+fun string_argument(ctx: ptr<u8>, value: ptr<u8>) -> bool {
+    return kind(ctx, value) == VALUE_STRING;
+}
+
+fun is_error_instance(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    if (kind(ctx, value) != VALUE_OBJECT) {
+        return false;
+    }
+    return is_native_error(ctx, value);
+}
+
+fun process_object(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return get(ctx, global(ctx), "process", ex);
+}
+
+fun emit_warning(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var subject: ptr<u8> = undefined(ctx);
+    if (count > 0) {
+        subject = args[0];
+    }
+    var type_value: ptr<u8> = undefined(ctx);
+    var code_value: ptr<u8> = undefined(ctx);
+    var detail_value: ptr<u8> = undefined(ctx);
+    if (count > 1) {
+        if (kind(ctx, args[1]) == VALUE_OBJECT && !callable(ctx, args[1])) {
+            type_value = get(ctx, args[1], "type", ex);
+            code_value = get(ctx, args[1], "code", ex);
+            detail_value = get(ctx, args[1], "detail", ex);
+        } else if (kind(ctx, args[1]) != VALUE_UNDEFINED && !callable(ctx, args[1])) {
+            type_value = args[1];
+        }
+        if (count > 2 && kind(ctx, args[1]) != VALUE_OBJECT) {
+            code_value = args[2];
+        }
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var error_input: bool = is_error_instance(ctx, subject, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (!string_argument(ctx, subject) && !error_input) {
+        invalid_argument_type(ctx, ex, "The \"warning\" argument", "of type string or an instance of Error", subject);
+        return undefined(ctx);
+    }
+    if (kind(ctx, type_value) != VALUE_UNDEFINED && !string_argument(ctx, type_value)) {
+        invalid_argument_type(ctx, ex, "The \"type\" argument", "of type string", type_value);
+        return undefined(ctx);
+    }
+    var warning: ptr<u8> = subject;
+    if (!error_input) {
+        warning = make_error(ctx, ERROR_BASE, subject, ex);
+        if (warning == null || deref ex != null) {
+            return undefined(ctx);
+        }
+        var label: ptr<u8> = type_value;
+        if (kind(ctx, label) == VALUE_UNDEFINED || string_length_of(ctx, label) == 0) {
+            label = text(ctx, "Warning");
+        }
+        define(ctx, warning, "name", label, ex, false);
+        if (string_argument(ctx, code_value)) {
+            define(ctx, warning, "code", code_value, ex, true);
+        }
+        if (string_argument(ctx, detail_value)) {
+            define(ctx, warning, "detail", detail_value, ex, true);
+        }
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var process: ptr<u8> = process_object(ctx, ex);
+    var tick: ptr<u8> = get(ctx, process, "nextTick", ex);
+    if (deref ex != null || !callable(ctx, tick)) {
+        return undefined(ctx);
+    }
+    var key: ptr<u8> = utf8("deliverWarning");
+    var deliver: ptr<u8> = function(ctx, key, callback());
+    release(key);
+    var pair: array<ptr<u8>, 2> = [deliver, warning];
+    call(ctx, tick, process, 2, &pair[0], ex);
+    return undefined(ctx);
+}
+
+fun warnings_silenced() -> bool {
+    var value: array<u8, 64>;
+    value[0] = 0;
+    if (env_get("NODE_NO_WARNINGS", &value[0], ENV_CAPACITY) < 0) {
+        return false;
+    }
+    return value[0] == 49 && value[1] == 0;
+}
+
+fun write_engine(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var js: ptr<u8> = to_string(ctx, value, ex);
+    if (js == null) {
+        return;
+    }
+    var capacity: i64 = utf8_capacity(js);
+    if (capacity > 0 && capacity <= WARNING_LIMIT) {
+        var bytes: array<u8, 65536>;
+        var written: i64 = copy_utf8(js, &bytes[0], capacity);
+        if (written > 1) {
+            bytes[written - 1] = 0;
+            write_text(STDERR_FD, &bytes[0] as str);
+        }
+    }
+    release(js);
+}
+
+fun print_warning(ctx: ptr<u8>, warning: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var sink: Builder;
+    deref sink.data = null;
+    deref sink.length = 0;
+    deref sink.capacity = 0;
+    var name: ptr<u8> = get(ctx, warning, "name", ex);
+    var message: ptr<u8> = get(ctx, warning, "message", ex);
+    var code: ptr<u8> = get(ctx, warning, "code", ex);
+    var detail: ptr<u8> = get(ctx, warning, "detail", ex);
+    if (deref ex != null) {
+        return;
+    }
+    var ok: bool = builder_ascii(&sink, "(node:") && builder_number(&sink, proc_getpid() as i64) &&
+        builder_ascii(&sink, ") ");
+    if (ok && string_argument(ctx, code)) {
+        ok = builder_ascii(&sink, "[") && append_engine(ctx, &sink, code, ex) && builder_ascii(&sink, "] ");
+    }
+    ok = ok && append_engine(ctx, &sink, name, ex) && builder_ascii(&sink, ": ") && append_engine(ctx, &sink, message, ex);
+    if (ok && string_argument(ctx, detail)) {
+        ok = builder_ascii(&sink, "\n") && append_engine(ctx, &sink, detail, ex);
+    }
+    ok = ok && builder_ascii(&sink, "\n");
+    if (ok) {
+        write_engine(ctx, builder_finish(ctx, &sink), ex);
+    }
+    builder_free(&sink);
+}
+
+fun append_engine(ctx: ptr<u8>, sink: ptr<Builder>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var js: ptr<u8> = to_string(ctx, value, ex);
+    if (js == null) {
+        return false;
+    }
+    var ok: bool = builder_units(sink, string_characters(js), 0, string_length(js));
+    release(js);
+    return ok;
+}
+
+// Runs from process.nextTick: default stderr report first, then the 'warning' listeners.
+fun deliver_warning(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (count == 0) {
+        return undefined(ctx);
+    }
+    if (!warnings_silenced()) {
+        print_warning(ctx, args[0], ex);
+    }
+    var process: ptr<u8> = process_object(ctx, ex);
+    if (deref ex == null) {
+        emit_named(ctx, process, "warning", 1, args, ex);
+    }
+    return undefined(ctx);
+}
+
+export(c) fun jsrt_process_warning_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var label: ptr<u8> = get(ctx, fn, "name", ex);
+    var name_bytes: array<u8, 64>;
+    if (deref ex != null || kind(ctx, label) != VALUE_STRING) {
+        return undefined(ctx);
+    }
+    var length: i64 = encode_bytes(ctx, label, 0, &name_bytes[0], NAME_CAPACITY - 1, ex);
+    if (length <= 0 || deref ex != null) {
+        return undefined(ctx);
+    }
+    // "umask" starts with 'u', "emitWarning" with 'e', "deliverWarning" with 'd'.
+    if (name_bytes[0] == 117) {
+        return process_umask(ctx, count, args, ex);
+    }
+    if (name_bytes[0] == 100) {
+        return deliver_warning(ctx, count, args, ex);
+    }
+    return emit_warning(ctx, count, args, ex);
+}
+
+pub fun install_process_warning(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var process: ptr<u8> = process_object(ctx, ex);
+    if (deref ex != null || kind(ctx, process) != VALUE_OBJECT) {
+        return false;
+    }
+    var names: array<str, 2> = ["umask", "emitWarning"];
+    for (var i: i64 = 0; i < 2; i++) {
+        var key: ptr<u8> = utf8(names[i]);
+        var created: ptr<u8> = function(ctx, key, callback());
+        release(key);
+        define(ctx, process, names[i], created, ex, true);
+    }
+    return deref ex == null;
+}

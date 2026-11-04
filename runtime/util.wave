@@ -43,6 +43,7 @@ import("./byte_codec")::{encode_bytes};
 import("./brands")::{is_map, is_set, is_weak_map, is_weak_set, is_regexp, is_promise, is_native_error, is_number_object,
     is_string_object, is_boolean_object, is_bigint_object, is_symbol_object};
 import("./config")::{ARGUMENT_LIMIT};
+import("./util_text")::{install_util_text};
 import("./format")::{format_to_value, inspect_to_value};
 import("./inspect_engine")::{set_inspect_function, inspect_intrinsic, INSPECT_CUSTOM};
 extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
@@ -481,6 +482,7 @@ pub fun install_util(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
         release(check_name);
     }
     define(ctx, (deref host_state.exports), "types", types, ex, false);
+    install_util_text(ctx, deref host_state.exports, ex);
     unprotect(ctx, types);
     return deref ex == null;
 }

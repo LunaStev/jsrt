@@ -576,6 +576,14 @@ JSCallback jsrt_util_type_callback(void) {
     return jsrt_util_type_check;
 }
 extern JSValue jsrt_extras_api(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+extern JSValue jsrt_util_text_api(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+JSCallback jsrt_util_text_callback(void) {
+    return jsrt_util_text_api;
+}
+extern JSValue jsrt_process_warning_api(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+JSCallback jsrt_process_warning_callback(void) {
+    return jsrt_process_warning_api;
+}
 JSCallback jsrt_extras_callback(void) {
     return jsrt_extras_api;
 }
@@ -589,6 +597,10 @@ JSCallback jsrt_timers_promises_callback(void) {
     return jsrt_timers_promises_api;
 }
 extern JSValue jsrt_assert_api(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+extern void *jsrt_assert_construct(const void *, void *, size_t, const JSValue *, JSValue *);
+void *jsrt_assert_ctor_callback(void) {
+    return (void *)jsrt_assert_construct;
+}
 JSCallback jsrt_assert_callback(void) {
     return jsrt_assert_api;
 }

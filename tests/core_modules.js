@@ -982,7 +982,125 @@ process.on('exit', code => {
         process.exitCode = 1;
     }
 });
+function utilTextCases() {
+    const util = require('util');
+    const red = '\u001b[31mx\u001b[39m';
+    equal(util.styleText('red', 'x', { validateStream: false }), red, 'styleText wraps in the color codes');
+    equal(util.styleText(['bold', 'red'], 'x', { validateStream: false }), '\u001b[1m\u001b[31mx\u001b[39m\u001b[22m',
+        'styleText nests an array of formats');
+    equal(util.styleText('red', 'a\u001b[39mb', { validateStream: false }), '\u001b[31ma\u001b[31mb\u001b[39m',
+        'styleText reopens the style after a nested close code');
+    equal(util.styleText('bold', 'a\u001b[22mb', { validateStream: false }), '\u001b[1ma\u001b[22m\u001b[1mb\u001b[22m',
+        'styleText keeps the shared bold/dim close code');
+    equal(util.styleText('none', 'x', { validateStream: false }), 'x', 'styleText accepts none');
+    equal(util.styleText('bgBlueBright', 'x', { validateStream: false }), '\u001b[104mx\u001b[49m', 'bright background');
+    throws(() => util.styleText('nope', 'x', { validateStream: false }),
+        error => error instanceof TypeError && error.code === 'ERR_INVALID_ARG_VALUE' &&
+            error.message.endsWith(". Received 'nope'"), 'styleText rejects an unknown format');
+    throws(() => util.styleText('red', 5, { validateStream: false }),
+        error => error instanceof TypeError && error.code === 'ERR_INVALID_ARG_TYPE' &&
+            error.message === 'The "text" argument must be of type string. Received type number (5)',
+        'styleText requires a string');
+    throws(() => util.styleText('red', 'x', { validateStream: 5 }), error => error.code === 'ERR_INVALID_ARG_TYPE',
+        'validateStream must be boolean');
+    equal(util.stripVTControlCharacters('\u001b[31mred\u001b[39m \u001b]8;;http://a\u0007link\u001b]8;;\u0007 \u009b1m x'),
+        'red link  x', 'strip removes CSI, OSC and 8-bit CSI sequences');
+    equal(util.stripVTControlCharacters('\u001b[12345x\u001b[1;2;3m\u001b[\u001b'), 'x\u001b[\u001b',
+        'strip keeps incomplete sequences');
+    throws(() => util.stripVTControlCharacters(5),
+        error => error instanceof TypeError && error.code === 'ERR_INVALID_ARG_TYPE' &&
+            error.message === 'The "str" argument must be of type string. Received type number (5)',
+        'strip requires a string');
+}
+function processUmaskCases() {
+    const original = process.umask();
+    equal(typeof original, 'number', 'umask() reads the mask');
+    equal(process.umask(0o22), original, 'umask(mask) returns the previous mask');
+    equal(process.umask(), 0o22, 'umask() reports the new mask');
+    equal(process.umask('077'), 0o22, 'umask accepts an octal string');
+    equal(process.umask(), 0o77, 'octal string applied');
+    throws(() => process.umask('abc'), error => error instanceof TypeError && error.code === 'ERR_INVALID_ARG_VALUE' &&
+        error.message === "The argument 'mask' must be a 32-bit unsigned integer or an octal string. Received 'abc'",
+        'umask rejects a non-octal string');
+    throws(() => process.umask(-1), error => error instanceof RangeError && error.code === 'ERR_OUT_OF_RANGE' &&
+        error.message === 'The value of "mask" is out of range. It must be >= 0 && <= 4294967295. Received -1',
+        'umask range');
+    throws(() => process.umask(1.5), error => error.code === 'ERR_OUT_OF_RANGE' && error.message.endsWith('an integer. Received 1.5'),
+        'umask integer');
+    throws(() => process.umask({}), error => error.code === 'ERR_INVALID_ARG_TYPE', 'umask type');
+    process.umask(original);
+}
+async function emitWarningCases() {
+    const seen = [];
+    process.on('warning', warning => seen.push([warning.name, warning.message, warning.code, warning.detail]));
+    process.emitWarning('hello');
+    process.emitWarning('hello2', 'CustomWarning', 'C001');
+    process.emitWarning('hello3', { type: 'T', code: 'X', detail: 'd' });
+    process.emitWarning(new Error('boom'));
+    equal(seen.length, 0, 'warnings are delivered on the next tick');
+    await new Promise(resolve => setTimeout(resolve, 20));
+    equal(JSON.stringify(seen), JSON.stringify([['Warning', 'hello', null, null], ['CustomWarning', 'hello2', 'C001', null],
+        ['T', 'hello3', 'X', 'd'], ['Error', 'boom', null, null]]),
+        'warning events carry name, message, code and detail');
+    throws(() => process.emitWarning(5), error => error.code === 'ERR_INVALID_ARG_TYPE', 'emitWarning argument type');
+    throws(() => process.emitWarning('a', 5), error => error.code === 'ERR_INVALID_ARG_TYPE', 'emitWarning type argument');
+}
+async function assertExtraCases() {
+    const assert = require('assert');
+    const failure = new assert.AssertionError({ actual: 1, expected: 2, operator: 'strictEqual' });
+    equal(failure.message, 'Expected values to be strictly equal:\n\n1 !== 2\n', 'AssertionError generates a message');
+    equal(failure.code, 'ERR_ASSERTION', 'AssertionError code');
+    equal(failure.generatedMessage, true, 'generated message flag');
+    equal(new assert.AssertionError({ message: 'x' }).generatedMessage, false, 'explicit message flag');
+    equal(failure instanceof assert.AssertionError && failure instanceof Error, true, 'AssertionError inherits Error');
+    throws(() => new assert.AssertionError(5), error => error.code === 'ERR_INVALID_ARG_TYPE', 'AssertionError options type');
+    let thrown = null;
+    try { assert.strictEqual(1, 2); } catch (error) { thrown = error; }
+    equal(thrown instanceof assert.AssertionError, true, 'failed assertions throw AssertionError instances');
+    equal(thrown.message, 'Expected values to be strictly equal:\n\n1 !== 2\n', 'strictEqual default message');
+    assert.match('abc', /b/);
+    assert.doesNotMatch('abc', /x/);
+    throws(() => assert.match('abc', /x/), error => error instanceof assert.AssertionError && error.operator === 'match' &&
+        error.message === "The input did not match the regular expression /x/. Input:\n\n'abc'\n", 'match failure message');
+    throws(() => assert.match('abc', /x/, 'custom'), error => error.message === 'custom' && error.generatedMessage === false,
+        'match custom message');
+    throws(() => assert.match(5, /x/), error => error instanceof assert.AssertionError &&
+        error.message === 'The "string" argument must be of type string. Received type number (5)', 'match input type');
+    throws(() => assert.match('abc', 'x'), error => error instanceof TypeError && error.code === 'ERR_INVALID_ARG_TYPE',
+        'match regexp type');
+    throws(() => assert.doesNotMatch('abc', /b/), error => error.operator === 'doesNotMatch' && error.message ===
+        "The input was expected to not match the regular expression /b/. Input:\n\n'abc'\n", 'doesNotMatch failure');
+    await assert.rejects(Promise.reject(new TypeError('t')));
+    await assert.rejects(() => Promise.reject(new TypeError('t')), TypeError);
+    await assert.rejects(() => Promise.reject(new TypeError('t')), /t/);
+    await rejects(assert.rejects(Promise.resolve(1)), error => error.message === 'Missing expected rejection.' &&
+        error instanceof assert.AssertionError, 'rejects requires a rejection');
+    await rejects(assert.rejects(() => Promise.resolve(1), Error, 'mm'),
+        error => error.message === 'Missing expected rejection (Error): mm', 'rejects composed message');
+    await rejects(assert.rejects(() => Promise.reject(new TypeError('t')), RangeError),
+        error => error.message.startsWith('The error is expected to be an instance of "RangeError". Received "TypeError"'),
+        'rejects instance mismatch');
+    await rejects(assert.rejects(5), error => error.code === 'ERR_INVALID_ARG_TYPE', 'rejects argument type');
+    await rejects(assert.rejects(() => 5), error => error.code === 'ERR_INVALID_RETURN_VALUE', 'rejects return value');
+    await assert.doesNotReject(Promise.resolve(1));
+    await rejects(assert.doesNotReject(Promise.reject(new Error('boom'))),
+        error => error instanceof assert.AssertionError && error.message === 'Got unwanted rejection.\nActual message: "boom"',
+        'doesNotReject reports a rejection');
+    await rejects(assert.doesNotReject(() => Promise.reject(new Error('boom')), /x/), error => error.message === 'boom',
+        'doesNotReject lets unrelated rejections through');
+    // The brand probe behind util.types.isPromise must not raise a phantom unhandled rejection.
+    let late;
+    const pending = new Promise((resolve, reject) => { late = reject; });
+    require('util').types.isPromise(pending);
+    pending.catch(() => {});
+    late(new Error('late'));
+    await new Promise(resolve => setTimeout(resolve, 5));
+}
 async function main() {
+    utilTextCases();
+    processUmaskCases();
+    await emitWarningCases();
+    await assertExtraCases();
     querystringCases();
     chdirCases();
     deepCases();
