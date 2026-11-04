@@ -22,6 +22,7 @@ import("./url_core")::{usv, parse_url, url_part, change_url};
 import("./url_params")::{install_params, shutdown_params, params_constructor, new_params, params_state,
     parse_pairs};
 import("./byte_codec")::{encode_utf8, decode_bytes};
+import("./url_file")::{install_url_file};
 extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
 extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
 extern(c, "wr_equal") fun equal(ctx: ptr<u8>, a: ptr<u8>, b: ptr<u8>) -> bool;
@@ -378,6 +379,7 @@ pub fun install_url(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     define(ctx, global(ctx), "URL", (deref host_state.ctor), ex, false);
     define(ctx, (deref host_state.exports), "URL", (deref host_state.ctor), ex, true);
     define(ctx, (deref host_state.exports), "URLSearchParams", params_constructor(), ex, true);
+    install_url_file(ctx, deref host_state.exports, deref host_state.ctor, ex);
     return deref ex == null;
 }
 

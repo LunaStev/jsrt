@@ -1,0 +1,355 @@
+// url.fileURLToPath and url.pathToFileURL. Both functions are stateless: one native callback
+// serves them and the function object's name selects the operation. Path and URL conversion
+// works on UTF-8 bytes; the URL object itself is created and read through the public URL
+// constructor and accessors, so file URL parsing rules stay in url_core.wave.
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::env::cwd")::{env_getcwd};
+import("./values")::{get, define, fail_coded};
+import("./byte_codec")::{encode_utf8, encode_bytes, decode_bytes};
+import("./util_text")::{invalid_argument_type};
+
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_construct") fun construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "jsrt_url_file_callback") fun callback() -> ptr<u8>;
+
+const VALUE_STRING: i32 = 4;
+const VALUE_OBJECT: i32 = 5;
+const ERROR_TYPE: i32 = 1;
+const ERROR_RANGE: i32 = 2;
+const PATH_BYTES: i64 = 8192;
+const NAME_CAPACITY: i64 = 64;
+const UTF8_CODE: i32 = 0;
+const SLASH: u8 = 47;
+const PERCENT: u8 = 37;
+const DOT: u8 = 46;
+
+// The URL constructor handed to install_url_file; kept per context by the exports object, so the
+// callbacks find it through the function's own "URL" slot rather than a global.
+const URL_PROPERTY: str = "jsrtUrlConstructor";
+
+fun hex_value(unit: u8) -> i64 {
+    if (unit >= 48 && unit <= 57) {
+        return (unit - 48) as i64;
+    }
+    if (unit >= 65 && unit <= 70) {
+        return (unit - 55) as i64;
+    }
+    if (unit >= 97 && unit <= 102) {
+        return (unit - 87) as i64;
+    }
+    return -1;
+}
+
+// Characters Node leaves alone when turning a path into a file URL: the URL path code points
+// that never need escaping. Everything else, including non-ASCII bytes, becomes %XX.
+fun keeps_character(octet: u8) -> bool {
+    if ((octet >= 48 && octet <= 57) || (octet >= 65 && octet <= 90) || (octet >= 97 && octet <= 122)) {
+        return true;
+    }
+    var allowed: str = "-._!$&'()*+,;=:@/";
+    var bytes: ptr<u8> = allowed as ptr<u8>;
+    var i: i64 = 0;
+    while (bytes[i] != 0) {
+        if (bytes[i] == octet) {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fun url_constructor(ctx: ptr<u8>, fn: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return get(ctx, fn, URL_PROPERTY, ex);
+}
+
+fun file_url_to_path(ctx: ptr<u8>, fn: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var subject: ptr<u8> = undefined(ctx);
+    if (count > 0) {
+        subject = args[0];
+    }
+    var address: ptr<u8> = subject;
+    if (kind(ctx, subject) == VALUE_STRING) {
+        var ctor: ptr<u8> = url_constructor(ctx, fn, ex);
+        if (deref ex != null) {
+            return undefined(ctx);
+        }
+        var source: array<ptr<u8>, 1> = [subject];
+        address = construct(ctx, ctor, 1, &source[0], ex);
+        if (deref ex != null || address == null) {
+            return undefined(ctx);
+        }
+    } else if (kind(ctx, subject) != VALUE_OBJECT) {
+        invalid_argument_type(ctx, ex, "The \"path\" argument", "of type string or an instance of URL", subject);
+        return undefined(ctx);
+    }
+    protect(ctx, address);
+    var result: ptr<u8> = convert_address(ctx, address, ex);
+    unprotect(ctx, address);
+    return result;
+}
+
+fun same_literal(ctx: ptr<u8>, value: ptr<u8>, expected: str) -> bool {
+    if (kind(ctx, value) != VALUE_STRING) {
+        return false;
+    }
+    var bytes: array<u8, 64>;
+    var ignored: ptr<u8> = null;
+    var length: i64 = encode_bytes(ctx, value, 0, &bytes[0], NAME_CAPACITY - 1, &ignored);
+    if (length < 0) {
+        return false;
+    }
+    bytes[length] = 0;
+    var wanted: ptr<u8> = expected as ptr<u8>;
+    var i: i64 = 0;
+    while (wanted[i] != 0 && i < length) {
+        if (wanted[i] != bytes[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return wanted[i] == 0 && i == length;
+}
+
+fun convert_address(ctx: ptr<u8>, address: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var protocol: ptr<u8> = get(ctx, address, "protocol", ex);
+    var host: ptr<u8> = get(ctx, address, "hostname", ex);
+    var pathname: ptr<u8> = get(ctx, address, "pathname", ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (!same_literal(ctx, protocol, "file:")) {
+        fail_coded(ctx, ex, ERROR_TYPE, "ERR_INVALID_URL_SCHEME", "The URL must be of scheme file");
+        return undefined(ctx);
+    }
+    if (kind(ctx, host) == VALUE_STRING && !same_literal(ctx, host, "") && !same_literal(ctx, host, "localhost")) {
+        fail_coded(ctx, ex, ERROR_TYPE, "ERR_INVALID_FILE_URL_HOST", "File URL host must be \"localhost\" or empty on linux");
+        return undefined(ctx);
+    }
+    var encoded: ptr<u8> = mem_alloc(PATH_BYTES);
+    var decoded: ptr<u8> = mem_alloc(PATH_BYTES);
+    if (encoded == null || decoded == null) {
+        if (encoded != null) {
+            mem_free(encoded, PATH_BYTES);
+        }
+        if (decoded != null) {
+            mem_free(decoded, PATH_BYTES);
+        }
+        fail_coded(ctx, ex, ERROR_RANGE, "ERR_STRING_TOO_LONG", "cannot allocate path buffers");
+        return undefined(ctx);
+    }
+    var result: ptr<u8> = undefined(ctx);
+    var length: i64 = encode_utf8(ctx, pathname, encoded, PATH_BYTES - 1, false, ex);
+    if (deref ex == null && length >= 0) {
+        var used: i64 = 0;
+        var forbidden: bool = false;
+        var at: i64 = 0;
+        while (at < length) {
+            var octet: u8 = encoded[at];
+            if (octet == PERCENT && at + 2 < length + 0 && hex_value(encoded[at + 1]) >= 0 && hex_value(encoded[at + 2]) >= 0) {
+                var value: i64 = hex_value(encoded[at + 1]) * 16 + hex_value(encoded[at + 2]);
+                if (value == SLASH as i64) {
+                    forbidden = true;
+                }
+                decoded[used] = value as u8;
+                used += 1;
+                at += 3;
+                continue;
+            }
+            decoded[used] = octet;
+            used += 1;
+            at += 1;
+        }
+        if (forbidden) {
+            fail_coded(ctx, ex, ERROR_TYPE, "ERR_INVALID_FILE_URL_PATH", "File URL path must not include encoded / characters");
+        } else {
+            result = decode_bytes(ctx, decoded, used, UTF8_CODE, ex);
+        }
+    }
+    mem_free(decoded, PATH_BYTES);
+    mem_free(encoded, PATH_BYTES);
+    return result;
+}
+
+// Resolves `path` against the working directory into `output` (always absolute, no "." or ".."
+// segments, no trailing slash except for the root). Returns the octet count, or -1 when it does not fit.
+fun resolve_path(path: ptr<u8>, length: i64, output: ptr<u8>, capacity: i64) -> i64 {
+    var combined: ptr<u8> = mem_alloc(PATH_BYTES * 2);
+    if (combined == null) {
+        return -1;
+    }
+    var total: i64 = 0;
+    if (length == 0 || path[0] != SLASH) {
+        if (env_getcwd(combined, PATH_BYTES) < 0) {
+            mem_free(combined, PATH_BYTES * 2);
+            return -1;
+        }
+        while (combined[total] != 0) {
+            total += 1;
+        }
+        combined[total] = SLASH;
+        total += 1;
+    }
+    if (total + length >= PATH_BYTES * 2) {
+        mem_free(combined, PATH_BYTES * 2);
+        return -1;
+    }
+    for (var i: i64 = 0; i < length; i++) {
+        combined[total + i] = path[i];
+    }
+    total += length;
+    var used: i64 = 0;
+    var at: i64 = 0;
+    while (at < total) {
+        while (at < total && combined[at] == SLASH) {
+            at += 1;
+        }
+        var start: i64 = at;
+        while (at < total && combined[at] != SLASH) {
+            at += 1;
+        }
+        var width: i64 = at - start;
+        if (width == 0 || (width == 1 && combined[start] == DOT)) {
+            continue;
+        }
+        if (width == 2 && combined[start] == DOT && combined[start + 1] == DOT) {
+            while (used > 0 && output[used - 1] != SLASH) {
+                used -= 1;
+            }
+            if (used > 0) {
+                used -= 1;
+            }
+            continue;
+        }
+        if (used + 1 + width >= capacity) {
+            mem_free(combined, PATH_BYTES * 2);
+            return -1;
+        }
+        output[used] = SLASH;
+        used += 1;
+        for (var i: i64 = 0; i < width; i++) {
+            output[used + i] = combined[start + i];
+        }
+        used += width;
+    }
+    if (used == 0) {
+        output[0] = SLASH;
+        used = 1;
+    }
+    mem_free(combined, PATH_BYTES * 2);
+    return used;
+}
+
+fun path_to_file_url(ctx: ptr<u8>, fn: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var subject: ptr<u8> = undefined(ctx);
+    if (count > 0) {
+        subject = args[0];
+    }
+    if (kind(ctx, subject) != VALUE_STRING) {
+        invalid_argument_type(ctx, ex, "The \"path\" argument", "of type string", subject);
+        return undefined(ctx);
+    }
+    var ctor: ptr<u8> = url_constructor(ctx, fn, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var raw: ptr<u8> = mem_alloc(PATH_BYTES);
+    var resolved: ptr<u8> = mem_alloc(PATH_BYTES);
+    var escaped: ptr<u8> = mem_alloc(PATH_BYTES * 3 + 16);
+    var result: ptr<u8> = undefined(ctx);
+    if (raw == null || resolved == null || escaped == null) {
+        fail_coded(ctx, ex, ERROR_RANGE, "ERR_STRING_TOO_LONG", "cannot allocate path buffers");
+    } else {
+        var length: i64 = encode_utf8(ctx, subject, raw, PATH_BYTES - 1, false, ex);
+        if (deref ex == null && length >= 0) {
+            var used: i64 = resolve_path(raw, length, resolved, PATH_BYTES - 1);
+            if (used < 0) {
+                fail_coded(ctx, ex, ERROR_RANGE, "ERR_STRING_TOO_LONG", "path is too long");
+            } else {
+                // A trailing slash in the subject survives resolution, as in Node.
+                if (length > 0 && raw[length - 1] == SLASH && resolved[used - 1] != SLASH) {
+                    resolved[used] = SLASH;
+                    used += 1;
+                }
+                result = escape_into_url(ctx, ctor, resolved, used, escaped, ex);
+            }
+        }
+    }
+    if (escaped != null) {
+        mem_free(escaped, PATH_BYTES * 3 + 16);
+    }
+    if (resolved != null) {
+        mem_free(resolved, PATH_BYTES);
+    }
+    if (raw != null) {
+        mem_free(raw, PATH_BYTES);
+    }
+    return result;
+}
+
+fun escape_into_url(ctx: ptr<u8>, ctor: ptr<u8>, path: ptr<u8>, length: i64, output: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var prefix: str = "file://";
+    var head: ptr<u8> = prefix as ptr<u8>;
+    var used: i64 = 0;
+    while (head[used] != 0) {
+        output[used] = head[used];
+        used += 1;
+    }
+    var digits: str = "0123456789ABCDEF";
+    var table: ptr<u8> = digits as ptr<u8>;
+    for (var i: i64 = 0; i < length; i++) {
+        var octet: u8 = path[i];
+        if (keeps_character(octet)) {
+            output[used] = octet;
+            used += 1;
+        } else {
+            output[used] = PERCENT;
+            output[used + 1] = table[(octet >> 4) as i64];
+            output[used + 2] = table[(octet & 15) as i64];
+            used += 3;
+        }
+    }
+    var href: ptr<u8> = decode_bytes(ctx, output, used, UTF8_CODE, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var source: array<ptr<u8>, 1> = [href];
+    return construct(ctx, ctor, 1, &source[0], ex);
+}
+
+export(c) fun jsrt_url_file_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var label: ptr<u8> = get(ctx, fn, "name", ex);
+    var name_bytes: array<u8, 64>;
+    if (deref ex != null || kind(ctx, label) != VALUE_STRING) {
+        return undefined(ctx);
+    }
+    var length: i64 = encode_bytes(ctx, label, 0, &name_bytes[0], NAME_CAPACITY - 1, ex);
+    if (length <= 0 || deref ex != null) {
+        return undefined(ctx);
+    }
+    // "fileURLToPath" starts with 'f', "pathToFileURL" with 'p'.
+    if (name_bytes[0] == 102) {
+        return file_url_to_path(ctx, fn, count, args, ex);
+    }
+    return path_to_file_url(ctx, fn, count, args, ex);
+}
+
+pub fun install_url_file(ctx: ptr<u8>, exports: ptr<u8>, ctor: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var names: array<str, 2> = ["fileURLToPath", "pathToFileURL"];
+    for (var i: i64 = 0; i < 2; i++) {
+        var key: ptr<u8> = utf8(names[i]);
+        var created: ptr<u8> = function(ctx, key, callback());
+        release(key);
+        // Hidden link to the URL constructor so the stateless callback needs no context slot.
+        define(ctx, created, URL_PROPERTY, ctor, ex, false);
+        define(ctx, exports, names[i], created, ex, true);
+    }
+    return deref ex == null;
+}

@@ -584,6 +584,14 @@ extern JSValue jsrt_process_warning_api(const void *, void *, void *, size_t, co
 JSCallback jsrt_process_warning_callback(void) {
     return jsrt_process_warning_api;
 }
+extern JSValue jsrt_url_file_api(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+JSCallback jsrt_url_file_callback(void) {
+    return jsrt_url_file_api;
+}
+extern JSValue jsrt_util_args_api(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+JSCallback jsrt_util_args_callback(void) {
+    return jsrt_util_args_api;
+}
 JSCallback jsrt_extras_callback(void) {
     return jsrt_extras_api;
 }

@@ -982,6 +982,61 @@ process.on('exit', code => {
         process.exitCode = 1;
     }
 });
+function parseArgsCases() {
+    const { parseArgs } = require('util');
+    const run = config => JSON.stringify(parseArgs(config), (key, value) => value === undefined ? '__undefined' : value);
+    const code = (config, expected, message) => throws(() => parseArgs(config),
+        error => error instanceof TypeError && error.code === expected, message);
+    equal(run({ args: ['-f', '--bar', 'b'], options: { foo: { type: 'boolean', short: 'f' }, bar: { type: 'string' } } }),
+        '{"values":{"foo":true,"bar":"b"},"positionals":[]}', 'short and long options');
+    equal(run({ args: ['--foo=1', 'pos', '--', '--x'], options: { foo: { type: 'string' } }, allowPositionals: true }),
+        '{"values":{"foo":"1"},"positionals":["pos","--x"]}', 'inline value, positionals and terminator');
+    equal(run({ args: ['--foo', '--foo'], options: { foo: { type: 'boolean', multiple: true } } }),
+        '{"values":{"foo":[true,true]},"positionals":[]}', 'multiple collects values');
+    equal(run({ args: ['--unknown'], options: {}, strict: false }), '{"values":{"unknown":true},"positionals":[]}',
+        'non-strict keeps unknown options');
+    equal(run({ args: [], options: { foo: { type: 'string', default: 'd' }, b: { type: 'boolean', default: true } } }),
+        '{"values":{"foo":"d","b":true},"positionals":[]}', 'defaults');
+    equal(run({ args: ['--no-color'], options: { color: { type: 'boolean' } }, allowNegative: true }),
+        '{"values":{"color":false},"positionals":[]}', 'allowNegative');
+    equal(run({ args: ['-bzval'], options: { b: { type: 'boolean', short: 'b' }, z: { type: 'string', short: 'z' } } }),
+        '{"values":{"b":true,"z":"val"},"positionals":[]}', 'short option group with a value');
+    equal(run({ args: ['--foo', 'x'], options: { foo: { type: 'string' } }, tokens: true }),
+        '{"values":{"foo":"x"},"positionals":[],"tokens":[{"kind":"option","name":"foo","rawName":"--foo","index":0,' +
+        '"value":"x","inlineValue":false}]}', 'tokens');
+    code({ args: ['--unknown'], options: {} }, 'ERR_PARSE_ARGS_UNKNOWN_OPTION', 'unknown option');
+    code({ args: ['pos'], options: {} }, 'ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL', 'unexpected positional');
+    code({ args: ['--foo'], options: { foo: { type: 'string' } } }, 'ERR_PARSE_ARGS_INVALID_OPTION_VALUE', 'missing value');
+    code({ args: ['--foo=x'], options: { foo: { type: 'boolean' } } }, 'ERR_PARSE_ARGS_INVALID_OPTION_VALUE', 'extra value');
+    code({ args: ['--foo', '-1'], options: { foo: { type: 'string' } } }, 'ERR_PARSE_ARGS_INVALID_OPTION_VALUE',
+        'ambiguous option-like value');
+    code({ options: { foo: { type: 'bogus' } } }, 'ERR_INVALID_ARG_TYPE', 'option type validation');
+    code({ args: 'x' }, 'ERR_INVALID_ARG_TYPE', 'args must be an array');
+    const result = parseArgs({ args: ['--a'], options: { a: { type: 'boolean' } } });
+    equal(Object.getPrototypeOf(result.values), null, 'values has a null prototype');
+}
+function urlFileCases() {
+    const url = require('url');
+    equal(url.fileURLToPath('file:///tmp/a%20b/c.txt'), '/tmp/a b/c.txt', 'fileURLToPath decodes escapes');
+    equal(url.fileURLToPath(new URL('file:///tmp/x')), '/tmp/x', 'fileURLToPath accepts URL objects');
+    equal(url.fileURLToPath('file:///tmp/%E2%82%AC'), '/tmp/€', 'fileURLToPath decodes UTF-8');
+    equal(url.fileURLToPath('file:///tmp/dir/'), '/tmp/dir/', 'trailing slash kept');
+    throws(() => url.fileURLToPath('http://a/b'), error => error instanceof TypeError &&
+        error.code === 'ERR_INVALID_URL_SCHEME' && error.message === 'The URL must be of scheme file', 'scheme check');
+    throws(() => url.fileURLToPath('file:///a%2Fb'), error => error.code === 'ERR_INVALID_FILE_URL_PATH',
+        'encoded slash is rejected');
+    throws(() => url.fileURLToPath('/not/url'), error => error.code === 'ERR_INVALID_URL', 'relative input is not a URL');
+    throws(() => url.fileURLToPath(5), error => error.code === 'ERR_INVALID_ARG_TYPE', 'argument type');
+    equal(url.pathToFileURL('/tmp/a b/c#d?e%f.txt').href, 'file:///tmp/a%20b/c%23d%3Fe%25f.txt', 'pathToFileURL escapes');
+    equal(url.pathToFileURL('/tmp/dir/').href, 'file:///tmp/dir/', 'pathToFileURL keeps a trailing slash');
+    equal(url.pathToFileURL('/a/../b/./c').href, 'file:///b/c', 'pathToFileURL normalizes');
+    equal(url.pathToFileURL('/tmp//x').href, 'file:///tmp/x', 'pathToFileURL collapses slashes');
+    equal(url.pathToFileURL('/').href, 'file:///', 'pathToFileURL root');
+    equal(url.pathToFileURL('rel/x').href, 'file://' + process.cwd() + '/rel/x', 'pathToFileURL resolves against cwd');
+    equal(url.pathToFileURL('/tmp/€ü\n\t\\x[1]{y}"\'`^|~!$&()*+,;=:@').href,
+        'file:///tmp/%E2%82%AC%C3%BC%0A%09%5Cx%5B1%5D%7By%7D%22\'%60%5E%7C%7E!$&()*+,;=:@', 'pathToFileURL special bytes');
+    throws(() => url.pathToFileURL(5), error => error.code === 'ERR_INVALID_ARG_TYPE', 'pathToFileURL type');
+}
 function utilTextCases() {
     const util = require('util');
     const red = '\u001b[31mx\u001b[39m';
@@ -1097,6 +1152,8 @@ async function assertExtraCases() {
     await new Promise(resolve => setTimeout(resolve, 5));
 }
 async function main() {
+    parseArgsCases();
+    urlFileCases();
     utilTextCases();
     processUmaskCases();
     await emitWarningCases();

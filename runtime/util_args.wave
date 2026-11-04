@@ -1,0 +1,831 @@
+// util.parseArgs. The parser keeps Node's two phases: tokenization of the argument list into
+// option, positional and option-terminator tokens, then validation and storage into the result.
+// Arguments are examined as UTF-8 bytes; names and values handed back to JavaScript are decoded
+// from byte slices, so they round-trip the original strings.
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./values")::{get, put, define, plain, fail_coded, fail_dynamic};
+import("./byte_codec")::{encode_utf8, encode_bytes, decode_bytes};
+import("./collections")::{length, at, append};
+import("./util_text")::{Builder, builder_ascii, builder_finish, builder_free, builder_engine_text, received_suffix,
+    invalid_argument_type};
+
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_is_array") fun is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, values: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "jsrt_util_args_callback") fun callback() -> ptr<u8>;
+
+const VALUE_UNDEFINED: i32 = 0;
+const VALUE_BOOLEAN: i32 = 2;
+const VALUE_STRING: i32 = 4;
+const VALUE_OBJECT: i32 = 5;
+const ERROR_TYPE: i32 = 1;
+const ARG_BYTES: i64 = 8192;
+const PENDING_LIMIT: i64 = 64;
+const TYPE_NONE: i32 = 0;
+const TYPE_BOOLEAN: i32 = 1;
+const TYPE_STRING: i32 = 2;
+const DASH: u8 = 45;
+const EQUALS: u8 = 61;
+// Hidden property on the parseArgs function holding captured Object.hasOwn and Object.keys.
+const INTRINSICS_PROPERTY: str = "jsrtParseArgsIntrinsics";
+
+struct Parser {
+    options: ptr<u8>;
+    has_own: ptr<u8>;
+    keys: ptr<u8>;
+    strict: bool;
+    allow_positionals: bool;
+    allow_negative: bool;
+    want_tokens: bool;
+    values: ptr<u8>;
+    positionals: ptr<u8>;
+    tokens: ptr<u8>;
+    scratch: ptr<u8>;
+    // Arguments produced by expanding a short option group, consumed before the next real argument.
+    pending: array<ptr<u8>, 64>;
+    pending_count: i64;
+    problem: ptr<ptr<u8>>;
+}
+
+fun slice_value(ctx: ptr<u8>, bytes: ptr<u8>, start: i64, end: i64, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return decode_bytes(ctx, bytes + start, end - start, 0, ex);
+}
+
+fun same_bytes(left: ptr<u8>, left_length: i64, text: str) -> bool {
+    var wanted: ptr<u8> = text as ptr<u8>;
+    var i: i64 = 0;
+    while (wanted[i] != 0) {
+        if (i >= left_length || left[i] != wanted[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return i == left_length;
+}
+
+// Own-property lookup on the user's options object, using the captured Object.hasOwn.
+fun own_option(ctx: ptr<u8>, parser: ptr<Parser>, name: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var pair: array<ptr<u8>, 2> = [deref parser.options, name];
+    var present: ptr<u8> = call(ctx, deref parser.has_own, null, 2, &pair[0], ex);
+    if (deref ex != null || present == null || !truth(ctx, present)) {
+        return null;
+    }
+    var key: array<u8, 8192>;
+    var key_length: i64 = encode_bytes(ctx, name, 0, &key[0], ARG_BYTES - 1, ex);
+    if (key_length < 0 || deref ex != null) {
+        return null;
+    }
+    key[key_length] = 0;
+    var record: ptr<u8> = get(ctx, deref parser.options, &key[0] as str, ex);
+    if (deref ex != null || kind(ctx, record) != VALUE_OBJECT) {
+        return null;
+    }
+    return record;
+}
+
+fun option_type(ctx: ptr<u8>, record: ptr<u8>, ex: ptr<ptr<u8>>) -> i32 {
+    if (record == null) {
+        return TYPE_NONE;
+    }
+    var declared: ptr<u8> = get(ctx, record, "type", ex);
+    if (deref ex != null || kind(ctx, declared) != VALUE_STRING) {
+        return TYPE_NONE;
+    }
+    var bytes: array<u8, 16>;
+    var count: i64 = encode_bytes(ctx, declared, 0, &bytes[0], 15, ex);
+    if (count < 0 || deref ex != null) {
+        return TYPE_NONE;
+    }
+    if (same_bytes(&bytes[0], count, "boolean")) {
+        return TYPE_BOOLEAN;
+    }
+    if (same_bytes(&bytes[0], count, "string")) {
+        return TYPE_STRING;
+    }
+    return TYPE_NONE;
+}
+
+// Long option name whose `short` is the given character, or the character itself.
+fun long_for_short(ctx: ptr<u8>, parser: ptr<Parser>, letter: u8, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var argument: array<ptr<u8>, 1> = [deref parser.options];
+    var names: ptr<u8> = call(ctx, deref parser.keys, null, 1, &argument[0], ex);
+    if (deref ex != null || names == null) {
+        return undefined(ctx);
+    }
+    protect(ctx, names);
+    var total: i64 = length(ctx, names, ex);
+    var found: ptr<u8> = null;
+    for (var i: i64 = 0; i < total && found == null && deref ex == null; i++) {
+        var name: ptr<u8> = at(ctx, names, i, ex);
+        var record: ptr<u8> = own_option(ctx, parser, name, ex);
+        if (record != null) {
+            var short: ptr<u8> = get(ctx, record, "short", ex);
+            if (deref ex == null && kind(ctx, short) == VALUE_STRING) {
+                var bytes: array<u8, 8>;
+                var count: i64 = encode_bytes(ctx, short, 0, &bytes[0], 7, ex);
+                if (count == 1 && bytes[0] == letter) {
+                    found = name;
+                }
+            }
+        }
+    }
+    unprotect(ctx, names);
+    if (found != null) {
+        return found;
+    }
+    var single: array<u8, 2> = [letter, 0];
+    return decode_bytes(ctx, &single[0], 1, 0, ex);
+}
+
+fun short_type(ctx: ptr<u8>, parser: ptr<Parser>, letter: u8, ex: ptr<ptr<u8>>) -> i32 {
+    var name: ptr<u8> = long_for_short(ctx, parser, letter, ex);
+    if (deref ex != null) {
+        return TYPE_NONE;
+    }
+    return option_type(ctx, own_option(ctx, parser, name, ex), ex);
+}
+
+fun make_token(ctx: ptr<u8>, token_kind: str, name: ptr<u8>, raw: ptr<u8>, index: i64, value: ptr<u8>,
+    inline_value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var token: ptr<u8> = object(ctx, null, null);
+    protect(ctx, token);
+    put(ctx, token, "kind", text_of(ctx, token_kind, ex), ex);
+    if (name != null) {
+        put(ctx, token, "name", name, ex);
+        put(ctx, token, "rawName", raw, ex);
+    }
+    put(ctx, token, "index", number(ctx, index as f64), ex);
+    if (name != null) {
+        // Option tokens always carry both keys; they are undefined when no value was attached.
+        if (value == null) {
+            put(ctx, token, "value", undefined(ctx), ex);
+        } else {
+            put(ctx, token, "value", value, ex);
+        }
+        if (inline_value == null) {
+            put(ctx, token, "inlineValue", undefined(ctx), ex);
+        } else {
+            put(ctx, token, "inlineValue", inline_value, ex);
+        }
+    } else if (value != null) {
+        put(ctx, token, "value", value, ex);
+    }
+    unprotect(ctx, token);
+    return token;
+}
+
+fun text_of(ctx: ptr<u8>, literal: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var count: i64 = 0;
+    var bytes: ptr<u8> = literal as ptr<u8>;
+    while (bytes[count] != 0) {
+        count += 1;
+    }
+    return decode_bytes(ctx, bytes, count, 0, ex);
+}
+
+fun option_like(bytes: ptr<u8>, count: i64) -> bool {
+    return count > 1 && bytes[0] == DASH;
+}
+
+// Reads the next argument without consuming it: expanded group members first, then the real list.
+fun peek_next(ctx: ptr<u8>, parser: ptr<Parser>, args: ptr<u8>, next_index: i64, total: i64) -> ptr<u8> {
+    if (deref parser.pending_count > 0) {
+        return (deref parser.pending)[0];
+    }
+    if (next_index < total) {
+        var ignored: ptr<u8> = null;
+        return at(ctx, args, next_index, &ignored);
+    }
+    return null;
+}
+
+fun push_front(ctx: ptr<u8>, parser: ptr<Parser>, value: ptr<u8>) {
+    protect(ctx, value);
+    for (var i: i64 = deref parser.pending_count; i > 0; i--) {
+        (deref parser.pending)[i] = (deref parser.pending)[i - 1];
+    }
+    (deref parser.pending)[0] = value;
+    deref parser.pending_count += 1;
+}
+
+fun pop_front(ctx: ptr<u8>, parser: ptr<Parser>) {
+    var first: ptr<u8> = (deref parser.pending)[0];
+    for (var i: i64 = 0; i + 1 < deref parser.pending_count; i++) {
+        (deref parser.pending)[i] = (deref parser.pending)[i + 1];
+    }
+    deref parser.pending_count -= 1;
+    unprotect(ctx, first);
+}
+
+fun add_token(ctx: ptr<u8>, parser: ptr<Parser>, token: ptr<u8>, ex: ptr<ptr<u8>>) {
+    append(ctx, deref parser.tokens, token, ex);
+}
+
+// Splits the argument list into tokens, following the rules of Node's tokenizer.
+fun tokenize(ctx: ptr<u8>, parser: ptr<Parser>, args: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var total: i64 = length(ctx, args, ex);
+    var index: i64 = 0;
+    var bytes: ptr<u8> = deref parser.scratch;
+    while ((index < total || deref parser.pending_count > 0) && deref ex == null) {
+        var from_pending: bool = deref parser.pending_count > 0;
+        var current: ptr<u8> = undefined(ctx);
+        if (from_pending) {
+            current = (deref parser.pending)[0];
+            pop_front(ctx, parser);
+        } else {
+            current = at(ctx, args, index, ex);
+        }
+        var count: i64 = encode_utf8(ctx, current, bytes, ARG_BYTES, false, ex);
+        if (count < 0 || deref ex != null) {
+            return;
+        }
+        var token_index: i64 = index;
+        if (from_pending) {
+            token_index = index - 1;
+        }
+        var consumed_next: bool = false;
+        if (!from_pending) {
+            index += 1;
+        }
+        if (count == 2 && bytes[0] == DASH && bytes[1] == DASH) {
+            add_token(ctx, parser, make_token(ctx, "option-terminator", null, null, token_index, null, null, ex), ex);
+            var rest: i64 = index;
+            while (rest < total && deref ex == null) {
+                var value: ptr<u8> = at(ctx, args, rest, ex);
+                add_token(ctx, parser, make_token(ctx, "positional", null, null, rest, value, null, ex), ex);
+                rest += 1;
+            }
+            return;
+        }
+        if (count == 2 && bytes[0] == DASH && bytes[1] != DASH) {
+            // -f, with the value taken from the next argument for string options.
+            var name: ptr<u8> = long_for_short(ctx, parser, bytes[1], ex);
+            protect(ctx, name);
+            var value: ptr<u8> = null;
+            var inline_flag: ptr<u8> = null;
+            if (short_type(ctx, parser, bytes[1], ex) == TYPE_STRING) {
+                var upcoming: ptr<u8> = peek_next(ctx, parser, args, index, total);
+                if (upcoming != null) {
+                    value = upcoming;
+                    inline_flag = boolean(ctx, false);
+                    consumed_next = true;
+                }
+            }
+            var raw: ptr<u8> = slice_value(ctx, bytes, 0, 2, ex);
+            add_token(ctx, parser, make_token(ctx, "option", name, raw, token_index, value, inline_flag, ex), ex);
+            unprotect(ctx, name);
+            if (consumed_next) {
+                if (deref parser.pending_count > 0) {
+                    pop_front(ctx, parser);
+                } else {
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        if (count > 2 && bytes[0] == DASH && bytes[1] != DASH) {
+            var first_type: i32 = short_type(ctx, parser, bytes[1], ex);
+            if (first_type == TYPE_STRING) {
+                // -fFILE: the rest of the argument is the value.
+                var name: ptr<u8> = long_for_short(ctx, parser, bytes[1], ex);
+                protect(ctx, name);
+                var value: ptr<u8> = slice_value(ctx, bytes, 2, count, ex);
+                var raw: ptr<u8> = slice_value(ctx, bytes, 0, 2, ex);
+                add_token(ctx, parser, make_token(ctx, "option", name, raw, token_index, value, boolean(ctx, true), ex), ex);
+                unprotect(ctx, name);
+                continue;
+            }
+            // -abc: expand into -a -b -c; a string option inside the group takes the remainder.
+            var members: array<ptr<u8>, 64>;
+            var member_count: i64 = 0;
+            for (var at_byte: i64 = 1; at_byte < count && member_count < PENDING_LIMIT && deref ex == null; at_byte++) {
+                var member_type: i32 = short_type(ctx, parser, bytes[at_byte], ex);
+                var expanded: array<u8, 8192>;
+                expanded[0] = DASH;
+                expanded[1] = bytes[at_byte];
+                var width: i64 = 2;
+                var stop: bool = false;
+                if (member_type == TYPE_STRING && at_byte < count - 1) {
+                    for (var tail: i64 = at_byte + 1; tail < count; tail++) {
+                        expanded[width] = bytes[tail];
+                        width += 1;
+                    }
+                    stop = true;
+                }
+                members[member_count] = slice_value(ctx, &expanded[0], 0, width, ex);
+                member_count += 1;
+                if (stop) {
+                    at_byte = count;
+                }
+            }
+            for (var back: i64 = member_count - 1; back >= 0; back--) {
+                push_front(ctx, parser, members[back]);
+            }
+            continue;
+        }
+        if (count > 2 && bytes[0] == DASH && bytes[1] == DASH) {
+            var equals: i64 = -1;
+            for (var scan: i64 = 2; scan < count && equals < 0; scan++) {
+                if (bytes[scan] == EQUALS) {
+                    equals = scan;
+                }
+            }
+            if (equals > 2) {
+                var name: ptr<u8> = slice_value(ctx, bytes, 2, equals, ex);
+                protect(ctx, name);
+                var value: ptr<u8> = slice_value(ctx, bytes, equals + 1, count, ex);
+                var raw: ptr<u8> = slice_value(ctx, bytes, 0, equals, ex);
+                add_token(ctx, parser, make_token(ctx, "option", name, raw, token_index, value, boolean(ctx, true), ex), ex);
+                unprotect(ctx, name);
+                continue;
+            }
+            var name: ptr<u8> = slice_value(ctx, bytes, 2, count, ex);
+            protect(ctx, name);
+            var value: ptr<u8> = null;
+            var inline_flag: ptr<u8> = null;
+            var record: ptr<u8> = own_option(ctx, parser, name, ex);
+            if (option_type(ctx, record, ex) == TYPE_STRING) {
+                var upcoming: ptr<u8> = peek_next(ctx, parser, args, index, total);
+                if (upcoming != null) {
+                    value = upcoming;
+                    inline_flag = boolean(ctx, false);
+                    consumed_next = true;
+                }
+            }
+            add_token(ctx, parser, make_token(ctx, "option", name, current, token_index, value, inline_flag, ex), ex);
+            unprotect(ctx, name);
+            if (consumed_next) {
+                if (deref parser.pending_count > 0) {
+                    pop_front(ctx, parser);
+                } else {
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        add_token(ctx, parser, make_token(ctx, "positional", null, null, token_index, current, null, ex), ex);
+    }
+}
+
+// --- validation and storage ---------------------------------------------------------------------
+
+fun new_builder() -> Builder {
+    var sink: Builder;
+    deref sink.data = null;
+    deref sink.length = 0;
+    deref sink.capacity = 0;
+    return sink;
+}
+
+// Throws TypeError with a parseArgs code. `pieces` alternates literal text and engine strings.
+fun raise(ctx: ptr<u8>, ex: ptr<ptr<u8>>, code: str, head: str, first: ptr<u8>, middle: str, second: ptr<u8>,
+    tail: str) {
+    var sink: Builder = new_builder();
+    var ignored: ptr<u8> = null;
+    var ok: bool = builder_ascii(&sink, head);
+    if (ok && first != null) {
+        ok = builder_engine_text(ctx, &sink, first, &ignored);
+    }
+    ok = ok && builder_ascii(&sink, middle);
+    if (ok && second != null) {
+        ok = builder_engine_text(ctx, &sink, second, &ignored);
+    }
+    ok = ok && builder_ascii(&sink, tail);
+    if (!ok) {
+        builder_free(&sink);
+        fail_coded(ctx, ex, ERROR_TYPE, code, "Invalid arguments");
+        return;
+    }
+    var message: ptr<u8> = builder_finish(ctx, &sink);
+    builder_free(&sink);
+    fail_dynamic(ctx, ex, ERROR_TYPE, code, message);
+}
+
+// "-f, " when the option declares a short name, otherwise "".
+fun short_hint(ctx: ptr<u8>, record: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var short: ptr<u8> = get(ctx, record, "short", ex);
+    if (kind(ctx, short) != VALUE_STRING) {
+        return null;
+    }
+    var bytes: array<u8, 16>;
+    var count: i64 = encode_bytes(ctx, short, 0, &bytes[0], 12, ex);
+    if (count < 0) {
+        return null;
+    }
+    var hint: array<u8, 24>;
+    hint[0] = DASH;
+    for (var i: i64 = 0; i < count; i++) {
+        hint[1 + i] = bytes[i];
+    }
+    hint[1 + count] = 44;
+    hint[2 + count] = 32;
+    return decode_bytes(ctx, &hint[0], 3 + count, 0, ex);
+}
+
+fun check_token(ctx: ptr<u8>, parser: ptr<Parser>, token: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var name: ptr<u8> = get(ctx, token, "name", ex);
+    var raw: ptr<u8> = get(ctx, token, "rawName", ex);
+    var value: ptr<u8> = get(ctx, token, "value", ex);
+    var inline_flag: ptr<u8> = get(ctx, token, "inlineValue", ex);
+    if (deref ex != null) {
+        return;
+    }
+    var record: ptr<u8> = own_option(ctx, parser, name, ex);
+    if (deref ex != null) {
+        return;
+    }
+    if (record == null) {
+        if (deref parser.allow_positionals) {
+            raise(ctx, ex, "ERR_PARSE_ARGS_UNKNOWN_OPTION", "Unknown option '", raw,
+                "'. To specify a positional argument starting with a '-', place it at the end of the command after '--', as in '-- \"",
+                raw, "\"");
+        } else {
+            raise(ctx, ex, "ERR_PARSE_ARGS_UNKNOWN_OPTION", "Unknown option '", raw, "'", null, "");
+        }
+        return;
+    }
+    var declared: i32 = option_type(ctx, record, ex);
+    var hint: ptr<u8> = short_hint(ctx, record, ex);
+    var long_name: ptr<u8> = name;
+    if (declared == TYPE_STRING && kind(ctx, value) != VALUE_STRING) {
+        raise(ctx, ex, "ERR_PARSE_ARGS_INVALID_OPTION_VALUE", "Option '", hint, "--", long_name, " <value>' argument missing");
+        return;
+    }
+    if (declared == TYPE_BOOLEAN && kind(ctx, value) != VALUE_UNDEFINED) {
+        raise(ctx, ex, "ERR_PARSE_ARGS_INVALID_OPTION_VALUE", "Option '", hint, "--", long_name, "' does not take an argument");
+    }
+}
+
+// An option value that itself looks like an option is ambiguous unless it was written as --name=value.
+fun check_ambiguous(ctx: ptr<u8>, token: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var value: ptr<u8> = get(ctx, token, "value", ex);
+    var inline_flag: ptr<u8> = get(ctx, token, "inlineValue", ex);
+    var raw: ptr<u8> = get(ctx, token, "rawName", ex);
+    if (deref ex != null || kind(ctx, value) != VALUE_STRING) {
+        return;
+    }
+    if (kind(ctx, inline_flag) == VALUE_BOOLEAN && truth(ctx, inline_flag)) {
+        return;
+    }
+    var bytes: array<u8, 8192>;
+    var count: i64 = encode_bytes(ctx, value, 0, &bytes[0], ARG_BYTES - 1, ex);
+    if (count < 0 || !option_like(&bytes[0], count)) {
+        return;
+    }
+    var raw_bytes: array<u8, 64>;
+    var raw_count: i64 = encode_bytes(ctx, raw, 0, &raw_bytes[0], 63, ex);
+    var example: str = "-XYZ'.";
+    if (raw_count > 1 && raw_bytes[0] == DASH && raw_bytes[1] == DASH) {
+        example = "=-XYZ'.";
+    }
+    var sink: Builder = new_builder();
+    var ignored: ptr<u8> = null;
+    var ok: bool = builder_ascii(&sink, "Option '") && builder_engine_text(ctx, &sink, raw, &ignored) &&
+        builder_ascii(&sink, "' argument is ambiguous.\nDid you forget to specify the option argument for '") &&
+        builder_engine_text(ctx, &sink, raw, &ignored) &&
+        builder_ascii(&sink, "'?\nTo specify an option argument starting with a dash use '") &&
+        builder_engine_text(ctx, &sink, raw, &ignored) && builder_ascii(&sink, example);
+    if (!ok) {
+        builder_free(&sink);
+        fail_coded(ctx, ex, ERROR_TYPE, "ERR_PARSE_ARGS_INVALID_OPTION_VALUE", "Option argument is ambiguous");
+        return;
+    }
+    var message: ptr<u8> = builder_finish(ctx, &sink);
+    builder_free(&sink);
+    fail_dynamic(ctx, ex, ERROR_TYPE, "ERR_PARSE_ARGS_INVALID_OPTION_VALUE", message);
+}
+
+fun is_proto_key(ctx: ptr<u8>, name: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var bytes: array<u8, 16>;
+    var count: i64 = encode_bytes(ctx, name, 0, &bytes[0], 15, ex);
+    return count >= 0 && same_bytes(&bytes[0], count, "__proto__");
+}
+
+// Stores one occurrence. Repeated values collect in an array when the option is `multiple`.
+fun store_option(ctx: ptr<u8>, parser: ptr<Parser>, name: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (is_proto_key(ctx, name, ex)) {
+        return;
+    }
+    var stored: ptr<u8> = boolean(ctx, true);
+    if (value != null && kind(ctx, value) == VALUE_STRING) {
+        stored = value;
+    } else if (value != null && kind(ctx, value) == VALUE_BOOLEAN) {
+        stored = value;
+    }
+    var record: ptr<u8> = own_option(ctx, parser, name, ex);
+    var multiple: bool = false;
+    if (record != null) {
+        multiple = truth(ctx, get(ctx, record, "multiple", ex));
+    }
+    var key: array<u8, 8192>;
+    var key_length: i64 = encode_bytes(ctx, name, 0, &key[0], ARG_BYTES - 1, ex);
+    if (key_length < 0 || deref ex != null) {
+        return;
+    }
+    key[key_length] = 0;
+    if (multiple) {
+        var existing: ptr<u8> = get(ctx, deref parser.values, &key[0] as str, ex);
+        if (deref ex == null && kind(ctx, existing) == VALUE_OBJECT) {
+            append(ctx, existing, stored, ex);
+        } else if (deref ex == null) {
+            var items: array<ptr<u8>, 1> = [stored];
+            put(ctx, deref parser.values, &key[0] as str, array(ctx, 1, &items[0], ex), ex);
+        }
+    } else {
+        put(ctx, deref parser.values, &key[0] as str, stored, ex);
+    }
+}
+
+// --no-name stores false for a boolean option `name` when allowNegative is on.
+fun negated_target(ctx: ptr<u8>, parser: ptr<Parser>, name: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    if (!deref parser.allow_negative) {
+        return null;
+    }
+    var bytes: array<u8, 8192>;
+    var count: i64 = encode_bytes(ctx, name, 0, &bytes[0], ARG_BYTES - 1, ex);
+    if (count < 4 || bytes[0] != 110 || bytes[1] != 111 || bytes[2] != DASH) {
+        return null;
+    }
+    if (own_option(ctx, parser, name, ex) != null) {
+        return null;
+    }
+    var positive: ptr<u8> = slice_value(ctx, &bytes[0], 3, count, ex);
+    var record: ptr<u8> = own_option(ctx, parser, positive, ex);
+    if (option_type(ctx, record, ex) != TYPE_BOOLEAN) {
+        return null;
+    }
+    return positive;
+}
+
+fun process_tokens(ctx: ptr<u8>, parser: ptr<Parser>, ex: ptr<ptr<u8>>) {
+    var total: i64 = length(ctx, deref parser.tokens, ex);
+    for (var i: i64 = 0; i < total && deref ex == null; i++) {
+        var token: ptr<u8> = at(ctx, deref parser.tokens, i, ex);
+        var token_kind: ptr<u8> = get(ctx, token, "kind", ex);
+        var label: array<u8, 24>;
+        var label_length: i64 = encode_bytes(ctx, token_kind, 0, &label[0], 23, ex);
+        if (label_length < 0 || deref ex != null) {
+            return;
+        }
+        if (same_bytes(&label[0], label_length, "positional")) {
+            if (deref parser.strict && !deref parser.allow_positionals) {
+                var value: ptr<u8> = get(ctx, token, "value", ex);
+                raise(ctx, ex, "ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL", "Unexpected argument '", value, "'. This command does not take positional arguments", null, "");
+                return;
+            }
+            append(ctx, deref parser.positionals, get(ctx, token, "value", ex), ex);
+        } else if (same_bytes(&label[0], label_length, "option")) {
+            var name: ptr<u8> = get(ctx, token, "name", ex);
+            var value: ptr<u8> = get(ctx, token, "value", ex);
+            var negated: ptr<u8> = negated_target(ctx, parser, name, ex);
+            if (negated != null) {
+                store_option(ctx, parser, negated, boolean(ctx, false), ex);
+                continue;
+            }
+            if (deref parser.strict) {
+                check_token(ctx, parser, token, ex);
+                check_ambiguous(ctx, token, ex);
+                if (deref ex != null) {
+                    return;
+                }
+            }
+            if (kind(ctx, value) == VALUE_UNDEFINED) {
+                value = null;
+            }
+            store_option(ctx, parser, name, value, ex);
+        }
+    }
+}
+
+fun apply_defaults(ctx: ptr<u8>, parser: ptr<Parser>, ex: ptr<ptr<u8>>) {
+    var argument: array<ptr<u8>, 1> = [deref parser.options];
+    var names: ptr<u8> = call(ctx, deref parser.keys, null, 1, &argument[0], ex);
+    if (deref ex != null || names == null) {
+        return;
+    }
+    protect(ctx, names);
+    var total: i64 = length(ctx, names, ex);
+    for (var i: i64 = 0; i < total && deref ex == null; i++) {
+        var name: ptr<u8> = at(ctx, names, i, ex);
+        var record: ptr<u8> = own_option(ctx, parser, name, ex);
+        if (record == null) {
+            continue;
+        }
+        var fallback: ptr<u8> = get(ctx, record, "default", ex);
+        if (kind(ctx, fallback) == VALUE_UNDEFINED) {
+            continue;
+        }
+        var key: array<u8, 8192>;
+        var key_length: i64 = encode_bytes(ctx, name, 0, &key[0], ARG_BYTES - 1, ex);
+        if (key_length < 0 || deref ex != null) {
+            continue;
+        }
+        key[key_length] = 0;
+        var current: ptr<u8> = get(ctx, deref parser.values, &key[0] as str, ex);
+        if (kind(ctx, current) == VALUE_UNDEFINED) {
+            put(ctx, deref parser.values, &key[0] as str, fallback, ex);
+        }
+    }
+    unprotect(ctx, names);
+}
+
+// Validates the shape of `options` (type, short, multiple) before parsing starts.
+fun validate_options(ctx: ptr<u8>, parser: ptr<Parser>, ex: ptr<ptr<u8>>) {
+    var argument: array<ptr<u8>, 1> = [deref parser.options];
+    var names: ptr<u8> = call(ctx, deref parser.keys, null, 1, &argument[0], ex);
+    if (deref ex != null || names == null) {
+        return;
+    }
+    protect(ctx, names);
+    var total: i64 = length(ctx, names, ex);
+    for (var i: i64 = 0; i < total && deref ex == null; i++) {
+        var name: ptr<u8> = at(ctx, names, i, ex);
+        var record: ptr<u8> = own_option(ctx, parser, name, ex);
+        if (record == null) {
+            var key: array<u8, 8192>;
+            var key_length: i64 = encode_bytes(ctx, name, 0, &key[0], ARG_BYTES - 1, ex);
+            if (key_length >= 0 && deref ex == null) {
+                key[key_length] = 0;
+                var shown: ptr<u8> = get(ctx, deref parser.options, &key[0] as str, ex);
+                invalid_argument_type(ctx, ex, "The \"options.", "of type object", shown);
+            }
+            continue;
+        }
+        if (option_type(ctx, record, ex) == TYPE_NONE) {
+            var declared: ptr<u8> = get(ctx, record, "type", ex);
+            var sink: Builder = new_builder();
+            var ignored: ptr<u8> = null;
+            var ok: bool = builder_ascii(&sink, "The \"options.") && builder_engine_text(ctx, &sink, name, &ignored) &&
+                builder_ascii(&sink, ".type\" property must be ('string|boolean'). ") &&
+                received_suffix(ctx, &sink, declared, &ignored);
+            var message: ptr<u8> = undefined(ctx);
+            if (ok) {
+                message = builder_finish(ctx, &sink);
+            }
+            builder_free(&sink);
+            if (ok) {
+                fail_dynamic(ctx, ex, ERROR_TYPE, "ERR_INVALID_ARG_TYPE", message);
+            }
+            continue;
+        }
+        var short: ptr<u8> = get(ctx, record, "short", ex);
+        if (deref ex == null && kind(ctx, short) != VALUE_UNDEFINED) {
+            var width: array<u8, 16>;
+            var count: i64 = -1;
+            if (kind(ctx, short) == VALUE_STRING) {
+                count = encode_bytes(ctx, short, 0, &width[0], 15, ex);
+            }
+            if (kind(ctx, short) != VALUE_STRING) {
+                invalid_argument_type(ctx, ex, "The \"options.short\" property", "of type string", short);
+            } else if (count != 1) {
+                raise(ctx, ex, "ERR_INVALID_ARG_VALUE", "The property 'options.", name, ".short' must be a single character. Received '", short, "'");
+            }
+        }
+    }
+    unprotect(ctx, names);
+}
+
+fun default_arguments(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var process: ptr<u8> = get(ctx, global(ctx), "process", ex);
+    var argv: ptr<u8> = get(ctx, process, "argv", ex);
+    var slice: ptr<u8> = get(ctx, argv, "slice", ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var start: array<ptr<u8>, 1> = [number(ctx, 2.0)];
+    return call(ctx, slice, argv, 1, &start[0], ex);
+}
+
+fun parse_args(ctx: ptr<u8>, fn: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var config: ptr<u8> = undefined(ctx);
+    if (count > 0) {
+        config = args[0];
+    }
+    if (kind(ctx, config) == VALUE_UNDEFINED) {
+        config = plain(ctx);
+    }
+    if (kind(ctx, config) != VALUE_OBJECT || callable(ctx, config)) {
+        // Node ignores a non-object config and parses the process arguments with defaults.
+        config = plain(ctx);
+    }
+    protect(ctx, config);
+    var intrinsics: ptr<u8> = get(ctx, fn, INTRINSICS_PROPERTY, ex);
+    var parser: Parser;
+    deref parser.has_own = get(ctx, intrinsics, "hasOwn", ex);
+    deref parser.keys = get(ctx, intrinsics, "keys", ex);
+    var supplied: ptr<u8> = get(ctx, config, "args", ex);
+    var options: ptr<u8> = get(ctx, config, "options", ex);
+    var strict_value: ptr<u8> = get(ctx, config, "strict", ex);
+    var positionals_value: ptr<u8> = get(ctx, config, "allowPositionals", ex);
+    var negative_value: ptr<u8> = get(ctx, config, "allowNegative", ex);
+    var tokens_value: ptr<u8> = get(ctx, config, "tokens", ex);
+    if (deref ex != null) {
+        unprotect(ctx, config);
+        return undefined(ctx);
+    }
+    deref parser.strict = true;
+    if (kind(ctx, strict_value) != VALUE_UNDEFINED) {
+        deref parser.strict = truth(ctx, strict_value);
+    }
+    deref parser.allow_positionals = !deref parser.strict;
+    if (kind(ctx, positionals_value) != VALUE_UNDEFINED) {
+        deref parser.allow_positionals = truth(ctx, positionals_value);
+    }
+    deref parser.allow_negative = kind(ctx, negative_value) != VALUE_UNDEFINED && truth(ctx, negative_value);
+    deref parser.want_tokens = kind(ctx, tokens_value) != VALUE_UNDEFINED && truth(ctx, tokens_value);
+    if (kind(ctx, supplied) == VALUE_UNDEFINED) {
+        supplied = default_arguments(ctx, ex);
+    } else if (!is_array(ctx, supplied)) {
+        invalid_argument_type(ctx, ex, "The \"args\" argument", "an instance of Array", supplied);
+    }
+    if (kind(ctx, options) == VALUE_UNDEFINED) {
+        options = plain(ctx);
+    } else if (kind(ctx, options) != VALUE_OBJECT || callable(ctx, options)) {
+        invalid_argument_type(ctx, ex, "The \"options\" argument", "of type object", options);
+    }
+    if (deref ex != null) {
+        unprotect(ctx, config);
+        return undefined(ctx);
+    }
+    protect(ctx, supplied);
+    protect(ctx, options);
+    deref parser.options = options;
+    deref parser.pending_count = 0;
+    deref parser.scratch = mem_alloc(ARG_BYTES);
+    deref parser.values = plain(ctx);
+    protect(ctx, deref parser.values);
+    deref parser.positionals = array(ctx, 0, null, ex);
+    protect(ctx, deref parser.positionals);
+    deref parser.tokens = array(ctx, 0, null, ex);
+    protect(ctx, deref parser.tokens);
+    var result: ptr<u8> = undefined(ctx);
+    if (deref parser.scratch == null) {
+        fail_coded(ctx, ex, 2, "ERR_STRING_TOO_LONG", "cannot allocate parser buffer");
+    } else {
+        validate_options(ctx, &parser, ex);
+        if (deref ex == null) {
+            tokenize(ctx, &parser, supplied, ex);
+        }
+        if (deref ex == null) {
+            process_tokens(ctx, &parser, ex);
+        }
+        if (deref ex == null) {
+            apply_defaults(ctx, &parser, ex);
+        }
+        if (deref ex == null) {
+            result = object(ctx, null, null);
+            protect(ctx, result);
+            put(ctx, result, "values", deref parser.values, ex);
+            put(ctx, result, "positionals", deref parser.positionals, ex);
+            if (deref parser.want_tokens) {
+                put(ctx, result, "tokens", deref parser.tokens, ex);
+            }
+            unprotect(ctx, result);
+        }
+        mem_free(deref parser.scratch, ARG_BYTES);
+    }
+    for (var i: i64 = 0; i < deref parser.pending_count; i++) {
+        unprotect(ctx, (deref parser.pending)[i]);
+    }
+    unprotect(ctx, deref parser.tokens);
+    unprotect(ctx, deref parser.positionals);
+    unprotect(ctx, deref parser.values);
+    unprotect(ctx, options);
+    unprotect(ctx, supplied);
+    unprotect(ctx, config);
+    return result;
+}
+
+export(c) fun jsrt_util_args_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    return parse_args(ctx, fn, count, args, ex);
+}
+
+pub fun install_util_args(ctx: ptr<u8>, exports: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var key: ptr<u8> = utf8("parseArgs");
+    var created: ptr<u8> = function(ctx, key, callback());
+    release(key);
+    var object_ctor: ptr<u8> = get(ctx, global(ctx), "Object", ex);
+    var record: ptr<u8> = plain(ctx);
+    protect(ctx, record);
+    put(ctx, record, "hasOwn", get(ctx, object_ctor, "hasOwn", ex), ex);
+    put(ctx, record, "keys", get(ctx, object_ctor, "keys", ex), ex);
+    define(ctx, created, INTRINSICS_PROPERTY, record, ex, false);
+    unprotect(ctx, record);
+    define(ctx, exports, "parseArgs", created, ex, false);
+    return deref ex == null;
+}
