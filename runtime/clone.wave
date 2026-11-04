@@ -42,6 +42,10 @@ extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) 
 extern(c, "wr_typed_type") fun typed_type(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i32;
 extern(c, "wr_typed_length") fun typed_length(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64;
 extern(c, "wr_typed_bytes") fun typed_bytes(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_typed_buffer") fun typed_buffer(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_typed_offset") fun typed_offset(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64;
+extern(c, "wr_array_buffer_length") fun buffer_length(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> i64;
+extern(c, "wr_array_buffer_bytes") fun buffer_bytes(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8>;
 extern(c, "wr_u8_new") fun new_u8(ctx: ptr<u8>, count: i64, ex: ptr<ptr<u8>>) -> ptr<u8>;
 extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
 extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
@@ -60,6 +64,11 @@ const SET: i32 = 12;
 const REGEXP: i32 = 13;
 const ERROR: i32 = 14;
 const BOXED: i32 = 15;
+// BUFFER owns the bytes of one ArrayBuffer (payload like BYTES). VIEW is a typed array: one edge to its
+// BUFFER node, node.value = the engine element kind, node.extra = byteOffset, node.size = element count.
+// Views that shared a buffer keep sharing the one cloned BUFFER node.
+const BUFFER: i32 = 16;
+const VIEW: i32 = 17;
 const BOXED_NUMBER: f64 = 0.0;
 const BOXED_STRING: f64 = 1.0;
 const BOXED_BOOLEAN: f64 = 2.0;
@@ -83,9 +92,16 @@ const ROOT_SYMBOL_VALUE: i64 = 26;
 const ROOT_MAP_SET: i64 = 27;
 const ROOT_SET_ADD: i64 = 28;
 const ERROR_CTOR_COUNT: i64 = 7;
-const ROOT_COUNT: i64 = 29;
+// 13 slots indexed by the engine typed array code (0..12); slots 9 and 10 stay empty.
+const ROOT_VIEW_CTORS: i64 = 29;
+const VIEW_KIND_COUNT: i64 = 14;
+// DataView reuses the VIEW node with this pseudo kind; node.size is its byteLength.
+const VIEW_KIND_DATA_VIEW: i32 = 13;
+const VIEW_KIND_ARRAY_BUFFER: i32 = 9;
+const VIEW_KIND_NONE: i32 = 10;
+const ROOT_COUNT: i64 = 43;
 struct CloneState {
-    roots: array<ptr<u8>, 29>;
+    roots: array<ptr<u8>, 43>;
 }
 pub struct CloneNode {
     tag: i32;
@@ -96,6 +112,8 @@ pub struct CloneNode {
     count: i64;
     // Allocated edge pairs; count can be smaller when deleted keys were skipped.
     capacity: i64;
+    // byteOffset of a VIEW node.
+    extra: i64;
 }
 pub struct CloneGraph {
     nodes: ptr<CloneNode>;
@@ -128,7 +146,7 @@ pub fun free_clone(graph: ptr<CloneGraph>) {
             var node: ptr<CloneNode> = deref graph.nodes + i;
             if (deref node.bytes != null) {
                 var bytes: i64 = deref node.size;
-                if (deref node.tag != BYTES) {
+                if (deref node.tag != BYTES && deref node.tag != BUFFER) {
                     bytes = bytes * 2;
                 }
                 mem_free(deref node.bytes, bytes + 2);
@@ -395,6 +413,15 @@ fun inherits_from_global(ctx: ptr<u8>, prototype: ptr<u8>, name: str, ex: ptr<pt
     return deref ex == null && kind(ctx, expected) == 5 && equal(ctx, prototype, expected);
 }
 
+// Bytes per element for each engine typed array code (0..12); the ArrayBuffer and none slots are 0.
+fun element_size(view_kind: i32) -> i64 {
+    var sizes: array<i64, 14> = [1, 2, 4, 1, 1, 2, 4, 4, 8, 0, 0, 8, 8, 1];
+    if (view_kind < 0 || view_kind > 13) {
+        return 0;
+    }
+    return sizes[view_kind];
+}
+
 fun visit_object(ctx: ptr<u8>, walk: ptr<Walk>, node: ptr<CloneNode>, value: ptr<u8>, depth: i64,
     ex: ptr<ptr<u8>>) {
     var state: ptr<CloneState> = storage(ctx);
@@ -405,15 +432,6 @@ fun visit_object(ctx: ptr<u8>, walk: ptr<Walk>, node: ptr<CloneNode>, value: ptr
     }
     var view_kind: i32 = typed_type(ctx, value, ex);
     if (deref ex != null) {
-        return;
-    }
-    // JSC's Uint8Array enum is 3; other views/backings are explicitly unsupported.
-    if (view_kind == 3) {
-        deref node.tag = BYTES;
-        deref node.size = typed_length(ctx, value, ex);
-        if (deref ex == null && payload(ctx, walk, node, deref node.size, ex)) {
-            copy_byte_view(ctx, value, deref node.bytes, deref node.size, ex);
-        }
         return;
     }
     var arg: array<ptr<u8>, 1> = [value];
@@ -453,14 +471,59 @@ fun visit_object(ctx: ptr<u8>, walk: ptr<Walk>, node: ptr<CloneNode>, value: ptr
         clone_failure(ctx, ex, "WeakMap, WeakSet and Promise objects cannot be cloned");
         return;
     }
-    // Typed arrays other than Uint8Array, ArrayBuffer and DataView are not cloned yet. They must be
-    // rejected here: falling through would turn them into empty plain records.
-    if (view_kind != 10) {
-        clone_failure(ctx, ex, "ArrayBuffer and typed array views other than Uint8Array cannot be cloned yet");
+    if (view_kind == VIEW_KIND_ARRAY_BUFFER) {
+        deref node.tag = BUFFER;
+        deref node.size = buffer_length(ctx, value, ex);
+        if (deref ex == null && payload(ctx, walk, node, deref node.size, ex)) {
+            var source: ptr<u8> = buffer_bytes(ctx, value, ex);
+            if (deref ex == null && source != null && deref node.size > 0) {
+                mem_copy(deref node.bytes, source, deref node.size);
+            }
+        }
+        return;
+    }
+    if (view_kind != VIEW_KIND_NONE) {
+        // A typed array clones its whole backing buffer (not just the visible window) and records
+        // where in it the view starts, so views sharing a buffer still share the cloned one.
+        var backing: ptr<u8> = typed_buffer(ctx, value, ex);
+        if (deref ex != null) {
+            return;
+        }
+        protect(ctx, backing);
+        deref node.tag = VIEW;
+        deref node.value = view_kind as f64;
+        deref node.extra = typed_offset(ctx, value, ex);
+        // wr_typed_length reports bytes; the view constructor takes an element count.
+        deref node.size = typed_length(ctx, value, ex) / element_size(view_kind);
+        if (deref ex == null) {
+            add_edge(ctx, walk, node, backing, backing, depth, ex);
+        }
+        unprotect(ctx, backing);
         return;
     }
     if (inherits_from_global(ctx, parent, "DataView", ex)) {
-        clone_failure(ctx, ex, "DataView objects cannot be cloned yet");
+        // A DataView is a view node like the typed arrays, with its own pseudo kind. The buffer,
+        // byteOffset and byteLength accessors are read through the engine, and a forged prototype can
+        // only reach this branch for an object whose accessors then throw, which rejects the clone.
+        var backing_view: ptr<u8> = get(ctx, value, "buffer", ex);
+        if (deref ex != null) {
+            return;
+        }
+        protect(ctx, backing_view);
+        var offset: ptr<u8> = get(ctx, value, "byteOffset", ex);
+        var span: ptr<u8> = get(ctx, value, "byteLength", ex);
+        if (deref ex == null && typed_type(ctx, backing_view, ex) == VIEW_KIND_ARRAY_BUFFER) {
+            deref node.tag = VIEW;
+            deref node.value = VIEW_KIND_DATA_VIEW as f64;
+            deref node.extra = numeric(ctx, offset, ex) as i64;
+            deref node.size = numeric(ctx, span, ex) as i64;
+            if (deref ex == null) {
+                add_edge(ctx, walk, node, backing_view, backing_view, depth, ex);
+            }
+        } else if (deref ex == null) {
+            clone_failure(ctx, ex, "object is not a DataView");
+        }
+        unprotect(ctx, backing_view);
         return;
     }
     if (visit_boxed(ctx, walk, node, value, depth, ex)) {
@@ -617,6 +680,44 @@ fun set_add(ctx: ptr<u8>, collection: ptr<u8>, item: ptr<u8>, ex: ptr<ptr<u8>>) 
     call(ctx, (deref state.roots)[ROOT_SET_ADD], collection, 1, &argument[0], ex);
 }
 
+// A fresh ArrayBuffer holding the cloned bytes, taken from the buffer of a new Uint8Array of that size.
+fun restore_buffer(ctx: ptr<u8>, node: ptr<CloneNode>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var holder: ptr<u8> = new_u8(ctx, deref node.size, ex);
+    if (deref ex != null) {
+        return null;
+    }
+    protect(ctx, holder);
+    var bytes: ptr<u8> = typed_bytes(ctx, holder, ex);
+    if (deref ex == null && deref node.size > 0 && bytes != null) {
+        mem_copy(bytes, deref node.bytes, deref node.size);
+    }
+    var buffer: ptr<u8> = null;
+    if (deref ex == null) {
+        buffer = typed_buffer(ctx, holder, ex);
+    }
+    unprotect(ctx, holder);
+    if (deref ex != null) {
+        return null;
+    }
+    return buffer;
+}
+
+// new <Ctor>(buffer, byteOffset, length) with the constructor chosen by the engine element kind.
+fun restore_view(ctx: ptr<u8>, node: ptr<CloneNode>, buffer: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var state: ptr<CloneState> = storage(ctx);
+    var view_kind: i64 = deref node.value as i64;
+    if (view_kind < 0 || view_kind >= VIEW_KIND_COUNT || (deref state.roots)[ROOT_VIEW_CTORS + view_kind] == null || buffer == null) {
+        clone_failure(ctx, ex, "unsupported typed array kind");
+        return null;
+    }
+    var arguments: array<ptr<u8>, 3> = [buffer, number(ctx, deref node.extra as f64), number(ctx, deref node.size as f64)];
+    var result: ptr<u8> = construct(ctx, (deref state.roots)[ROOT_VIEW_CTORS + view_kind], 3, &arguments[0], ex);
+    if (deref ex != null) {
+        return null;
+    }
+    return result;
+}
+
 pub fun restore_clone(ctx: ptr<u8>, graph: ptr<CloneGraph>, ex: ptr<ptr<u8>>) -> ptr<u8> {
     var refs: ptr<ptr<u8>> = mem_alloc_zeroed(deref graph.count * 8) as ptr<ptr<u8>>;
     if (refs == null) {
@@ -652,7 +753,9 @@ pub fun restore_clone(ctx: ptr<u8>, graph: ptr<CloneGraph>, ex: ptr<ptr<u8>>) ->
             value = construct(ctx, (deref state.roots)[ROOT_MAP_CTOR], 0, null, ex);
         } else if (tag == SET) {
             value = construct(ctx, (deref state.roots)[ROOT_SET_CTOR], 0, null, ex);
-        } else if (tag == REGEXP || tag == ERROR || tag == BOXED) {
+        } else if (tag == BUFFER) {
+            value = restore_buffer(ctx, node, ex);
+        } else if (tag == REGEXP || tag == ERROR || tag == BOXED || tag == VIEW) {
             // Built in the reverse pass below, once every child value exists.
             value = null;
         } else if (tag == DATE) {
@@ -686,6 +789,8 @@ pub fun restore_clone(ctx: ptr<u8>, graph: ptr<CloneGraph>, ex: ptr<ptr<u8>>) ->
             made = construct(ctx, (deref state.roots)[ROOT_REGEXP_CTOR], 2, &pattern[0], ex);
         } else if (built_tag == BOXED && deref built.count > 0) {
             made = box_primitive(ctx, refs[(deref built.edges)[0]], deref built.value, ex);
+        } else if (built_tag == VIEW && deref built.count > 0) {
+            made = restore_view(ctx, built, refs[(deref built.edges)[0]], ex);
         } else if (built_tag == ERROR && deref built.count > 0) {
             made = build_error(ctx, built, refs, ex);
         }
@@ -706,7 +811,7 @@ pub fun restore_clone(ctx: ptr<u8>, graph: ptr<CloneGraph>, ex: ptr<ptr<u8>>) ->
                 map_set(ctx, refs[i], refs[key], refs[value], ex);
             } else if (fill_tag == SET) {
                 set_add(ctx, refs[i], refs[key], ex);
-            } else if (fill_tag != REGEXP && fill_tag != ERROR && fill_tag != BOXED) {
+            } else if (fill_tag != REGEXP && fill_tag != ERROR && fill_tag != BOXED && fill_tag != VIEW) {
                 define_key(ctx, refs[i], refs[key], refs[value], ex, true);
             }
         }
@@ -774,6 +879,14 @@ pub fun install_clone(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     (deref state.roots)[ROOT_BOOLEAN_VALUE] = capture(ctx, get(ctx, get(ctx, root, "Boolean", ex), "prototype", ex), "valueOf", ex);
     (deref state.roots)[ROOT_BIGINT_VALUE] = capture(ctx, get(ctx, get(ctx, root, "BigInt", ex), "prototype", ex), "valueOf", ex);
     (deref state.roots)[ROOT_SYMBOL_VALUE] = capture(ctx, get(ctx, get(ctx, root, "Symbol", ex), "prototype", ex), "valueOf", ex);
+    // Typed array constructors indexed by the engine's JSTypedArrayType code.
+    var view_names: array<str, 14> = ["Int8Array", "Int16Array", "Int32Array", "Uint8Array", "Uint8ClampedArray",
+        "Uint16Array", "Uint32Array", "Float32Array", "Float64Array", "", "", "BigInt64Array", "BigUint64Array", "DataView"];
+    for (var i: i64 = 0; i < VIEW_KIND_COUNT; i++) {
+        if (i != VIEW_KIND_ARRAY_BUFFER as i64 && i != VIEW_KIND_NONE as i64) {
+            (deref state.roots)[ROOT_VIEW_CTORS + i] = capture(ctx, root, view_names[i], ex);
+        }
+    }
     var error_names: array<str, 7> = ["Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError",
         "URIError"];
     for (var i: i64 = 0; i < ERROR_CTOR_COUNT; i++) {
