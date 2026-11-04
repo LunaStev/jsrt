@@ -19,10 +19,11 @@ import("./stream_utils")::{stream_promises_module};
 import("./http_client")::{https_module};
 import("./path")::{path_module};
 import("./os")::{os_module};
-import("./util")::{util_module};
+import("./util")::{util_module, util_types_module};
 import("./assert")::{assert_module};
 import("./crypto")::{crypto_module};
 import("./url")::{url_module};
+import("./string_decoder")::{string_decoder_module};
 import("./child_process")::{child_process_module};
 import("./addons")::{load_addon};
 import("./config")::{MODULE_LIMIT, DEPTH_LIMIT};
@@ -385,6 +386,10 @@ pub fun install_modules(ctx: ptr<u8>, path: str, evaluating: bool, ex: ptr<ptr<u
     wr_protect(ctx, (deref host_state.builtins)[20]);
     (deref host_state.builtins)[21] = timers_promises_module(ctx, ex);
     wr_protect(ctx, (deref host_state.builtins)[21]);
+    (deref host_state.builtins)[22] = string_decoder_module(ctx, ex);
+    wr_protect(ctx, (deref host_state.builtins)[22]);
+    (deref host_state.builtins)[23] = util_types_module();
+    wr_protect(ctx, (deref host_state.builtins)[23]);
     var fs_key: ptr<u8> = wr_string_utf8("fs");
     wr_delete(ctx, global, fs_key, ex);
     wr_string_release(fs_key);
@@ -500,7 +505,7 @@ pub fun shutdown_modules(ctx: ptr<u8>) {
             (deref host_state.constructors)[i] = null;
         }
     }
-    for (var i: i64 = 0; i < 22; i++) {
+    for (var i: i64 = 0; i < 24; i++) {
         if ((deref host_state.builtins)[i] != null) {
             wr_unprotect(ctx, (deref host_state.builtins)[i]);
             (deref host_state.builtins)[i] = null;

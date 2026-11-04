@@ -1,4 +1,5 @@
 import("./context_state")::{EVENTS_SLOT, context_slot, allocate_context_slot, release_context_slot};
+import("./events_on")::{install_events_on};
 fun intrinsic(ctx: ptr<u8>, index: i64) -> ptr<ptr<u8>> {
     return(context_slot(ctx, EVENTS_SLOT) as ptr<ptr<u8>>) + index;
 }
@@ -562,6 +563,7 @@ pub fun install_events(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
     // rawListeners returns the registered functions; jsrt stores once listeners unwrapped.
     define(ctx, deref intrinsic(ctx, 2), "rawListeners", deref intrinsic(ctx, 3 + (7)), ex, false);
     define(ctx, deref intrinsic(ctx, 1), "defaultMaxListeners", number(ctx, DEFAULT_MAX_LISTENERS), ex, true);
+    install_events_on(ctx, deref intrinsic(ctx, 1), ex);
     return deref ex == null;
 }
 

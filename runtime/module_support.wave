@@ -162,6 +162,12 @@ pub fun annotate(ctx: ptr<u8>, value: ptr<u8>, path: str) {
 }
 
 pub fun builtin(request: str) -> i64 {
+    if (mem_eq_cstr(request, "string_decoder") || mem_eq_cstr(request, "node:string_decoder")) {
+        return 22;
+    }
+    if (mem_eq_cstr(request, "util/types") || mem_eq_cstr(request, "node:util/types")) {
+        return 23;
+    }
     if (mem_eq_cstr(request, "timers/promises") || mem_eq_cstr(request, "node:timers/promises")) {
         return 21;
     }

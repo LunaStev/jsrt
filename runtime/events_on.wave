@@ -1,0 +1,423 @@
+// events.on(emitter, eventName[, options]): an async iterator over emitted events. Each call
+// builds one state object that is the receiver of every native function involved (the iterator
+// methods and the listeners registered on the emitter), so no context slot is needed. The
+// state is reachable from the bound functions held by the emitter and the iterator, and
+// it is released by removing those listeners when the iterator finishes.
+import("./values")::{get, put, define, define_key, plain, fail_coded, fail_dynamic, make_error};
+import("./byte_codec")::{encode_bytes};
+import("./collections")::{length, at, append, remove_at, bind_one};
+import("./util_text")::{invalid_argument_type};
+
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_callable") fun callable(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_boolean") fun boolean(ctx: ptr<u8>, value: bool) -> ptr<u8>;
+extern(c, "wr_to_boolean") fun truth(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_is_array") fun is_array(ctx: ptr<u8>, value: ptr<u8>) -> bool;
+extern(c, "wr_array") fun array(ctx: ptr<u8>, count: i64, values: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_call") fun call(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_promise") fun promise(ctx: ptr<u8>, resolve: ptr<ptr<u8>>, reject: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8>;
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_context_global") fun global(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "jsrt_events_on_callback") fun callback() -> ptr<u8>;
+
+const VALUE_UNDEFINED: i32 = 0;
+const VALUE_STRING: i32 = 4;
+const VALUE_OBJECT: i32 = 5;
+const ERROR_BASE: i32 = 0;
+const NAME_CAPACITY: i64 = 64;
+// Operation codes derived from the native function name.
+const OP_ON: i32 = 0;
+const OP_NEXT: i32 = 1;
+const OP_RETURN: i32 = 2;
+const OP_THROW: i32 = 3;
+const OP_EVENT: i32 = 4;
+const OP_ERROR: i32 = 5;
+const OP_CLOSE: i32 = 6;
+const OP_ABORT: i32 = 7;
+const OP_ITERATOR: i32 = 8;
+const OPERATION_COUNT: i64 = 9;
+
+fun operation_names() -> array<str, 9> {
+    return ["on", "next", "return", "throw", "onEvent", "onError", "onClose", "onAbort", "asyncIterator"];
+}
+
+fun operation_of(ctx: ptr<u8>, fn: ptr<u8>, ex: ptr<ptr<u8>>) -> i32 {
+    var label: ptr<u8> = get(ctx, fn, "name", ex);
+    var bytes: array<u8, 64>;
+    if (deref ex != null || kind(ctx, label) != VALUE_STRING) {
+        return -1;
+    }
+    var count: i64 = encode_bytes(ctx, label, 0, &bytes[0], NAME_CAPACITY - 1, ex);
+    if (count < 0 || deref ex != null) {
+        return -1;
+    }
+    bytes[count] = 0;
+    var names: array<str, 9> = operation_names();
+    for (var op: i64 = 0; op < OPERATION_COUNT; op++) {
+        var wanted: ptr<u8> = names[op] as ptr<u8>;
+        var i: i64 = 0;
+        while (wanted[i] != 0 && wanted[i] == bytes[i]) {
+            i += 1;
+        }
+        if (wanted[i] == 0 && bytes[i] == 0) {
+            return op as i32;
+        }
+    }
+    return -1;
+}
+
+// { value, done } as a plain object with the ordinary Object prototype.
+fun iteration_result(ctx: ptr<u8>, value: ptr<u8>, done: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var result: ptr<u8> = object(ctx, null, null);
+    protect(ctx, result);
+    put(ctx, result, "done", boolean(ctx, done), ex);
+    put(ctx, result, "value", value, ex);
+    unprotect(ctx, result);
+    return result;
+}
+
+fun settled(ctx: ptr<u8>, value: ptr<u8>, rejected: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var resolve: ptr<u8> = null;
+    var reject: ptr<u8> = null;
+    var result: ptr<u8> = promise(ctx, &resolve, &reject, ex);
+    if (deref ex != null || result == null) {
+        return undefined(ctx);
+    }
+    protect(ctx, result);
+    var argument: array<ptr<u8>, 1> = [value];
+    if (rejected) {
+        call(ctx, reject, null, 1, &argument[0], ex);
+    } else {
+        call(ctx, resolve, null, 1, &argument[0], ex);
+    }
+    unprotect(ctx, result);
+    return result;
+}
+
+fun flag(ctx: ptr<u8>, state: ptr<u8>, name: str, ex: ptr<ptr<u8>>) -> bool {
+    return truth(ctx, get(ctx, state, name, ex));
+}
+
+fun call_method(ctx: ptr<u8>, target: ptr<u8>, method: str, a: ptr<u8>, b: ptr<u8>, count: i64, ex: ptr<ptr<u8>>) {
+    var fn: ptr<u8> = get(ctx, target, method, ex);
+    if (deref ex != null || !callable(ctx, fn)) {
+        return;
+    }
+    var pair: array<ptr<u8>, 2> = [a, b];
+    call(ctx, fn, target, count, &pair[0], ex);
+}
+
+// Removes every listener this iterator registered. Safe to call more than once.
+fun detach(ctx: ptr<u8>, state: ptr<u8>, ex: ptr<ptr<u8>>) {
+    if (flag(ctx, state, "detached", ex)) {
+        return;
+    }
+    put(ctx, state, "detached", boolean(ctx, true), ex);
+    var emitter: ptr<u8> = get(ctx, state, "emitter", ex);
+    var name: ptr<u8> = get(ctx, state, "name", ex);
+    var on_event: ptr<u8> = get(ctx, state, "onEvent", ex);
+    var on_error: ptr<u8> = get(ctx, state, "onError", ex);
+    var on_close: ptr<u8> = get(ctx, state, "onClose", ex);
+    call_method(ctx, emitter, "removeListener", name, on_event, 2, ex);
+    call_method(ctx, emitter, "removeListener", string_value(ctx, "error", ex), on_error, 2, ex);
+    var closes: ptr<u8> = get(ctx, state, "closes", ex);
+    var total: i64 = length(ctx, closes, ex);
+    for (var i: i64 = 0; i < total && deref ex == null; i++) {
+        call_method(ctx, emitter, "removeListener", at(ctx, closes, i, ex), on_close, 2, ex);
+    }
+    var signal: ptr<u8> = get(ctx, state, "signal", ex);
+    if (kind(ctx, signal) == VALUE_OBJECT) {
+        var type_name: ptr<u8> = get(ctx, state, "abortType", ex);
+        call_method(ctx, signal, "removeEventListener", type_name, get(ctx, state, "onAbort", ex), 2, ex);
+    }
+}
+
+extern(c, "wr_string_value") fun engine_string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+
+fun string_value(ctx: ptr<u8>, literal: str, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var raw: ptr<u8> = utf8(literal);
+    var result: ptr<u8> = engine_string_value(ctx, raw);
+    release(raw);
+    return result;
+}
+
+fun shift_waiting(ctx: ptr<u8>, state: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var waiting: ptr<u8> = get(ctx, state, "waiting", ex);
+    if (deref ex != null || length(ctx, waiting, ex) == 0) {
+        return null;
+    }
+    var first: ptr<u8> = at(ctx, waiting, 0, ex);
+    remove_at(ctx, waiting, 0, ex);
+    return first;
+}
+
+fun finish_waiting(ctx: ptr<u8>, state: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var pending: ptr<u8> = shift_waiting(ctx, state, ex);
+    while (pending != null && deref ex == null) {
+        protect(ctx, pending);
+        var done: ptr<u8> = iteration_result(ctx, undefined(ctx), true, ex);
+        var resolve: ptr<u8> = get(ctx, pending, "resolve", ex);
+        var argument: array<ptr<u8>, 1> = [done];
+        call(ctx, resolve, null, 1, &argument[0], ex);
+        unprotect(ctx, pending);
+        pending = shift_waiting(ctx, state, ex);
+    }
+}
+
+fun on_next(ctx: ptr<u8>, state: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var queue: ptr<u8> = get(ctx, state, "queue", ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (length(ctx, queue, ex) > 0) {
+        var first: ptr<u8> = at(ctx, queue, 0, ex);
+        remove_at(ctx, queue, 0, ex);
+        return settled(ctx, iteration_result(ctx, first, false, ex), false, ex);
+    }
+    var stored: ptr<u8> = get(ctx, state, "error", ex);
+    if (kind(ctx, stored) != VALUE_UNDEFINED) {
+        put(ctx, state, "error", undefined(ctx), ex);
+        return settled(ctx, stored, true, ex);
+    }
+    if (flag(ctx, state, "finished", ex)) {
+        return settled(ctx, iteration_result(ctx, undefined(ctx), true, ex), false, ex);
+    }
+    var resolve: ptr<u8> = null;
+    var reject: ptr<u8> = null;
+    var pending: ptr<u8> = promise(ctx, &resolve, &reject, ex);
+    if (deref ex != null || pending == null) {
+        return undefined(ctx);
+    }
+    protect(ctx, pending);
+    var record: ptr<u8> = plain(ctx);
+    protect(ctx, record);
+    put(ctx, record, "resolve", resolve, ex);
+    put(ctx, record, "reject", reject, ex);
+    append(ctx, get(ctx, state, "waiting", ex), record, ex);
+    unprotect(ctx, record);
+    unprotect(ctx, pending);
+    return pending;
+}
+
+fun on_return(ctx: ptr<u8>, state: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    detach(ctx, state, ex);
+    put(ctx, state, "finished", boolean(ctx, true), ex);
+    finish_waiting(ctx, state, ex);
+    return settled(ctx, iteration_result(ctx, undefined(ctx), true, ex), false, ex);
+}
+
+fun on_event(ctx: ptr<u8>, state: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) {
+    var values: ptr<u8> = array(ctx, count, args, ex);
+    if (deref ex != null) {
+        return;
+    }
+    protect(ctx, values);
+    var pending: ptr<u8> = shift_waiting(ctx, state, ex);
+    if (pending != null) {
+        protect(ctx, pending);
+        var resolve: ptr<u8> = get(ctx, pending, "resolve", ex);
+        var argument: array<ptr<u8>, 1> = [iteration_result(ctx, values, false, ex)];
+        call(ctx, resolve, null, 1, &argument[0], ex);
+        unprotect(ctx, pending);
+    } else {
+        append(ctx, get(ctx, state, "queue", ex), values, ex);
+    }
+    unprotect(ctx, values);
+}
+
+// Delivers an error to the oldest waiting next() call, or keeps it for the next one, and stops listening.
+fun on_failure(ctx: ptr<u8>, state: ptr<u8>, reason: ptr<u8>, ex: ptr<ptr<u8>>) {
+    var pending: ptr<u8> = shift_waiting(ctx, state, ex);
+    if (pending != null) {
+        protect(ctx, pending);
+        var reject: ptr<u8> = get(ctx, pending, "reject", ex);
+        var argument: array<ptr<u8>, 1> = [reason];
+        call(ctx, reject, null, 1, &argument[0], ex);
+        unprotect(ctx, pending);
+    } else {
+        put(ctx, state, "error", reason, ex);
+    }
+    detach(ctx, state, ex);
+    put(ctx, state, "finished", boolean(ctx, true), ex);
+    finish_waiting(ctx, state, ex);
+}
+
+fun abort_error(ctx: ptr<u8>, signal: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var message: ptr<u8> = string_value(ctx, "The operation was aborted", ex);
+    var error: ptr<u8> = make_error(ctx, ERROR_BASE, message, ex);
+    if (deref ex != null || error == null) {
+        return undefined(ctx);
+    }
+    protect(ctx, error);
+    define(ctx, error, "name", string_value(ctx, "AbortError", ex), ex, false);
+    define(ctx, error, "code", string_value(ctx, "ABORT_ERR", ex), ex, true);
+    var reason: ptr<u8> = get(ctx, signal, "reason", ex);
+    if (kind(ctx, reason) != VALUE_UNDEFINED) {
+        define(ctx, error, "cause", reason, ex, false);
+    }
+    unprotect(ctx, error);
+    return error;
+}
+
+// Registers `handler` with emitter.on(name, handler) so any emitter implementing `on` works.
+fun listen(ctx: ptr<u8>, emitter: ptr<u8>, name: ptr<u8>, handler: ptr<u8>, ex: ptr<ptr<u8>>) {
+    call_method(ctx, emitter, "on", name, handler, 2, ex);
+}
+
+fun bound(ctx: ptr<u8>, op: i64, state: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var names: array<str, 9> = operation_names();
+    var key: ptr<u8> = utf8(names[op]);
+    var native: ptr<u8> = function(ctx, key, callback());
+    release(key);
+    return bind_one(ctx, native, state, undefined(ctx), ex);
+}
+
+fun events_on(ctx: ptr<u8>, count: i64, args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var emitter: ptr<u8> = undefined(ctx);
+    if (count > 0) {
+        emitter = args[0];
+    }
+    var name: ptr<u8> = undefined(ctx);
+    if (count > 1) {
+        name = args[1];
+    }
+    if (kind(ctx, emitter) != VALUE_OBJECT || !callable(ctx, get(ctx, emitter, "on", ex))) {
+        invalid_argument_type(ctx, ex, "The \"emitter\" argument", "an instance of EventEmitter or EventTarget", emitter);
+        return undefined(ctx);
+    }
+    var options: ptr<u8> = undefined(ctx);
+    if (count > 2) {
+        options = args[2];
+    }
+    if (kind(ctx, options) != VALUE_UNDEFINED && (kind(ctx, options) != VALUE_OBJECT || callable(ctx, options))) {
+        invalid_argument_type(ctx, ex, "The \"options\" argument", "of type object", options);
+        return undefined(ctx);
+    }
+    var signal: ptr<u8> = undefined(ctx);
+    var closes: ptr<u8> = array(ctx, 0, null, ex);
+    if (kind(ctx, options) == VALUE_OBJECT) {
+        signal = get(ctx, options, "signal", ex);
+        var requested: ptr<u8> = get(ctx, options, "close", ex);
+        if (deref ex == null && is_array(ctx, requested)) {
+            closes = requested;
+        }
+    }
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (kind(ctx, signal) == VALUE_OBJECT && truth(ctx, get(ctx, signal, "aborted", ex))) {
+        deref ex = abort_error(ctx, signal, ex);
+        return undefined(ctx);
+    }
+    var state: ptr<u8> = plain(ctx);
+    protect(ctx, state);
+    put(ctx, state, "emitter", emitter, ex);
+    put(ctx, state, "name", name, ex);
+    put(ctx, state, "queue", array(ctx, 0, null, ex), ex);
+    put(ctx, state, "waiting", array(ctx, 0, null, ex), ex);
+    put(ctx, state, "closes", closes, ex);
+    put(ctx, state, "signal", signal, ex);
+    put(ctx, state, "abortType", string_value(ctx, "abort", ex), ex);
+    put(ctx, state, "finished", boolean(ctx, false), ex);
+    put(ctx, state, "detached", boolean(ctx, false), ex);
+    var iterator: ptr<u8> = object(ctx, null, null);
+    protect(ctx, iterator);
+    put(ctx, state, "iterator", iterator, ex);
+    define(ctx, iterator, "next", bound(ctx, OP_NEXT, state, ex), ex, true);
+    define(ctx, iterator, "return", bound(ctx, OP_RETURN, state, ex), ex, true);
+    define(ctx, iterator, "throw", bound(ctx, OP_THROW, state, ex), ex, true);
+    var symbol_ctor: ptr<u8> = get(ctx, global(ctx), "Symbol", ex);
+    var async_iterator: ptr<u8> = get(ctx, symbol_ctor, "asyncIterator", ex);
+    define_key(ctx, iterator, async_iterator, bound(ctx, OP_ITERATOR, state, ex), ex, false);
+    var handler: ptr<u8> = bound(ctx, OP_EVENT, state, ex);
+    put(ctx, state, "onEvent", handler, ex);
+    var failure: ptr<u8> = bound(ctx, OP_ERROR, state, ex);
+    put(ctx, state, "onError", failure, ex);
+    var closing: ptr<u8> = bound(ctx, OP_CLOSE, state, ex);
+    put(ctx, state, "onClose", closing, ex);
+    if (deref ex == null) {
+        listen(ctx, emitter, name, handler, ex);
+        listen(ctx, emitter, string_value(ctx, "error", ex), failure, ex);
+        var total: i64 = length(ctx, closes, ex);
+        for (var i: i64 = 0; i < total && deref ex == null; i++) {
+            listen(ctx, emitter, at(ctx, closes, i, ex), closing, ex);
+        }
+    }
+    if (deref ex == null && kind(ctx, signal) == VALUE_OBJECT) {
+        var aborting: ptr<u8> = bound(ctx, OP_ABORT, state, ex);
+        put(ctx, state, "onAbort", aborting, ex);
+        call_method(ctx, signal, "addEventListener", string_value(ctx, "abort", ex), aborting, 2, ex);
+    }
+    unprotect(ctx, iterator);
+    unprotect(ctx, state);
+    return iterator;
+}
+
+export(c) fun jsrt_events_on_api(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var op: i32 = operation_of(ctx, fn, ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    if (op == OP_ON) {
+        return events_on(ctx, count, args, ex);
+    }
+    // Everything else runs with the per-iterator state as the receiver (bound with one leading argument).
+    var state: ptr<u8> = receiver;
+    if (op == OP_NEXT) {
+        return on_next(ctx, state, ex);
+    }
+    if (op == OP_RETURN) {
+        return on_return(ctx, state, ex);
+    }
+    if (op == OP_THROW) {
+        var reason: ptr<u8> = undefined(ctx);
+        if (count > 1) {
+            reason = args[1];
+        }
+        on_failure(ctx, state, reason, ex);
+        return settled(ctx, iteration_result(ctx, undefined(ctx), true, ex), false, ex);
+    }
+    if (op == OP_EVENT) {
+        // The leading argument is the undefined placeholder added by bind.
+        on_event(ctx, state, count - 1, &args[1], ex);
+        return undefined(ctx);
+    }
+    if (op == OP_ERROR) {
+        var reason: ptr<u8> = undefined(ctx);
+        if (count > 1) {
+            reason = args[1];
+        }
+        on_failure(ctx, state, reason, ex);
+        return undefined(ctx);
+    }
+    if (op == OP_CLOSE) {
+        detach(ctx, state, ex);
+        put(ctx, state, "finished", boolean(ctx, true), ex);
+        finish_waiting(ctx, state, ex);
+        return undefined(ctx);
+    }
+    if (op == OP_ABORT) {
+        on_failure(ctx, state, abort_error(ctx, get(ctx, state, "signal", ex), ex), ex);
+        return undefined(ctx);
+    }
+    if (op == OP_ITERATOR) {
+        return get(ctx, state, "iterator", ex);
+    }
+    return undefined(ctx);
+}
+
+pub fun install_events_on(ctx: ptr<u8>, ctor: ptr<u8>, ex: ptr<ptr<u8>>) -> bool {
+    var key: ptr<u8> = utf8("on");
+    var created: ptr<u8> = function(ctx, key, callback());
+    release(key);
+    define(ctx, ctor, "on", created, ex, true);
+    return deref ex == null;
+}

@@ -528,3 +528,10 @@ pub fun shutdown_util(ctx: ptr<u8>) {
         }
     }
 }
+
+// require('util/types') is the same object as util.types.
+pub fun util_types_module() -> ptr<u8> {
+    var host_state: ptr<UtilState> = util_storage(active_context());
+    var ignored: ptr<u8> = null;
+    return get(active_context(), deref host_state.exports, "types", &ignored);
+}

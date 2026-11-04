@@ -13,7 +13,7 @@ pub struct ModulesState {
     parse_fn: ptr<u8>;
     keys_fn: ptr<u8>;
     constructors: array<ptr<u8>, 4>;
-    builtins: array<ptr<u8>, 22>;
+    builtins: array<ptr<u8>, 24>;
     import_depth: i64;
     esm_resolving: bool;
 }

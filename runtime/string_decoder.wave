@@ -1,0 +1,317 @@
+// require('string_decoder'): StringDecoder decodes a byte stream that may split multi-byte
+// characters across chunks. Bytes that cannot be decoded yet are kept in the hidden
+// `_pending` Buffer property of the decoder instance, so the native functions are stateless and
+// are told apart by name. Decoding itself reuses byte_codec (the same code paths as Buffer.toString).
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::ops")::{mem_copy};
+import("./values")::{get, put, plain, define, fail_coded, fail_dynamic};
+import("./byte_codec")::{encode_bytes, decode_bytes, encoding};
+import("./buffer_core")::{is_byte_view, byte_view_length, copy_byte_view, buffer_from_bytes};
+import("./web_support")::{public_constructor};
+import("./util_text")::{invalid_argument_type};
+
+extern(c, "wr_type") fun kind(ctx: ptr<u8>, value: ptr<u8>) -> i32;
+extern(c, "wr_undefined") fun undefined(ctx: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_number") fun number(ctx: ptr<u8>, value: f64) -> ptr<u8>;
+extern(c, "wr_to_number") fun to_number(ctx: ptr<u8>, value: ptr<u8>, ex: ptr<ptr<u8>>) -> f64;
+extern(c, "wr_object") fun object(ctx: ptr<u8>, cls: ptr<u8>, data: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_set_prototype") fun prototype(ctx: ptr<u8>, value: ptr<u8>, parent: ptr<u8>);
+extern(c, "wr_function") fun function(ctx: ptr<u8>, name: ptr<u8>, cb: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_utf8") fun utf8(value: str) -> ptr<u8>;
+extern(c, "wr_string_utf16") fun utf16(value: ptr<u16>, count: i64) -> ptr<u8>;
+extern(c, "wr_string_value") fun string_value(ctx: ptr<u8>, text: ptr<u8>) -> ptr<u8>;
+extern(c, "wr_string_release") fun release(value: ptr<u8>);
+extern(c, "wr_protect") fun protect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "wr_unprotect") fun unprotect(ctx: ptr<u8>, value: ptr<u8>);
+extern(c, "jsrt_string_decoder_callback") fun callback(constructing: bool) -> ptr<u8>;
+
+const VALUE_UNDEFINED: i32 = 0;
+const VALUE_STRING: i32 = 4;
+const ERROR_TYPE: i32 = 1;
+const ERROR_RANGE: i32 = 2;
+// byte_codec encoding codes.
+const CODE_UTF8: i32 = 0;
+const CODE_HEX: i32 = 1;
+const CODE_BASE64: i32 = 2;
+const CODE_BASE64URL: i32 = 3;
+const CODE_UTF16LE: i32 = 6;
+const NAME_CAPACITY: i64 = 32;
+const PENDING_CAPACITY: i64 = 8;
+const CHUNK_LIMIT: i64 = 67108864;
+const REPLACEMENT_UTF8_LENGTH: i64 = 3;
+
+fun canonical_name(code: i32) -> str {
+    if (code == CODE_HEX) {
+        return "hex";
+    }
+    if (code == CODE_BASE64) {
+        return "base64";
+    }
+    if (code == CODE_BASE64URL) {
+        return "base64url";
+    }
+    if (code == 4) {
+        return "latin1";
+    }
+    if (code == 5) {
+        return "ascii";
+    }
+    if (code == CODE_UTF16LE) {
+        return "utf16le";
+    }
+    return "utf8";
+}
+
+export(c) fun jsrt_string_decoder_construct(ctx: ptr<u8>, ctor: ptr<u8>, count: i64, args: ptr<ptr<u8>>,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var requested: ptr<u8> = undefined(ctx);
+    if (count > 0) {
+        requested = args[0];
+    }
+    var code: i32 = 0;
+    if (kind(ctx, requested) != VALUE_UNDEFINED) {
+        code = encoding(ctx, requested, ex, true);
+        if (code < 0) {
+            unknown_encoding(ctx, ex, requested);
+            return undefined(ctx);
+        }
+    }
+    var decoder: ptr<u8> = object(ctx, null, null);
+    protect(ctx, decoder);
+    prototype(ctx, decoder, get(ctx, ctor, "prototype", ex));
+    define(ctx, decoder, "encoding", text_of(ctx, canonical_name(code)), ex, true);
+    define(ctx, decoder, "_code", number(ctx, code as f64), ex, false);
+    define(ctx, decoder, "_pending", empty_buffer(ctx, ex), ex, false);
+    define(ctx, decoder, "lastNeed", number(ctx, 0.0), ex, false);
+    define(ctx, decoder, "lastTotal", number(ctx, 0.0), ex, false);
+    unprotect(ctx, decoder);
+    return decoder;
+}
+
+fun text_of(ctx: ptr<u8>, literal: str) -> ptr<u8> {
+    var raw: ptr<u8> = utf8(literal);
+    var result: ptr<u8> = string_value(ctx, raw);
+    release(raw);
+    return result;
+}
+
+fun empty_buffer(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var none: array<u8, 1>;
+    none[0] = 0;
+    return buffer_from_bytes(ctx, &none[0], 0, ex);
+}
+
+fun unknown_encoding(ctx: ptr<u8>, ex: ptr<ptr<u8>>, requested: ptr<u8>) {
+    var bytes: array<u8, 96>;
+    var prefix: str = "Unknown encoding: ";
+    var width: i64 = 18;
+    mem_copy(&bytes[0], prefix as ptr<u8>, width);
+    var used: i64 = 0;
+    if (kind(ctx, requested) == VALUE_STRING) {
+        used = encode_bytes(ctx, requested, 0, &bytes[width], 64, ex);
+        if (used < 0) {
+            used = 0;
+        }
+    }
+    bytes[width + used] = 0;
+    fail_coded(ctx, ex, ERROR_TYPE, "ERR_UNKNOWN_ENCODING", &bytes[0] as str);
+}
+
+// Number of trailing bytes that start a character the chunk does not complete yet.
+fun incomplete_tail(bytes: ptr<u8>, total: i64, code: i32) -> i64 {
+    if (code == CODE_BASE64 || code == CODE_BASE64URL) {
+        return total % 3;
+    }
+    if (code == CODE_UTF16LE) {
+        var odd: i64 = total % 2;
+        var whole: i64 = total - odd;
+        // Like Node, a trailing high surrogate is only held back when the data ends on a unit boundary.
+        if (odd == 0 && whole >= 2) {
+            var last: u32 = (bytes[whole - 2] as u32) | ((bytes[whole - 1] as u32) << 8);
+            if (last >= 55296 && last <= 56319) {
+                return odd + 2;
+            }
+        }
+        return odd;
+    }
+    if (code != CODE_UTF8) {
+        return 0;
+    }
+    var limit: i64 = 3;
+    if (total < limit) {
+        limit = total;
+    }
+    for (var back: i64 = 1; back <= limit; back++) {
+        var octet: u8 = bytes[total - back];
+        if (octet >= 128 && octet < 192) {
+            continue;
+        }
+        var need: i64 = 1;
+        if (octet >= 240 && octet <= 244) {
+            need = 4;
+        } else if (octet >= 224 && octet < 240) {
+            need = 3;
+        } else if (octet >= 194 && octet < 224) {
+            need = 2;
+        }
+        if (need > back) {
+            return back;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+// Total length a character that starts with the pending bytes needs, for lastTotal/lastNeed.
+fun expected_total(bytes: ptr<u8>, pending: i64, code: i32) -> i64 {
+    if (pending == 0) {
+        return 0;
+    }
+    if (code == CODE_BASE64 || code == CODE_BASE64URL) {
+        return 3;
+    }
+    if (code == CODE_UTF16LE) {
+        if (pending >= 2) {
+            return 4;
+        }
+        return 2;
+    }
+    var octet: u8 = bytes[0];
+    if (octet >= 240) {
+        return 4;
+    }
+    if (octet >= 224) {
+        return 3;
+    }
+    return 2;
+}
+
+fun store_pending(ctx: ptr<u8>, decoder: ptr<u8>, bytes: ptr<u8>, pending: i64, code: i32, ex: ptr<ptr<u8>>) {
+    var kept: ptr<u8> = buffer_from_bytes(ctx, bytes, pending, ex);
+    if (deref ex != null) {
+        return;
+    }
+    define(ctx, decoder, "_pending", kept, ex, false);
+    var total: i64 = expected_total(bytes, pending, code);
+    put(ctx, decoder, "lastTotal", number(ctx, total as f64), ex);
+    put(ctx, decoder, "lastNeed", number(ctx, (total - pending) as f64), ex);
+}
+
+// Decodes pending bytes plus `chunk`. With `flush` the leftover bytes are decoded too, the way end() does.
+fun decode_chunk(ctx: ptr<u8>, decoder: ptr<u8>, chunk: ptr<u8>, flush: bool, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var code: i32 = to_number(ctx, get(ctx, decoder, "_code", ex), ex) as i32;
+    var held: ptr<u8> = get(ctx, decoder, "_pending", ex);
+    if (deref ex != null) {
+        return undefined(ctx);
+    }
+    var held_size: i64 = byte_view_length(ctx, held, ex);
+    var chunk_size: i64 = 0;
+    if (chunk != null) {
+        chunk_size = byte_view_length(ctx, chunk, ex);
+    }
+    if (held_size < 0 || chunk_size < 0 || deref ex != null) {
+        return undefined(ctx);
+    }
+    if (chunk_size > CHUNK_LIMIT) {
+        fail_coded(ctx, ex, ERROR_RANGE, "ERR_BUFFER_TOO_LARGE", "chunk is too large");
+        return undefined(ctx);
+    }
+    var capacity: i64 = held_size + chunk_size + PENDING_CAPACITY;
+    var bytes: ptr<u8> = mem_alloc(capacity);
+    if (bytes == null) {
+        fail_coded(ctx, ex, ERROR_RANGE, "ERR_STRING_TOO_LONG", "cannot allocate decoder buffer");
+        return undefined(ctx);
+    }
+    var total: i64 = 0;
+    if (held_size > 0) {
+        total = copy_byte_view(ctx, held, bytes, capacity, ex);
+    }
+    if (chunk_size > 0 && deref ex == null) {
+        var copied: i64 = copy_byte_view(ctx, chunk, bytes + total, capacity - total, ex);
+        if (copied > 0) {
+            total += copied;
+        }
+    }
+    var result: ptr<u8> = undefined(ctx);
+    if (deref ex == null) {
+        var keep: i64 = 0;
+        if (!flush) {
+            keep = incomplete_tail(bytes, total, code);
+        }
+        var usable: i64 = total - keep;
+        if (flush && total > 0 && code == CODE_UTF8) {
+            var tail: i64 = incomplete_tail(bytes, total, code);
+            if (tail > 0) {
+                // An unfinished character at the end becomes one replacement character.
+                bytes[total - tail] = 239;
+                bytes[total - tail + 1] = 191;
+                bytes[total - tail + 2] = 189;
+                usable = total - tail + REPLACEMENT_UTF8_LENGTH;
+            }
+        }
+        result = decode_bytes(ctx, bytes, usable, code, ex);
+        usable = total - keep;
+        if (deref ex == null) {
+            store_pending(ctx, decoder, bytes + usable, keep, code, ex);
+        }
+    }
+    mem_free(bytes, capacity);
+    return result;
+}
+
+fun write_value(ctx: ptr<u8>, receiver: ptr<u8>, count: i64, args: ptr<ptr<u8>>, flush: bool,
+    ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var chunk: ptr<u8> = null;
+    if (count > 0 && kind(ctx, args[0]) != VALUE_UNDEFINED) {
+        chunk = args[0];
+    }
+    if (chunk != null && kind(ctx, chunk) == VALUE_STRING) {
+        return chunk;
+    }
+    if (chunk != null && !is_byte_view(ctx, chunk, ex)) {
+        invalid_argument_type(ctx, ex, "The \"buf\" argument", "an instance of Buffer, TypedArray, or DataView", chunk);
+        return undefined(ctx);
+    }
+    return decode_chunk(ctx, receiver, chunk, flush, ex);
+}
+
+export(c) fun jsrt_string_decoder_method(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,
+    args: ptr<ptr<u8>>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var label: ptr<u8> = get(ctx, fn, "name", ex);
+    var name: array<u8, 32>;
+    if (deref ex != null || kind(ctx, label) != VALUE_STRING) {
+        return undefined(ctx);
+    }
+    var length: i64 = encode_bytes(ctx, label, 0, &name[0], NAME_CAPACITY - 1, ex);
+    if (length <= 0 || deref ex != null) {
+        return undefined(ctx);
+    }
+    // "write" starts with 'w', "end" with 'e'.
+    if (name[0] == 119) {
+        return write_value(ctx, receiver, count, args, false, ex);
+    }
+    return write_value(ctx, receiver, count, args, true, ex);
+}
+
+pub fun string_decoder_module(ctx: ptr<u8>, ex: ptr<ptr<u8>>) -> ptr<u8> {
+    var exports: ptr<u8> = plain(ctx);
+    protect(ctx, exports);
+    var ctor: ptr<u8> = public_constructor(ctx, callback(true), "StringDecoder", ex);
+    if (deref ex != null) {
+        unprotect(ctx, exports);
+        return exports;
+    }
+    protect(ctx, ctor);
+    var parent: ptr<u8> = get(ctx, ctor, "prototype", ex);
+    define(ctx, parent, "constructor", ctor, ex, false);
+    var names: array<str, 2> = ["write", "end"];
+    for (var i: i64 = 0; i < 2; i++) {
+        var key: ptr<u8> = utf8(names[i]);
+        define(ctx, parent, names[i], function(ctx, key, callback(false)), ex, false);
+        release(key);
+    }
+    define(ctx, exports, "StringDecoder", ctor, ex, true);
+    unprotect(ctx, ctor);
+    unprotect(ctx, exports);
+    return exports;
+}

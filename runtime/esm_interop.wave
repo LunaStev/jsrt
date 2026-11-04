@@ -45,10 +45,10 @@ pub fun canonical_builtin(ctx: ptr<u8>, request: str, ex: ptr<ptr<u8>>) -> ptr<u
         fail(ctx, ex, 1, "ESM builtin interop requires the matching synthetic module ABI");
         return null;
     }
-    var names: array<str, 22> = ["node:fs", "node:process", "node:timers", "node:console", "node:fs/promises",
+    var names: array<str, 24> = ["node:fs", "node:process", "node:timers", "node:console", "node:fs/promises",
         "node:http", "node:buffer", "node:events", "node:stream", "node:stream/promises", "node:https",
         "node:path", "node:os", "node:util", "node:assert", "node:crypto", "node:url", "node:child_process",
-        "node:worker_threads", "node:querystring", "node:stream/web", "node:timers/promises"];
+        "node:worker_threads", "node:querystring", "node:stream/web", "node:timers/promises", "node:string_decoder", "node:util/types"];
     return utf8(names[index]);
 }
 export(c) fun jsrt_esm_cjs(ctx: ptr<u8>, fn: ptr<u8>, receiver: ptr<u8>, count: i64,

@@ -982,6 +982,91 @@ process.on('exit', code => {
         process.exitCode = 1;
     }
 });
+function stringDecoderCases() {
+    const { StringDecoder } = require('string_decoder');
+    const euro = Buffer.from('€');
+    const split = new StringDecoder('utf8');
+    equal(split.write(euro.subarray(0, 1)), '', 'first byte of a split character is held');
+    equal(split.lastNeed, 2, 'lastNeed counts the missing bytes');
+    equal(split.lastTotal, 3, 'lastTotal is the character length');
+    equal(split.write(euro.subarray(1, 2)), '', 'second byte still held');
+    equal(split.write(euro.subarray(2)), '€', 'last byte completes the character');
+    equal(split.lastNeed, 0, 'nothing pending afterwards');
+    const unfinished = new StringDecoder();
+    equal(unfinished.write(Buffer.from([0xe2, 0x82])), '', 'incomplete sequence is held');
+    equal(unfinished.end(), '�', 'end() flushes an unfinished character as U+FFFD');
+    equal(unfinished.end(), '', 'end() twice yields nothing');
+    equal(unfinished.write(Buffer.from([0xf0, 0x9f])), '', 'four-byte prefix is held');
+    equal(unfinished.end(Buffer.from([0x98])), '�', 'end(chunk) decodes the chunk and then flushes');
+    const wide = new StringDecoder('utf16le');
+    equal(JSON.stringify([wide.write(Buffer.from([0x3d])), wide.write(Buffer.from([0xd8, 0x4d])),
+        wide.write(Buffer.from([0xdc])), wide.end()]), '["","\\ud83d","\\udc4d",""]', 'utf16le splits and surrogates');
+    const text = new StringDecoder('base64');
+    equal(JSON.stringify([text.write(Buffer.from('ab')), text.write(Buffer.from('cde')), text.end()]),
+        '["","YWJj","ZGU="]', 'base64 holds partial groups');
+    equal(new StringDecoder('hex').write(Buffer.from([1, 255])), '01ff', 'hex');
+    equal(new StringDecoder('latin1').write(Buffer.from([0xe9, 0x41])), 'éA', 'latin1');
+    equal(new StringDecoder('UCS2').encoding, 'utf16le', 'encoding names are normalized');
+    equal(new StringDecoder('base64url').write(Buffer.from([0xfb, 0xff, 0xbf])), '-_-_', 'base64url');
+    equal(split.write('text'), 'text', 'strings pass through');
+    throws(() => new StringDecoder('nope'), error => error instanceof TypeError && error.code === 'ERR_UNKNOWN_ENCODING',
+        'unknown encoding');
+    throws(() => split.write(5), error => error.code === 'ERR_INVALID_ARG_TYPE', 'write argument type');
+    equal(Object.keys(new StringDecoder()).join(), 'encoding', 'only encoding is enumerable');
+    equal(require('util/types') === require('util').types, true, 'util/types is util.types');
+    equal(typeof require('node:util/types').isDate, 'function', 'util/types has the checks');
+}
+async function eventsOnCases() {
+    const { on, EventEmitter } = require('events');
+    const emitter = new EventEmitter();
+    const iterator = on(emitter, 'foo');
+    equal(iterator[Symbol.asyncIterator]() === iterator, true, 'on() returns an async iterator');
+    setTimeout(() => { emitter.emit('foo', 1, 2); emitter.emit('foo', 'a'); }, 5);
+    equal(JSON.stringify(await iterator.next()), '{"done":false,"value":[1,2]}', 'first event');
+    equal(JSON.stringify(await iterator.next()), '{"done":false,"value":["a"]}', 'buffered event');
+    const pending = iterator.next();
+    setTimeout(() => emitter.emit('foo', 3), 5);
+    equal(JSON.stringify(await pending), '{"done":false,"value":[3]}', 'pending next is resolved by a later event');
+    equal(emitter.listenerCount('foo') + emitter.listenerCount('error'), 2, 'listeners are registered');
+    equal(JSON.stringify(await iterator.return()), '{"done":true}', 'return() ends the iteration');
+    equal(emitter.listenerCount('foo') + emitter.listenerCount('error'), 0, 'return() removes the listeners');
+    equal(JSON.stringify(await iterator.next()), '{"done":true}', 'finished iterator stays done');
+    const failing = on(emitter, 'bar');
+    setTimeout(() => emitter.emit('error', new Error('bad')), 5);
+    await rejects(failing.next(), error => error.message === 'bad', 'error events reject next()');
+    equal(JSON.stringify(await failing.next()), '{"done":true}', 'iterator is done after an error');
+    const closing = on(emitter, 'baz', { close: ['end'] });
+    setTimeout(() => { emitter.emit('baz', 1); emitter.emit('end'); }, 5);
+    const seen = [];
+    for await (const value of closing) {
+        seen.push(value);
+    }
+    equal(JSON.stringify(seen), '[[1]]', 'close events end for-await');
+    const controller = new AbortController();
+    const aborting = on(emitter, 'q', { signal: controller.signal });
+    setTimeout(() => controller.abort(), 5);
+    await rejects(aborting.next(), error => error.name === 'AbortError' && error.code === 'ABORT_ERR', 'abort rejects next()');
+    const leaving = on(emitter, 'w');
+    setTimeout(() => emitter.emit('w', 9), 5);
+    for await (const value of leaving) {
+        equal(JSON.stringify(value), '[9]', 'for-await value');
+        break;
+    }
+    equal(emitter.listenerCount('w'), 0, 'leaving for-await removes listeners');
+    throws(() => on(5, 'x'), error => error instanceof TypeError && error.code === 'ERR_INVALID_ARG_TYPE', 'emitter type');
+    throws(() => on(emitter, 'x', 5), error => error.code === 'ERR_INVALID_ARG_TYPE', 'options type');
+    const aborted = new AbortController();
+    aborted.abort();
+    throws(() => on(emitter, 'x', { signal: aborted.signal }), error => error.name === 'AbortError', 'pre-aborted signal');
+    const queued = on(emitter, 'm');
+    const first = queued.next();
+    const second = queued.next();
+    emitter.emit('m', 1);
+    emitter.emit('m', 2);
+    equal(JSON.stringify([await first, await second]), '[{"done":false,"value":[1]},{"done":false,"value":[2]}]',
+        'concurrent next() calls resolve in order');
+    await queued.return();
+}
 function parseArgsCases() {
     const { parseArgs } = require('util');
     const run = config => JSON.stringify(parseArgs(config), (key, value) => value === undefined ? '__undefined' : value);
@@ -1152,6 +1237,8 @@ async function assertExtraCases() {
     await new Promise(resolve => setTimeout(resolve, 5));
 }
 async function main() {
+    await eventsOnCases();
+    stringDecoderCases();
     parseArgsCases();
     urlFileCases();
     utilTextCases();

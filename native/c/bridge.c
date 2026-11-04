@@ -592,6 +592,15 @@ extern JSValue jsrt_util_args_api(const void *, void *, void *, size_t, const JS
 JSCallback jsrt_util_args_callback(void) {
     return jsrt_util_args_api;
 }
+extern JSValue jsrt_events_on_api(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+JSCallback jsrt_events_on_callback(void) {
+    return jsrt_events_on_api;
+}
+extern void *jsrt_string_decoder_construct(const void *, void *, size_t, const JSValue *, JSValue *);
+extern JSValue jsrt_string_decoder_method(const void *, void *, void *, size_t, const JSValue *, JSValue *);
+void *jsrt_string_decoder_callback(bool constructing) {
+    return constructing ? (void *)jsrt_string_decoder_construct : (void *)jsrt_string_decoder_method;
+}
 JSCallback jsrt_extras_callback(void) {
     return jsrt_extras_api;
 }
